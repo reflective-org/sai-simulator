@@ -81,7 +81,7 @@ python scripts/cache.py --data_dir data/processed --model_dir data/models --outp
 ```
 
 ## 🔒 License
-This project is licensed under the TODO - see the [LICENSE](LICENSE) file for details.
+This project is released under the Apache 2.0 License - see the [LICENSE](https://github.com/reflective-org/sai-simulator/blob/main/LICENSE) file for details.
 
 ## ✏️ Citation
 If you use the SAI Simulator in your work, please cite the following:
