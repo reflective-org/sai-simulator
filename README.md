@@ -75,7 +75,7 @@ python scripts/fit_delta.py --var tas --data_dir data/processed --output_dir dat
 ```
 
 ### E. Cache the Data
-(TODO): The simulator caches the data in a format that is easy to load and use in the browser. You can cache the data by running the following command:
+The simulator caches all the data to be loaded more efficiently by the frontend. You can cache the data by running the following command:
 ```bash
 python scripts/cache.py --data_dir data/processed --model_dir data/models --output_dir data/cache
 ```
