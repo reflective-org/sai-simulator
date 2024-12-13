@@ -9,12 +9,11 @@ Official repository for [the SAI Simulator](https://simulator.reflective.org/), 
   - [Data Processing](#c-data-processing)
   - [Fit the Regression Models](#d-fit-the-regression-models)
   - [Cache the Data](#e-cache-the-data)
-- [Running the Simulator](#-running-the-simulator)
 - [License](#-license)
 - [Citation](#%EF%B8%8F-citation)
 
 ## Introduction
-The SAI Simulator is a web-based tool that runs in your browser at [simulator.reflective.org](https://simulator.reflective.org/). If you would like to reproduce the steps to prepare the data and run the simulations, you can follow the instructions below.
+The SAI Simulator is a web-based tool that runs in your browser at [simulator.reflective.org](https://simulator.reflective.org/). If you would like to reproduce the steps to prepare the data presented in the simulator, you can follow the instructions below.
 
 ## 📁 Data Preparation
 
@@ -76,19 +75,16 @@ python scripts/fit_delta.py --var tas --data_dir data/processed --output_dir dat
 ```
 
 ### E. Cache the Data
-(TODO): The simulator caches the data in a format that is easy to load and use in the browser. You can cache the data by running the following command:
+The simulator caches all the data to be loaded more efficiently by the frontend. You can cache the data by running the following command:
 ```bash
-python scripts/cache.py --data_dir data/gauss --model_dir data/models --output_dir data/cache
+python scripts/cache.py --data_dir data/processed --model_dir data/models --output_dir data/cache
 ```
 
-## 🚀 Running the Simulator
-TODO
-
 ## 🔒 License
-This project is licensed under the TODO - see the [LICENSE](LICENSE) file for details.
+This project is released under the Apache 2.0 License - see the [LICENSE](https://github.com/reflective-org/sai-simulator/blob/main/LICENSE) file for details.
 
 ## ✏️ Citation
-If you use the SAI Simulator in your research, please cite the following:
+If you use the SAI Simulator in your work, please cite the following:
 
 ```
 TODO
