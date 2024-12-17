@@ -1,5 +1,6 @@
 # sai-simulator
 [![DOI](https://zenodo.org/badge/894158026.svg)](https://doi.org/10.5281/zenodo.14510645)
+
 Official repository for [the SAI Simulator](https://simulator.reflective.org/), a new tool to explore the effects of stratospheric aerosol injection on the climate.
 
 ![SAI Simulator](img/preview.png)
