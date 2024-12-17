@@ -1,5 +1,9 @@
 # sai-simulator
+[![DOI](https://zenodo.org/badge/894158026.svg)](https://doi.org/10.5281/zenodo.14510645)
+
 Official repository for [the SAI Simulator](https://simulator.reflective.org/), a new tool to explore the effects of stratospheric aerosol injection on the climate.
+
+![SAI Simulator](img/preview.png)
 
 ## Table of Contents
 - [Introduction](#introduction)
@@ -87,5 +91,5 @@ This project is released under the Apache 2.0 License - see the [LICENSE](https:
 If you use the SAI Simulator in your work, please cite the following:
 
 ```
-TODO
+Jeremy Irvin, Jake Dexheimer, Dakota Gruener, Charlotte DeWald, Daniele Visioni, Duncan Watson-Parri, Douglas MacMartin, Joshua Elliott, Juerg Luterbacher, Kion Yaghoobzadeh. (2024). SAI Simulator (Version 1.0.0) [Software]. Available at GitHub: https://github.com/Reflective-org/sai-simulator. Hosted at: https://simulator.reflective.org and https://planetparasol.ai.  DOI: https://doi.org/10.5281/zenodo.11467175
 ```
