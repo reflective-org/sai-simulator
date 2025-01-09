@@ -24,7 +24,7 @@ The SAI Simulator is a web-based tool that runs in your browser at [simulator.re
 ### A. Environment Setup
 Create a new conda environment and install the required packages by running the following commands:
 ```bash
-conda env create -n sai-simulator -p python=3.11
+conda create -n sai-simulator python=3.11 esmpy=8.6.1 -c conda-forge
 pip install -r requirements.txt
 ```
 
