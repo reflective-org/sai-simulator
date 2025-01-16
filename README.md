@@ -41,7 +41,7 @@ Download the GAUSS data from Globus (requires around 140GB of disk space):
     ```
 3. Download the data:
     ```bash
-    sh scripts/download_gauss.sh 2e01e83a-5180-47f7-a6ab-c98b626ad9e4 <YOUR ENDPOINT ID> data/gauss
+    sh scripts/download_gauss.sh 2e01e83a-5180-47f7-a6ab-c98b626ad9e4 <YOUR ENDPOINT ID> data/gauss/
     ```
 
 ### C. Data Processing
