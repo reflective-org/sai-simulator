@@ -20,14 +20,15 @@ for arg in "${@:4}"
 do
     case $arg in
         --tas)
-            if [ "$downloaded_pr" = true ]; then
+            if [ "$download_pr" = true ]; then
                 echo "Error: You cannot select both ---tas and --pr."
                 exit 1
             fi
             download_tas=true
+            echo "tas true"
         ;;
         --pr)
-            if [ "$downloaded_tas" = true ]; then
+            if [ "$download_tas" = true ]; then
                 echo "Error: You cannot select both --tas and --pr."
                 exit 1
             fi
