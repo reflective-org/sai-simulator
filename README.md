@@ -48,6 +48,7 @@ Download the GAUSS data from Globus (requires up to 140GB of disk space if all d
     ```bash
     sh scripts/download_gauss.sh 2e01e83a-5180-47f7-a6ab-c98b626ad9e4 <YOUR ENDPOINT ID> data/gauss/ --tas --monthly
     ```
+    If only a subset of the data is downloaded, it will affect which parts of the following steps can successfully run. To fit the regression models the monthly temperature (--tas --monthly) data must be downloaded at a minimum. At this time, it is only possible to subselect temperature (--tas) or precipitation (--pr) data.
 
 ### C. Data Processing
 1. Process the daily data to create monthly values. You can process all the daily data (both `tas` and `pr`) using:
