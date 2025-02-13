@@ -25,7 +25,6 @@ do
                 exit 1
             fi
             download_tas=true
-            echo "tas true"
         ;;
         --pr)
             if [ "$download_tas" = true ]; then
@@ -36,14 +35,14 @@ do
         ;;
         --daily)
             if [ "$download_monthly" = true ]; then  
-                echo "Error: You cannot select both --daily and monthly."
+                echo "Error: You cannot select both --daily and --monthly."
                 exit 1
             fi
             download_daily=true
         ;;
         --monthly)
             if [ "$download_daily" = true ]; then
-                echo "Error: You cannot elect both --daily and --monthly."
+                echo "Error: You cannot select both --daily and --monthly."
                 exit 1
             fi
             download_monthly=true
@@ -86,7 +85,7 @@ if [ "$download_daily" = false ]; then
     # Loop through each base directory and download the files
     for dir in "${base_dirs[@]}"
     do
-        echo "Listing files in $dir..."
+        echo "Listing files in $dir... with file pattern $file_pattern"
         # List files in the directory and filter for specific patterns
         files=$(globus ls $source_endpoint_id:$dir | grep -E "$file_pattern" | grep -E "\.h0\.")
 
@@ -108,7 +107,7 @@ if [ "$download_daily" = false ]; then
         # For MA-BASELINE.002 and MA-BASELINE.003, have to download PRECC and PRECL instead of PRECT
         for i in {2..3}
         do
-            echo "Listing files in /MA-BASELINE.00$i/atm/proc/tseries/month_1..."
+            echo "Listing files in /MA-BASELINE.00$i/atm/proc/tseries/month_1... with file pattern \.PRECL\.|\.\PRECC\."
             files=$(globus ls $source_endpoint_id:/MA-BASELINE.00$i/atm/proc/tseries/month_1 | grep -E "\.PRECL\.|\.\PRECC\." | grep -E "\.h0\.")
             for file in $files
             do
@@ -124,7 +123,7 @@ if [ "$download_daily" = false ]; then
         # For MA-HISTORICAL, have to download PRECC and PRECL insrtead of PRECT
         for i in {1..3}
         do
-            echo "Listing files in /MA-HISTORICAL.00$i/atm/proc/tseries/month_1..."
+            echo "Listing files in /MA-HISTORICAL.00$i/atm/proc/tseries/month_1... with file pattern \.PRECL\.|\.\PRECC\."
             files=$(globus ls $source_endpoint_id:/MA-HISTORICAL.00$i/atm/proc/tseries/month_1 | grep -E "\.PRECL\.|\.\PRECC\." | grep -E "\.h0\.")
             for file in $files
             do
@@ -142,6 +141,13 @@ fi
 # Download daily data as long as user didn't only request monthly data
 if [ "$download_monthly" = false ]; then
     # Define the file pattern based on the user's selection
+    file_pattern=""
+    if [ "$download_tas" = true ]; then
+        file_pattern="\.TREFHT\."
+    fi
+    if [ "$download_pr" = true ]; then
+        file_pattern="\.PRECT"
+    fi
     if [ "$download_tas" = false ] && [ "$download_pr" = false ]; then
         file_pattern="\.TREFHT\.|\.PRECT"
     fi
@@ -151,7 +157,7 @@ if [ "$download_monthly" = false ]; then
     do
         # Replace month with day
         dir=$(echo $dir | sed 's/month_1/day_1/g')
-        echo "Listing files in $dir..."
+        echo "Listing files in $dir... with file pattern $file_pattern"
         files=$(globus ls $source_endpoint_id:$dir | grep -E "$file_pattern" | grep -E "\.h1\.")
         for file in $files
         do
