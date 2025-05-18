@@ -137,9 +137,9 @@ def process_monthly(var, data_dir, output_dir):
 
     # Compute natural variability
     baseline = exp2member2data_combined['baseline']
-    # Compute std over time and ensemble members after taking lat-weighted global mean
     member_data = [data for data in baseline.values()]
     member_data = xr.concat(member_data, dim="member")
+    # Compute std over time and ensemble members after taking lat-weighted global mean
     weights = np.cos(np.deg2rad(member_data.lat))
     global_mean = member_data[gauss_var].weighted(weights).mean(dim=("lat", "lon"))
     global_mean = global_mean.sel(time=slice("2025", "2099"))
@@ -148,7 +148,27 @@ def process_monthly(var, data_dir, output_dir):
     fitted_data = xr.polyval(global_mean['time'], trend.polyfit_coefficients)
     detrended_data = global_mean - fitted_data
     std = np.std(detrended_data)
-    np.save(output_dir / "natural_variability.npy", std.item())
+    path = output_dir / "natural_variability.npy"
+    print("Writing natural variability to", path)
+    np.save(path, std.item())
+
+    # Compute regional natural variability
+    regional = member_data.sel(time=slice("2025", "2099"))
+    decades = list(zip(range(2041, 2092, 10), range(2050, 2101, 10)))
+
+    # Compute per-pixel trend and detrend efficiently
+    trend = regional[arise_var].polyfit(dim="time", deg=1)
+    fitted_data = xr.polyval(regional["time"], trend.polyfit_coefficients)
+    detrended_data = regional[arise_var] - fitted_data
+
+    # Compute standard deviation from 2010 to 2030
+    regional_variability = detrended_data.sel(time=slice("2010", "2030")).std(dim=("time", "member"))
+    # Convert back to dataset
+    regional_variability = regional_variability.to_dataset(name=var)
+
+    path = output_dir / "regional_natural_variability.nc"
+    print(f"Writing regional natural variability to {path}")
+    regional_variability.to_netcdf(path)
 
     # Concatenate exp to baseline data along the time dimension
     for member, data in exp2member2data_combined['historical'].items():
