@@ -74,6 +74,7 @@ Pint==0.24.3
 pint-xarray==0.4
 pip==24.0
 platformdirs==4.2.2
+pooch==v1.8.2
 proto-plus==1.24.0
 protobuf==5.27.3
 psutil==6.0.0
@@ -92,6 +93,7 @@ PyYAML==6.0.1
 rasterio==1.4.1
 requests==2.32.3
 requests-oauthlib==2.0.0
+rioxarray==0.17.0
 rsa==4.9
 scikit-learn==1.5.1
 scipy==1.14.0

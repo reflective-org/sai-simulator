@@ -187,7 +187,9 @@ def process_monthly(var, data_dir, output_dir):
             x['lon'] = np.linspace(0, 360, len(x.lon))
             regridder = xe.Regridder(x, common_grid, 'bilinear', periodic=True, ignore_degenerate=True)
         for member, data in member2data_combined.items():
-            output_gauss_data.append(regridder(data))
+            regridded_data = regridder(data)
+            regridded_data = regridded_data.assign_coords(member=member)
+            output_gauss_data.append(regridded_data)
             members.append(member)
         output_gauss_data = xr.concat(output_gauss_data, dim="member")
         output_gauss_data['member'] = members
