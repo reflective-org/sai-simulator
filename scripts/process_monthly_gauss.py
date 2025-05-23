@@ -157,9 +157,9 @@ def process_monthly(var, data_dir, output_dir):
     decades = list(zip(range(2041, 2092, 10), range(2050, 2101, 10)))
 
     # Compute per-pixel trend and detrend efficiently
-    trend = regional[arise_var].polyfit(dim="time", deg=1)
+    trend = regional[gauss_var].polyfit(dim="time", deg=1)
     fitted_data = xr.polyval(regional["time"], trend.polyfit_coefficients)
-    detrended_data = regional[arise_var] - fitted_data
+    detrended_data = regional[gauss_var] - fitted_data
 
     # Compute standard deviation from 2010 to 2030
     regional_variability = detrended_data.sel(time=slice("2010", "2030")).std(dim=("time", "member"))
