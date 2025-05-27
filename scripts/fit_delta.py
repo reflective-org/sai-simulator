@@ -47,6 +47,12 @@ def load_experiment_data(processed_dir):
 def load_baseline_data(processed_dir):
     output_gauss_baseline = xr.open_dataset(processed_dir / "output_gauss-baseline.nc") # MA-HISTORICAL ; MA-BASELINE
 
+    historical_file = processed_dir / "output_arise-cmip_historical.nc"
+    if historical_file.exists():
+        output_arise_historical = xr.open_dataset(historical_file)
+        # Concatenate the historical and baseline data
+        output_arise_baseline = xr.concat([output_arise_historical, output_arise_baseline], dim="time")
+
     return output_gauss_baseline
 
 
