@@ -4,14 +4,36 @@ if [ "$#" -ne 2 ]; then
     exit 1
 fi
 
-
+echo "Processing tas..."
 python scripts/process_monthly_gauss.py  --var tas --data_dir $1 --output_dir $2
+
+echo "Processing pr..."
 python scripts/process_monthly_gauss.py  --var pr --data_dir $1 --output_dir $2
+
+echo "Processing tasmax..."
 python scripts/process_monthly_gauss.py  --var tasmax --data_dir $1 --output_dir $2
+
+echo "Processing tasmin..."
 python scripts/process_monthly_gauss.py  --var tasmin --data_dir $1 --output_dir $2
+
+echo "Processing tas_above_35..."
 python scripts/process_monthly_gauss.py  --var tas_above_35 --data_dir $1 --output_dir $2
+
+echo "Processing tas_above_40..."
 python scripts/process_monthly_gauss.py  --var tas_above_40 --data_dir $1 --output_dir $2
+
+echo "Processing tas_below_0..."
 python scripts/process_monthly_gauss.py  --var tas_below_0 --data_dir $1 --output_dir $2
+
+echo "Processing pr_above_10..."
 python scripts/process_monthly_gauss.py  --var pr_above_10 --data_dir $1 --output_dir $2
+
+echo "Processing pr_above_20..."
 python scripts/process_monthly_gauss.py  --var pr_above_20 --data_dir $1 --output_dir $2
+
+echo "Processing p-e..."
 python scripts/process_monthly_gauss.py  --var p-e --data_dir $1 --output_dir $2
+
+echo "Processing icefrac..."
+python scripts/process_monthly_gauss.py  --var icefrac --data_dir $1 --output_dir $2
+echo "Done."
