@@ -164,3 +164,4 @@ cython_debug/
 # Individual data
 *.nc
 *.joblib
+natural_variability.npy
