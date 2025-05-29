@@ -65,6 +65,11 @@ Download the GAUSS data from Globus (requires around 140GB of disk space):
     python scripts/process_monthly_gauss.py  --var tas --data_dir data/gauss --output_dir data/processed
     ```
 
+    Although not necessary, to visualize the processed monthly data for a specific variable in different years, run:
+    ```bash
+    python scripts/visualize_monthly_gauss.py --var tas --year 2042 --data_dir data/processed
+    ```
+
 ### D. Fit the Regression Models
 We fit linear regression models to (1) estimate a gridded map of each variable given a global temperature output by [FaIR](https://github.com/OMS-NetZero/FAIR) and (2) estimate a gridded delta of each variable given a global temperature delta. The models are trained using the GAUSS simulation data.
 
@@ -78,6 +83,11 @@ Or you can fit the regression models for a specific variable using:
 python scripts/fit_map.py --var tas --data_dir data/processed --output_dir data/models
 python scripts/fit_delta.py --var tas --data_dir data/processed --output_dir data/models
 ```
+
+Although not necessary, to visualize the range, IQR, and mean of the linear regression models that estimate a gridded map of each variable given a global temperature output by [FaIR](https://github.com/OMS-NetZero/FAIR) for a variable, run:
+```bash
+python scripts/visualize_map_fit.py --var tas --model CESM2-WACCM --model_dir data/models --data_dir data/processed
+```   
 
 ### E. Cache the Data
 The simulator caches all the data to be loaded more efficiently by the frontend. You can cache the data by running the following command:
