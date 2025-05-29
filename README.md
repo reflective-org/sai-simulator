@@ -30,7 +30,7 @@ pip install -r requirements.txt
 ```
 
 ### B. Data Download
-Download the GAUSS data from Globus (requires around 140GB of disk space):
+Download the GAUSS data from Globus (requires up to 140GB of disk space if all data is downloaded):
 1. First install the [Globus CLI](https://docs.globus.org/cli/):
     ```bash
     pip install globus-cli
@@ -39,10 +39,16 @@ Download the GAUSS data from Globus (requires around 140GB of disk space):
     ```bash
     globus login
     ```
-3. Download the data:
+3. Download the data. You can download all data (~140GB) using:
     ```bash
     sh scripts/download_gauss.sh 2e01e83a-5180-47f7-a6ab-c98b626ad9e4 <YOUR ENDPOINT ID> data/gauss/
     ```
+    
+    Or you can select a subset of the data to download (e.g. `tas` and `monthly`) using:
+    ```bash
+    sh scripts/download_gauss.sh 2e01e83a-5180-47f7-a6ab-c98b626ad9e4 <YOUR ENDPOINT ID> data/gauss/ --tas --monthly
+    ```
+    If only a subset of the data is downloaded, it will affect which of the following steps can successfully run. To fit the regression models, the monthly temperature (--tas --monthly) data must be downloaded at a minimum. At this time, it is only possible to subselect temperature (--tas) or precipitation (--pr) data.
 
 ### C. Data Processing
 1. Process the daily data to create monthly values. You can process all the daily data (both `tas` and `pr`) using:
