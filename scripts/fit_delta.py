@@ -3,7 +3,69 @@ import numpy as np
 import xarray as xr
 import pandas as pd
 from pathlib import Path
+from scipy.optimize import curve_fit
+import numba as nb
+from functools import partial
+from concurrent.futures import ThreadPoolExecutor
+from scipy.optimize import curve_fit
 
+njit = nb.njit
+
+@njit(fastmath=True)
+def stretched_sigmoid(x, lam, beta):
+    z = np.maximum(-x / lam, 0.0)  # ensure domain
+    return 1 - np.exp(-(z**beta))
+
+def _fit_column_2par(y_col, x_data, p0, bounds, maxfev):
+    if not np.isfinite(y_col).all() or np.all(y_col == 0):
+        return np.inf, np.inf              # sentinel
+
+    popt, _ = curve_fit(stretched_sigmoid, x_data, y_col,
+                        p0=p0, bounds=bounds,
+                        maxfev=maxfev)
+    return popt # (λ̂, β̂)
+
+def fit_sigmoid_columns_2par(
+        Y,
+        X,
+        maxfev=10_000,
+        n_jobs=None,
+        tiny_thr=1e-12
+    ):
+    """
+    Parameters
+    ----------
+    Y : np.ndarray, shape (n_time, n_cols)
+    X : np.ndarray, shape (n_time,)
+    Returns
+    -------
+    reg : np.ndarray, shape (2, n_cols)  [row0=λ̂, row1=β̂]
+    """
+    x_data = X.ravel().astype(float)
+    n_cols = Y.shape[1]
+    reg    = np.empty((2, n_cols), dtype=float)
+
+    # ---- skip perfectly-zero columns quickly ---------------------------
+    zero_mask = (np.abs(Y).max(axis=0) < tiny_thr)
+    reg[:, zero_mask] = np.inf
+
+    cols = np.where(~zero_mask)[0]
+    if cols.size == 0:
+        return reg
+
+    # ---- shared p0 / bounds -------------------------------------------
+    p0     = (np.percentile(-x_data, 75), 0.9)
+    bounds = ([1e-9, 0.3],   [np.inf, 1.0])
+
+    worker = partial(_fit_column_2par,
+                     x_data=x_data, p0=p0,
+                     bounds=bounds, maxfev=maxfev)
+
+    with ThreadPoolExecutor(max_workers=n_jobs) as pool:
+        res = pool.map(worker, (Y[:, i] for i in cols))
+
+    reg[:, cols] = np.array(list(res)).T
+    return reg
 
 def process_so2_data(paths):
     latitudes = ["30S(Tg)", "15S(Tg)", "15N(Tg)", "30N(Tg)"]
@@ -148,27 +210,6 @@ def fit_delta(var, data_dir, output_dir, ignore_existing=False):
         beta_xr = xr.DataArray(beta_numpy, dims=['features', 'lat'], 
                                coords={'features': ['slope'],
                                        'lat': Y.lat.values})
-    elif var == "icefrac":
-        # Stack the data arrays along a new dimension ('sample'), aligning with the order of x_values
-        Y = xr.concat(
-            [output_gauss_1_5_rebased, output_gauss_1_0_rebased, output_gauss_0_5_rebased],
-            dim='sample'
-        ).sel(model="CESM2-WACCM", ssp="ssp245")[var]
-        Y_stacked = Y.stack(samples=('lat', 'lon'))
-        Y_stacked_log = -1.0 * np.log(1.0 - Y_stacked.values) # logit transform
-        beta_numpy = np.linalg.lstsq(X_numpy, Y_stacked_log, rcond=None)[0] # fit the model
-        
-        # Reshape the beta coefficients to have dimensions (features, lat, lon)
-        beta_reshaped = beta_numpy.reshape((1, Y.lat.size, Y.lon.size)) 
-        beta_xr = xr.DataArray(
-            beta_reshaped,
-            dims=['features', 'lat', 'lon'], 
-            coords={
-                'features': ['slope'],
-                'lat': Y.lat.values,
-                'lon': Y.lon.values
-            }
-        )
     else:
         # Stack the data arrays along a new dimension ('sample'), aligning with the order of x_values
         Y = xr.concat(
@@ -177,14 +218,27 @@ def fit_delta(var, data_dir, output_dir, ignore_existing=False):
         ).sel(model="CESM2-WACCM", ssp="ssp245")[var]
         Y_stacked = Y.stack(samples=('lat', 'lon'))
 
-        beta_numpy = np.linalg.lstsq(X_numpy, Y_stacked.values, rcond=None)[0]
+        if var == "icefrac":
+            reg = fit_sigmoid_columns_2par(Y_stacked.values, X_numpy, n_jobs=None)
 
-        # Reshape the beta coefficients to have dimensions (features, lat, lon)
-        beta_reshaped = beta_numpy.reshape((1, Y.lat.size, Y.lon.size))
-        beta_xr = xr.DataArray(beta_reshaped, dims=['features', 'lat', 'lon'], 
-                            coords={'features': ['slope'],
-                                    'lat': Y.lat.values, 
-                                    'lon': Y.lon.values})
+            # reshape back to (features, lat, lon)
+            reg_reshaped = reg.reshape((2, Y.lat.size, Y.lon.size))
+            beta_xr = xr.DataArray(
+                reg_reshaped,
+                dims=['features', 'lat', 'lon'],
+                coords={'features': ['lambda', 'beta'],
+                        'lat': Y.lat,
+                        'lon': Y.lon}
+            )
+        else:
+            beta_numpy = np.linalg.lstsq(X_numpy, Y_stacked.values, rcond=None)[0]
+
+            # Reshape the beta coefficients to have dimensions (features, lat, lon)
+            beta_reshaped = beta_numpy.reshape((1, Y.lat.size, Y.lon.size))
+            beta_xr = xr.DataArray(beta_reshaped, dims=['features', 'lat', 'lon'], 
+                                coords={'features': ['slope'],
+                                        'lat': Y.lat.values, 
+                                        'lon': Y.lon.values})
 
     # Convert to a Dataset and save to disk
     beta_xr = beta_xr.to_dataset(name=var)
