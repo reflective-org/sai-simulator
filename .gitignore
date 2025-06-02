@@ -166,3 +166,6 @@ cython_debug/
 *.joblib
 natural_variability.npy
 *.pkl
+
+# notebooks
+*.ipynb
