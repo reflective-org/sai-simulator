@@ -6,6 +6,11 @@ from .constants import *
 from .utils import get_interpolator, clip_to_land
 from .population import get_population_exposure
 
+def stretched_sigmoid(x, lam, beta):
+    """Vectorised stretched sigmoid (λ, β, x0 all scalars)."""
+    z = -x/lam    # z ≥ 0 for valid domain
+    z = np.maximum(z, 0.0) # clip to domain  z ≥ 0
+    return 1.0 - np.exp(-(z ** beta))
 
 def get_regional_delta_without_rampup(var, data_dir, model_dir, cache_dir, ssp_scenario, temp_target, temp_diff):
 
@@ -27,9 +32,13 @@ def get_regional_delta_without_rampup(var, data_dir, model_dir, cache_dir, ssp_s
         variable_dir = model_dir / var
         
         interpolator = get_interpolator(variable_dir / "interpolator.nc")
-
-        regional_delta = interpolator.sel(features='slope') * temp_diff
-
+        if var == "icefrac":
+            lambda_hat = interpolator.sel(features='lambda')
+            beta_hat = interpolator.sel(features='beta')
+            regional_delta = stretched_sigmoid(temp_diff, lambda_hat, beta_hat)
+            regional_delta = regional_delta.transpose('lat', 'lon', 'time')
+        else:
+            regional_delta = interpolator.sel(features='slope') * temp_diff
         regional_delta = regional_delta[var]
 
         if is_above_below or var in ["pr", "p-e"]:
