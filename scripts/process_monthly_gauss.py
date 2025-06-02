@@ -22,6 +22,7 @@ def process_monthly(var, data_dir, output_dir):
         "pr_above_10": "PRECT_above_10",
         "pr_above_20": "PRECT_above_20",
         "p-e": "QFLX",
+        "icefrac": "ICEFRAC",
     }
 
     if var not in var2gauss_var:
@@ -89,6 +90,16 @@ def process_monthly(var, data_dir, output_dir):
             exp = exp2gauss_exp[split_path[-6]]
 
         x = xr.open_dataset(cdf_path, use_cftime=True)[gauss_var]
+
+        # Special processing for ice fraction - filter by hemisphere and month
+        if gauss_var == "ICEFRAC":
+            # Create a month coordinate
+            month = x.time.dt.month
+            # Filter for Northern Hemisphere September data only
+            x = x.where((x.lat > 0) & (month == 9), drop=False)
+            # Fill non-September months with NaN
+            x = x.where(month == 9, np.nan)
+
         if "historical" in exp:
             # Slice to 1850-2014
             x = x.sel(time=slice("1850", "2014"))
@@ -130,6 +141,9 @@ def process_monthly(var, data_dir, output_dir):
                 exp2member2data_combined[exp][member] = resampled_data.max()
             elif "above" in var or "below" in var:
                 exp2member2data_combined[exp][member] = resampled_data.sum()
+            elif var == "icefrac":
+                exp2member2data_combined[exp][member] = resampled_data.mean()
+                exp2member2data_combined[exp][member] = exp2member2data_combined[exp][member].fillna(0)
             else:
                 exp2member2data_combined[exp][member] = resampled_data.mean()
             # Set time to years instead of dates
