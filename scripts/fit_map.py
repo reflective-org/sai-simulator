@@ -6,7 +6,93 @@ from pathlib import Path
 from joblib import dump, load
 from collections import defaultdict
 from sklearn.linear_model import LinearRegression
+from scipy.optimize import curve_fit
+from functools import partial
+from concurrent.futures import ProcessPoolExecutor
+import numba as nb
+import os
 
+njit = nb.njit
+
+@njit(fastmath=True)
+def stretched_sigmoid_x0(x, lam, beta, x0):
+    """Vectorised stretched sigmoid (λ, β, x0 all scalars)."""
+    z = -(x - x0) / lam    # z ≥ 0 for valid domain
+    z = np.maximum(z, 0.0) # clip to domain  z ≥ 0
+    return 1.0 - np.exp(-(z ** beta))
+
+def _fit_one_column(y_col, x_data, p0, bounds, maxfev):
+    """
+    Returns (λ, β, x0) for a single 1-D y column.
+    """
+    popt, _ = curve_fit(
+        stretched_sigmoid_x0,
+        x_data,
+        y_col,
+        p0=p0,
+        bounds=bounds,
+        maxfev=maxfev
+    )
+    return popt              # tuple length 3
+    
+def fit_stretched_sigmoid_columns(
+        y, X,
+        tiny_thr=1e-3,
+        maxfev=10_000,
+        n_jobs=None,
+    ):
+    """
+    Parameters
+    ----------
+    y : ndarray, shape (n_time, n_cols)
+        Your `y` matrix - each column is one time-series to fit.
+    X : ndarray, shape (n_time,) or broadcastable to (n_time, 1)
+        Predictor array (same for every column).
+    tiny_thr : float
+        Columns whose mean < tiny_thr are treated as "all zeros"
+        and assigned (λ=∞, β=∞, x0=0).
+    maxfev : int
+        Max function evaluations passed to `curve_fit`.
+    n_jobs : int or None
+        Number of worker processes.  None → os.cpu_count().
+
+    Returns
+    -------
+    reg : ndarray, shape (3, n_cols)
+        Row 0 = λ̂, Row 1 = β̂, Row 2 = x̂0
+    """
+    # --- 1 set up shared x-data, initial guess, bounds ---------------------
+    x_data  = np.ascontiguousarray(X.squeeze())
+    x_min   = x_data.min()
+    x_max   = x_data.max()
+    p0      = (np.ptp(x_data) / 2.0, 1.0, x_min)
+    bounds  = ((1e-9, 0.01, x_min - 1),
+               (np.inf, 10.0, x_max + 2))
+
+    n_cols  = y.shape[1]
+    reg     = np.empty((3, n_cols), dtype=float)
+
+    # --- 2 skip tiny columns in vectorised fashion -------------------------
+    tiny_mask = y.mean(axis=0) < tiny_thr
+    reg[:, tiny_mask] = np.array([np.inf, np.inf, 0.0]).reshape(3, 1)
+
+    cols_to_fit = np.where(~tiny_mask)[0]
+    if cols_to_fit.size == 0:        # nothing left
+        return reg
+
+    # --- 3 run the expensive fits in parallel ------------------------------
+    _worker = partial(
+        _fit_one_column,
+        x_data=x_data,
+        p0=p0,
+        bounds=bounds,
+        maxfev=maxfev
+    )
+
+    with ProcessPoolExecutor(max_workers=n_jobs) as pool:
+        results = pool.map(_worker, (y[:, idx] for idx in cols_to_fit))
+    reg[:, cols_to_fit] = np.array(list(results)).T
+    return reg
 
 def fit_map(var, data_dir, output_dir, num_bootstrap_replicates=100, ignore_existing=False):
     data_dir = Path(data_dir)
@@ -65,7 +151,11 @@ def fit_map(var, data_dir, output_dir, num_bootstrap_replicates=100, ignore_exis
             X = np.concatenate(Xs, axis=0) # (time * ssp, 1)
             y = np.concatenate(ys, axis=0) # (time * ssp, lat * lon)
             # For every climate model, train a linear regression that inputs global fair tas and outputs regional smip tas
-            reg = LinearRegression().fit(X, y)
+            if var == "icefrac": # icefrac is a special case since the fit is not linear
+                # fit a stretched sigmoid to the data
+                reg = fit_stretched_sigmoid_columns(y, X, n_jobs=os.cpu_count())
+            else:
+                reg = LinearRegression().fit(X, y)
             model2bootstrapped_fair_emulators[model].append(reg)
             dump(reg, model_path)
 
