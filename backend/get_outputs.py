@@ -105,7 +105,10 @@ def get_outputs(ssp_scenario, temp_target, spatial_gdf, spatial_item,
 
         ### Get regional mean and delta data ###
         if variable_injection is None:
-            regional_delta = get_regional_delta(var, data_dir, model_dir, cache_dir, ssp_scenario, temp_target, ramp_up, temp_diff, start_year)
+            regional_delta = get_regional_delta(
+                var, data_dir, model_dir, cache_dir, ssp_scenario, 
+                temp_target, ramp_up, temp_diff, start_year
+            )
         else:
             if var != "p-e":
                 regional_delta = get_variable_regional_delta(var, data_dir, cache_dir, variable_injection)
@@ -113,7 +116,10 @@ def get_outputs(ssp_scenario, temp_target, spatial_gdf, spatial_item,
                 regional_delta_p = get_variable_regional_delta("pr", data_dir, cache_dir, variable_injection)
                 regional_delta_e = get_variable_regional_delta("e", data_dir, cache_dir, variable_injection)
                 regional_delta = regional_delta_p - regional_delta_e
-
+        if var == "icefrac":
+            global_mean_temp = output_data["tas"]['mean_over_time']["no_sai"]
+            regional_delta = regional_delta.where(global_mean_temp<=3.37).ffill("time")
+        
         ## T-test 
         if historical_model is not None:
             simple_ssp = REVERSE_FANCY_SSP_TITLES[ssp_scenario]
@@ -128,9 +134,15 @@ def get_outputs(ssp_scenario, temp_target, spatial_gdf, spatial_item,
             else:
                 if var in ["tas", "tasmin", "tasmax", "pr", "p-e"]:
                     # The regional map is already rebased, so need to add the historical rebase back before comparing
-                    regional_sai_p_values = get_regional_p_values(var, data_dir, historical_rebase, regional_map + regional_delta + historical_rebase)
+                    regional_sai_p_values = get_regional_p_values(
+                        var, data_dir, historical_rebase,
+                        regional_map + regional_delta + historical_rebase
+                    )
                 else:
-                    regional_sai_p_values = get_regional_p_values(var, data_dir, historical_rebase, regional_map + regional_delta)
+                    regional_sai_p_values = get_regional_p_values(
+                        var, data_dir, historical_rebase,
+                        regional_map + regional_delta
+                    )
             # Slice regional_sai_p_values by the decade
             regional_sai_p_values = regional_sai_p_values.sel(time=decade_end_year)
         else:
