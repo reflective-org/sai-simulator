@@ -5,12 +5,7 @@ from fair_wrap.fair_utils import REVERSE_FANCY_SSP_TITLES, SIM_END_YEAR
 from .constants import *
 from .utils import get_interpolator, clip_to_land
 from .population import get_population_exposure
-
-def stretched_sigmoid(x, lam, beta):
-    """Vectorised stretched sigmoid (λ, β, x0 all scalars)."""
-    z = -x/lam    # z ≥ 0 for valid domain
-    z = np.maximum(z, 0.0) # clip to domain  z ≥ 0
-    return 1.0 - np.exp(-(z ** beta))
+from .backend import stretched_sigmoid
 
 def get_regional_delta_without_rampup(var, data_dir, model_dir, cache_dir, ssp_scenario, temp_target, temp_diff):
 
