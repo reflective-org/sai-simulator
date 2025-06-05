@@ -10,13 +10,7 @@ from .historical import get_historical_model
 from .utils import clip_to_land
 from .population import get_population_exposure
 from .p_values import get_regional_p_values
-
-
-def stretched_sigmoid_x0(x, lam, beta, x0):
-    """Vectorised stretched sigmoid (λ, β, x0 all scalars)."""
-    z = -(x - x0) / lam    # z ≥ 0 for valid domain
-    z = np.maximum(z, 0.0) # clip to domain  z ≥ 0
-    return 1.0 - np.exp(-(z ** beta))
+from .backend import stretched_sigmoid_x0
 
 def get_global_temp(ssp_scenario, initial_dir=None):
     # Get global temperature from FaIR
