@@ -51,13 +51,13 @@ def get_global_temp(ssp_scenario, initial_dir=None):
 
 
 @lru_cache(maxsize=32)  # Caches the last 32 unique calls
-def get_regional_models(model_dir):
+def get_regional_models(variable_dir):
 
     fair2smip_coefs, fair2smip_intercepts, fair2smip_x0 = [], [], []
 
     for model in REGIONAL_MODEL_NAMES:
         for i in range(NUM_EMULATORS):
-            fair2smip = joblib.load(model_dir / f"fair_to_smip_{model}_{i}.joblib")
+            fair2smip = joblib.load(variable_dir / f"fair_to_smip_{model}_{i}.joblib")
             if isinstance(fair2smip, np.ndarray):  # For icefrac (stretched sigmoid)
                 fair2smip_coefs.append(fair2smip[0])  # lambda
                 fair2smip_intercepts.append(fair2smip[1])  # beta
