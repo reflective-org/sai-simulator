@@ -98,7 +98,7 @@ class SigmoidRegression:
 
 class SigmoidRegression_x0:
     """
-    A class for fitting a sigmoid regression model.
+    A class for fitting a sigmoid regression model with intercept (x0).
     """
     def __init__(self):
         self.coef_ = None
