@@ -3,8 +3,10 @@ import numpy as np
 import xarray as xr
 import pandas as pd
 from pathlib import Path
-from scipy.optimize import curve_fit
-from ..backend.backend import SigmoidRegression
+
+import sys
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from backend.backend import SigmoidRegression
 
 def process_so2_data(paths):
     latitudes = ["30S(Tg)", "15S(Tg)", "15N(Tg)", "30N(Tg)"]
