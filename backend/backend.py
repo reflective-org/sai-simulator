@@ -2,7 +2,7 @@ import numpy as np
 from scipy.optimize import curve_fit
 import numba as nb
 from functools import partial
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from scipy.optimize import curve_fit
 
 njit = nb.njit
@@ -50,9 +50,12 @@ class SigmoidRegression:
         if not np.isfinite(y_col).all() or np.all(y_col == 0):
             return np.inf, np.inf              # sentinel
 
-        popt, _ = curve_fit(stretched_sigmoid, x_data, y_col,
-                            p0=p0, bounds=bounds,
-                            maxfev=maxfev)
+        popt, _ = curve_fit(
+            stretched_sigmoid,
+            x_data, y_col,
+            p0=p0, bounds=bounds,
+            maxfev=maxfev
+        )
         return popt # (λ̂, β̂)
 
     def fit_sigmoid_columns_2par(
@@ -107,5 +110,82 @@ class SigmoidRegression_x0:
         self.intercept_ = None
         self.x0_ = None
 
+    def _fit_one_column(self, y_col, x_data, p0, bounds, maxfev):
+        """
+        Returns (λ, β, x0) for a single 1-D y column.
+        """
+        popt, _ = curve_fit(
+            stretched_sigmoid_x0,
+            x_data, y_col,
+            p0=p0, bounds=bounds,
+            maxfev=maxfev
+        )
+        return popt              # tuple length 3
+
+    def fit(self, X, y, tiny_thr=1e-3, maxfev=10_000, n_jobs=None):
+        """
+        Fit the sigmoid regression model.
+        
+        Parameters
+        ----------
+        X : ndarray, shape (n_time,) or broadcastable to (n_time, 1)
+            Predictor array.
+        y : ndarray, shape (n_time, n_cols)
+            Target array - each column is one time-series to fit.
+        tiny_thr : float
+            Columns whose mean < tiny_thr are treated as "all zeros"
+            and assigned (λ=∞, β=∞, x0=0).
+        maxfev : int
+            Max function evaluations passed to `curve_fit`.
+        n_jobs : int or None
+            Number of worker processes. None → os.cpu_count().
+
+        Returns
+        -------
+        self : SigmoidRegression_x0
+            The fitted model.
+        """
+        # --- 1 set up shared x-data, initial guess, bounds ---------------------
+        x_data = np.ascontiguousarray(X.squeeze())
+        x_min = x_data.min()
+        x_max = x_data.max()
+        p0 = (np.ptp(x_data) / 2.0, 1.0, x_min)
+        bounds = ((1e-9, 0.01, x_min - 1),
+                 (np.inf, 10.0, x_max + 2))
+
+        n_cols = y.shape[1]
+        reg = np.empty((3, n_cols), dtype=float)
+
+        # --- 2 skip tiny columns in vectorised fashion -------------------------
+        tiny_mask = y.mean(axis=0) < tiny_thr
+        reg[:, tiny_mask] = np.array([np.inf, np.inf, 0.0]).reshape(3, 1)
+
+        cols_to_fit = np.where(~tiny_mask)[0]
+        if cols_to_fit.size == 0:        # nothing left
+            self.coef_ = reg[0]  # lambda
+            self.intercept_ = reg[1]  # beta
+            self.x0_ = reg[2]  # x0
+            return self
+
+        # --- 3 run the expensive fits in parallel ------------------------------
+        _worker = partial(
+            self._fit_one_column,
+            x_data=x_data,
+            p0=p0,
+            bounds=bounds,
+            maxfev=maxfev
+        )
+
+        with ProcessPoolExecutor(max_workers=n_jobs) as pool:
+            results = pool.map(_worker, (y[:, idx] for idx in cols_to_fit))
+        reg[:, cols_to_fit] = np.array(list(results)).T
+
+        # Store the fitted parameters
+        self.coef_ = reg[0]  # lambda
+        self.intercept_ = reg[1]  # beta
+        self.x0_ = reg[2]  # x0
+
+        return self
+    
     def predict(self, X):
         return stretched_sigmoid_x0(X, self.coef_, self.intercept_, self.x0_)

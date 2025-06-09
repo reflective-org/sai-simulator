@@ -10,7 +10,7 @@ from .historical import get_historical_model
 from .utils import clip_to_land
 from .population import get_population_exposure
 from .p_values import get_regional_p_values
-from .backend import stretched_sigmoid_x0
+from .backend import SigmoidRegression_x0
 
 def get_global_temp(ssp_scenario, initial_dir=None):
     # Get global temperature from FaIR
@@ -48,54 +48,36 @@ def get_global_temp(ssp_scenario, initial_dir=None):
 
     return global_temp
 
-
-
 @lru_cache(maxsize=32)  # Caches the last 32 unique calls
 def get_regional_models(variable_dir):
-
-    fair2smip_coefs, fair2smip_intercepts, fair2smip_x0 = [], [], []
-
+    var = variable_dir.name
+    
+    # Load all model data
+    model_data = []
     for model in REGIONAL_MODEL_NAMES:
         for i in range(NUM_EMULATORS):
-            fair2smip = joblib.load(variable_dir / f"fair_to_smip_{model}_{i}.joblib")
-            if isinstance(fair2smip, np.ndarray):  # For icefrac (stretched sigmoid)
-                fair2smip_coefs.append(fair2smip[0])  # lambda
-                fair2smip_intercepts.append(fair2smip[1])  # beta
-                fair2smip_x0.append(fair2smip[2])  # x0
-            else:  # For other variables (linear regression)
-                fair2smip_coefs.append(fair2smip.coef_)
-                fair2smip_intercepts.append(fair2smip.intercept_)
-                fair2smip_x0.append(None)  # Add None for linear regression case
-
-    fair2smip_coefs = np.concatenate(fair2smip_coefs)
-    fair2smip_intercepts = np.concatenate(fair2smip_intercepts)
+            model_data.append(joblib.load(variable_dir / f"fair_to_smip_{model}_{i}.joblib"))
     
-    # Check if we have any non-None x0 values (icefrac case)
-    has_x0 = any(x is not None for x in fair2smip_x0)
-    if has_x0:
-        # Filter out None values and concatenate
-        fair2smip_x0 = np.concatenate([x for x in fair2smip_x0 if x is not None])
-        fair2smip = np.stack([fair2smip_coefs, fair2smip_intercepts, fair2smip_x0], axis=0)
-    else:  # Linear regression case
-        fair2smip = LinearRegression(n_jobs=-1)
-        fair2smip.coef_ = fair2smip_coefs
-        fair2smip.intercept_ = fair2smip_intercepts
-
+    # Extract coefficients and intercepts
+    fair2smip_coefs = np.concatenate([m.coef_ for m in model_data])
+    fair2smip_intercepts = np.concatenate([m.intercept_ for m in model_data])
+    
+    # Initialize appropriate regression model
+    fair2smip = SigmoidRegression_x0() if var == "icefrac" else LinearRegression(n_jobs=-1)
+    
+    # Set model parameters
+    fair2smip.coef_ = fair2smip_coefs
+    fair2smip.intercept_ = fair2smip_intercepts
+    if var == "icefrac":
+        fair2smip.x0_ = np.concatenate([m.x0_ for m in model_data])
+    
     return fair2smip
-
 
 def get_smip(global_temp, fair2smip):
     # Get regional projections for each model
-    if isinstance(fair2smip, np.ndarray):  # For icefrac (stretched sigmoid)
-        # Reshape global temp to match 2015 to the end of the time series
-        X = global_temp.sel(timebounds=slice(2015, None)).values[:, np.newaxis]
-        # Apply stretched sigmoid function with fitted parameters (λ, β, x0)
-        smip = stretched_sigmoid_x0(X, fair2smip[0], fair2smip[1], fair2smip[2])
-    else:  # For other variables (linear regression)
-        smip = fair2smip.predict(global_temp.sel(timebounds=slice(2015, None)))
-
+    X = global_temp.sel(timebounds=slice(2015, None)).values[:, np.newaxis]
+    smip = fair2smip.predict(X)
     smip = smip.reshape((smip.shape[0], len(REGIONAL_MODEL_NAMES), NUM_EMULATORS, NUM_LAT, NUM_LON))
-
     return smip
 
 def get_threshold_temp(model_dir, var):
