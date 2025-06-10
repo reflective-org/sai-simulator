@@ -80,16 +80,6 @@ def get_smip(global_temp, fair2smip):
     smip = smip.reshape((smip.shape[0], len(REGIONAL_MODEL_NAMES), NUM_EMULATORS, NUM_LAT, NUM_LON))
     return smip
 
-def get_threshold_temp(model_dir, var):
-    variable_dir = model_dir / var
-    fair2smip = get_regional_models(variable_dir)
-    coef = fair2smip.coef_.reshape((NUM_EMULATORS, NUM_LAT, NUM_LON))
-    intercept = fair2smip.intercept_.reshape((NUM_EMULATORS, NUM_LAT, NUM_LON))
-    threshold_temp = -intercept / coef
-    threshold_temp = np.nan_to_num(threshold_temp.mean(axis=0))
-    return threshold_temp, coef, intercept
-
-
 def get_regional_map_from_global_temp(global_temp, fair2smip, var, data_dir, cache_dir):
     # Get regional map from global temperature
     smip = get_smip(global_temp, fair2smip)
