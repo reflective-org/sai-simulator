@@ -15,6 +15,7 @@ from .p_values import get_regional_p_values
 from .population import get_population_data
 from .variable import get_variable_regional_delta
 from .utils import get_interpolator, create_mask, regional_aggregation, apply_constraints, clip_to_land
+from .icefrac import get_area
 
 
 @lru_cache(maxsize=32)  # Caches the last 32 unique calls
@@ -85,12 +86,16 @@ def get_outputs(ssp_scenario, temp_target, spatial_gdf, spatial_item,
 
         is_exposure = "exposure" in var
         is_above_below = "above" in var or "below" in var
+        is_icefrac = var == "icefrac"
+        if is_icefrac:
+            area = get_area(data_dir)
 
         # Load projection data
         if var == "tas":
             regional_map, regional_no_sai_p_values = regional_temp, regional_temp_no_sai_p_values
         else:
             regional_map, regional_no_sai_p_values = get_regional_map(var, data_dir, model_dir, cache_dir, ssp_scenario)
+        output_data[var]["regional_map"] = regional_map
 
         # Slice regional_no_sai_p_values by the decade
         if regional_no_sai_p_values is not None:
@@ -116,9 +121,9 @@ def get_outputs(ssp_scenario, temp_target, spatial_gdf, spatial_item,
                 regional_delta_p = get_variable_regional_delta("pr", data_dir, cache_dir, variable_injection)
                 regional_delta_e = get_variable_regional_delta("e", data_dir, cache_dir, variable_injection)
                 regional_delta = regional_delta_p - regional_delta_e
-        if var == "icefrac":
-            global_mean_temp = output_data["tas"]['mean_over_time']["no_sai"]
-            regional_delta = regional_delta.where(global_mean_temp<=3.37).ffill("time")
+        if is_icefrac:
+            total_ice_area_no_sai = (regional_map * area.broadcast_like(regional_map)).sum(('lat', 'lon')).sel(time=slice(start_year, SIM_END_YEAR))
+            regional_delta = regional_delta.where(total_ice_area_no_sai>=.05).ffill("time")
         
         ## T-test 
         if historical_model is not None:
@@ -168,12 +173,12 @@ def get_outputs(ssp_scenario, temp_target, spatial_gdf, spatial_item,
         recent_regional_map = regional_map.sel(time=slice(2015, start_year-1))
         regional_map = regional_map.sel(time=slice(start_year, SIM_END_YEAR))
 
-        if is_exposure:
+        if is_exposure or is_icefrac:
             op = "sum"
         else:
             op = "mean"
 
-        if is_exposure:
+        if is_exposure or is_icefrac:
             # Define data array of all ones like regional_map.lat
             weights = xr.DataArray(np.ones_like(regional_map.lat), dims=('lat'), coords={'lat': regional_map.lat})
         else:
@@ -182,17 +187,30 @@ def get_outputs(ssp_scenario, temp_target, spatial_gdf, spatial_item,
         if spatial_gdf is None or spatial_item is None:
             if historical_model is not None:
                 # Compute historical global mean
-                historical_mean = regional_aggregation(historical_model, weights, op)
-            # Compute recent global mean
-            recent_global_mean = regional_aggregation(recent_regional_map, weights, op)
-            # Compute mean temperature with and without SAI
-            mean_no_sai = regional_aggregation(regional_map, weights, op)
+                if is_icefrac:
+                    historical_mean = regional_aggregation(historical_model * area.broadcast_like(historical_model), weights, op)
+                else:
+                    historical_mean = regional_aggregation(historical_model, weights, op)
+            
+            if is_icefrac:
+                # Compute recent global mean
+                recent_global_mean = regional_aggregation(recent_regional_map * area.broadcast_like(recent_regional_map), weights, op)
+                # Compute mean temperature with and without SAI
+                mean_no_sai = regional_aggregation(regional_map * area.broadcast_like(regional_map), weights, op)
+            else:
+                # Compute recent global mean
+                recent_global_mean = regional_aggregation(recent_regional_map, weights, op)
+                # Compute mean temperature with and without SAI
+                mean_no_sai = regional_aggregation(regional_map, weights, op)
             regional_map_with_sai = regional_map + regional_delta
             if is_above_below:
                 regional_map_with_sai = regional_map_with_sai.where(regional_map_with_sai > 0, 0)
                 # Clip again because the above sets nan values to 0
                 regional_map_with_sai = clip_to_land(data_dir, regional_map_with_sai)
-            mean_with_sai = regional_aggregation(regional_map_with_sai, weights, op)
+            if is_icefrac:
+                mean_with_sai = regional_aggregation(regional_map_with_sai * area.broadcast_like(regional_map_with_sai), weights, op)
+            else:
+                mean_with_sai = regional_aggregation(regional_map_with_sai, weights, op)
         else:
             if historical_model is not None:
                 # Compute historical global mean averaged over the selected geometry
