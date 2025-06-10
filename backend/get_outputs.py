@@ -121,6 +121,8 @@ def get_outputs(ssp_scenario, temp_target, spatial_gdf, spatial_item,
                 regional_delta_p = get_variable_regional_delta("pr", data_dir, cache_dir, variable_injection)
                 regional_delta_e = get_variable_regional_delta("e", data_dir, cache_dir, variable_injection)
                 regional_delta = regional_delta_p - regional_delta_e
+        # If icefrac, set the regional delta to 0 when the total ice area is less than 0.05 million km^2
+        # this is a hack to avoid the icefrac delta keeps increasing when the total ice area is less than 0.05 million km^2
         if is_icefrac:
             total_ice_area_no_sai = (regional_map * area.broadcast_like(regional_map)).sum(('lat', 'lon')).sel(time=slice(start_year, SIM_END_YEAR))
             regional_delta = regional_delta.where(total_ice_area_no_sai>=.05).ffill("time")
