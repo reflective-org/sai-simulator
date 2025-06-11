@@ -10,7 +10,7 @@ from .historical import get_historical_model
 from .utils import clip_to_land
 from .population import get_population_exposure
 from .p_values import get_regional_p_values
-from .backend import SigmoidRegression_x0
+from .sigmoid import SigmoidRegression_x0
 
 def get_global_temp(ssp_scenario, initial_dir=None):
     # Get global temperature from FaIR

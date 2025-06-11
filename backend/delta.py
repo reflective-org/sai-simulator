@@ -5,7 +5,7 @@ from fair_wrap.fair_utils import REVERSE_FANCY_SSP_TITLES, SIM_END_YEAR
 from .constants import *
 from .utils import get_interpolator, clip_to_land
 from .population import get_population_exposure
-from .backend import stretched_sigmoid
+from .sigmoid import stretched_sigmoid
 
 def get_regional_delta_without_rampup(var, data_dir, model_dir, cache_dir, ssp_scenario, temp_target, temp_diff):
 

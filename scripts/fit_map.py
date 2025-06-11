@@ -10,7 +10,7 @@ import os
 
 import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))
-from backend.backend import SigmoidRegression_x0
+from backend.sigmoid import SigmoidRegression_x0
 
 
 def fit_map(var, data_dir, output_dir, num_bootstrap_replicates=100, ignore_existing=False):
