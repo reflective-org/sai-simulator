@@ -5,7 +5,7 @@ from fair_wrap.fair_utils import REVERSE_FANCY_SSP_TITLES, SIM_END_YEAR
 from .constants import *
 from .utils import get_interpolator, clip_to_land
 from .population import get_population_exposure
-
+from .sigmoid import stretched_sigmoid
 
 def get_regional_delta_without_rampup(var, data_dir, model_dir, cache_dir, ssp_scenario, temp_target, temp_diff):
 
@@ -27,9 +27,13 @@ def get_regional_delta_without_rampup(var, data_dir, model_dir, cache_dir, ssp_s
         variable_dir = model_dir / var
         
         interpolator = get_interpolator(variable_dir / "interpolator.nc")
-
-        regional_delta = interpolator.sel(features='slope') * temp_diff
-
+        if var == "icefrac":
+            lambda_hat = interpolator.sel(features='lambda')
+            beta_hat = interpolator.sel(features='beta')
+            regional_delta = stretched_sigmoid(temp_diff, lambda_hat, beta_hat)
+            regional_delta = regional_delta.transpose('lat', 'lon', 'time')
+        else:
+            regional_delta = interpolator.sel(features='slope') * temp_diff
         regional_delta = regional_delta[var]
 
         if is_above_below or var in ["pr", "p-e"]:

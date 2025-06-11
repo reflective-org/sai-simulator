@@ -44,6 +44,7 @@ def get_vmin_vmax(var, var_is_rebased, delta):
         "exposure_above_10": (0, 50),
         "exposure_above_20": (0, 50),
         "p-e": (-1, 1),
+        "icefrac": (0, 1),
     }
 
     return var2scale[var]
@@ -98,6 +99,13 @@ def generate_gradio_plots(ssp_scenario, temp_target, spatial_agg, spatial_item,
         regional_fig, regional_axs = plt.subplots(1, 1, figsize=REGIONAL_FIGSIZE, subplot_kw={'projection': projection})    
         sai_fig, sai_axs = plt.subplots(1, 1, figsize=REGIONAL_FIGSIZE, subplot_kw={'projection': projection})
         delta_fig, delta_axs = plt.subplots(1, 1, figsize=REGIONAL_FIGSIZE, subplot_kw={'projection': projection})
+        if var == 'icefrac':
+            regional_fig, regional_axs = plt.subplots(1, 1, figsize=REGIONAL_FIGSIZE, subplot_kw={'projection': ccrs.NorthPolarStereo(globe=None)})    
+            sai_fig, sai_axs = plt.subplots(1, 1, figsize=REGIONAL_FIGSIZE, subplot_kw={'projection': ccrs.NorthPolarStereo(globe=None)})
+            delta_fig, delta_axs = plt.subplots(1, 1, figsize=REGIONAL_FIGSIZE, subplot_kw={'projection': ccrs.NorthPolarStereo(globe=None)})
+            regional_axs.set_extent([-180, 180, 60, 90], crs=ccrs.PlateCarree())
+            sai_axs.set_extent([-180, 180, 60, 90], crs=ccrs.PlateCarree())
+            delta_axs.set_extent([-180, 180, 60, 90], crs=ccrs.PlateCarree())
 
         var_plots["delta"] = delta_fig
 
@@ -393,7 +401,7 @@ def get_args():
     parser.add_argument("--use_robinson_projection", action="store_true")
     parser.add_argument("--use_local_cache", action="store_true")
     parser.add_argument("--data_dir", type=str, default="data/processed")
-    parser.add_argument("--model_dir", type=str, default="data/processed")
+    parser.add_argument("--model_dir", type=str, default="data/models")
     parser.add_argument("--cache_dir", type=str, default="data/cache")
     return parser.parse_args()
 
@@ -401,7 +409,7 @@ def get_args():
 def get_params():
     args = get_args()
     if args.use_local_cache:
-        CACHE_DIR = Path(__file__).parent / "cache"
+        CACHE_DIR = Path(__file__).parent / "data/cache"
     else:
         CACHE_DIR = Path(args.cache_dir)
         CACHE_DIR.mkdir(exist_ok=True)
@@ -489,6 +497,7 @@ if __name__ == "__main__":
             ("Exposure to Days above 10mm", "red"),
             ("Exposure to Days above 20mm", "red"),
             ("Water Availability", "red"),
+            ("Ice Fraction", "blue"),
         ]
         for var, slider_color in other_variables:
             outputs.append(ImageSlider(label=f"Regional {var}", type="pil", slider_color=slider_color))

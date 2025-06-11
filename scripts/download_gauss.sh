@@ -28,7 +28,7 @@ for dir in "${base_dirs[@]}"
 do
     echo "Listing files in $dir..."
     # List files in the directory and filter for specific patterns
-    files=$(globus ls $source_endpoint_id:$dir | grep -E "\.TREFHT\.|\.\PRECT\.|\.TREFHTMN\.|\.TREFHTMX\.|\.QFLX\." | grep -E "\.h0\.")
+    files=$(globus ls $source_endpoint_id:$dir | grep -E "\.TREFHT\.|\.\PRECT\.|\.TREFHTMN\.|\.TREFHTMX\.|\.QFLX\.|\.ICEFRAC\." | grep -E "\.h0\.")
 
     # Loop through filtered files and initiate transfer
     for file in $files
@@ -38,7 +38,7 @@ do
             echo "Skipping $file, already exists at destination."
         else
             echo "Transferring $file from $dir..."
-            globus transfer $source_endpoint_id:$dir/$file $destination_endpoint_id:$local_destination$file
+            globus transfer $source_endpoint_id:$dir/$file $destination_endpoint_id:$local_destination/$file
         fi
     done
 done
@@ -54,7 +54,7 @@ do
             echo "Skipping $file, already exists at destination."
         else
             echo "Transferring $file from /MA-BASELINE.00$i/atm/proc/tseries/month_1..."
-            globus transfer $source_endpoint_id:/MA-BASELINE.00$i/atm/proc/tseries/month_1/$file $destination_endpoint_id:$local_destination$file
+            globus transfer $source_endpoint_id:/MA-BASELINE.00$i/atm/proc/tseries/month_1/$file $destination_endpoint_id:$local_destination/$file
         fi
     done
 done
@@ -70,7 +70,7 @@ do
             echo "Skipping $file, already exists at destination."
         else
             echo "Transferring $file from /MA-HISTORICAL.00$i/atm/proc/tseries/month_1..."
-            globus transfer $source_endpoint_id:/MA-HISTORICAL.00$i/atm/proc/tseries/month_1/$file $destination_endpoint_id:$local_destination$file
+            globus transfer $source_endpoint_id:/MA-HISTORICAL.00$i/atm/proc/tseries/month_1/$file $destination_endpoint_id:$local_destination/$file
         fi
     done
 done
@@ -88,7 +88,7 @@ do
             echo "Skipping $file, already exists at destination."
         else
             echo "Transferring $file from $dir..."
-            globus transfer $source_endpoint_id:$dir/$file $destination_endpoint_id:$local_destination$file
+            globus transfer $source_endpoint_id:$dir/$file $destination_endpoint_id:$local_destination/$file
         fi
     done
 done
@@ -102,6 +102,6 @@ do
         echo "Skipping $file, already exists at destination."
     else
         echo "Transferring $file from /ARISE-HISTORICAL..."
-        globus transfer $source_endpoint_id:/ARISE-HISTORICAL/$file $destination_endpoint_id:$local_destination$file
+        globus transfer $source_endpoint_id:/ARISE-HISTORICAL/$file $destination_endpoint_id:$local_destination/$file
     fi
 done

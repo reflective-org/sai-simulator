@@ -6,6 +6,11 @@ from pathlib import Path
 from joblib import dump, load
 from collections import defaultdict
 from sklearn.linear_model import LinearRegression
+import os
+
+import sys
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from backend.sigmoid import SigmoidRegression_x0
 
 
 def fit_map(var, data_dir, output_dir, num_bootstrap_replicates=100, ignore_existing=False):
@@ -65,7 +70,11 @@ def fit_map(var, data_dir, output_dir, num_bootstrap_replicates=100, ignore_exis
             X = np.concatenate(Xs, axis=0) # (time * ssp, 1)
             y = np.concatenate(ys, axis=0) # (time * ssp, lat * lon)
             # For every climate model, train a linear regression that inputs global fair tas and outputs regional smip tas
-            reg = LinearRegression().fit(X, y)
+            if var == "icefrac": # icefrac is a special case since the fit is not linear
+                # fit a stretched sigmoid to the data
+                reg = SigmoidRegression_x0().fit(X, y, n_jobs=os.cpu_count())
+            else:
+                reg = LinearRegression().fit(X, y)
             model2bootstrapped_fair_emulators[model].append(reg)
             dump(reg, model_path)
 

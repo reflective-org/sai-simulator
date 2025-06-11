@@ -4,6 +4,9 @@ import xarray as xr
 import pandas as pd
 from pathlib import Path
 
+import sys
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from backend.sigmoid import SigmoidRegression
 
 def process_so2_data(paths):
     latitudes = ["30S(Tg)", "15S(Tg)", "15N(Tg)", "30N(Tg)"]
@@ -111,9 +114,18 @@ def fit_delta(var, data_dir, output_dir, ignore_existing=False):
     # Get tas difference
     output_gauss_1_5_tas, output_gauss_1_0_tas, output_gauss_0_5_tas = get_temporal_averaged_experiments(tas_processed_dir)
     output_gauss_baseline_tas, _, _ = get_temporal_averaged_baseline(tas_processed_dir, equivalent=False)
-    mean_diff_1_5 = (output_gauss_1_5_tas.weighted(np.cos(np.deg2rad(output_gauss_1_5_tas.lat))).mean(('lat', 'lon')) - output_gauss_baseline_tas.weighted(np.cos(np.deg2rad(output_gauss_baseline_tas.lat))).mean(('lat', 'lon')))["tas"].item()
-    mean_diff_1_0 = (output_gauss_1_0_tas.weighted(np.cos(np.deg2rad(output_gauss_1_0_tas.lat))).mean(('lat', 'lon')) - output_gauss_baseline_tas.weighted(np.cos(np.deg2rad(output_gauss_baseline_tas.lat))).mean(('lat', 'lon')))["tas"].item()
-    mean_diff_0_5 = (output_gauss_0_5_tas.weighted(np.cos(np.deg2rad(output_gauss_0_5_tas.lat))).mean(('lat', 'lon')) - output_gauss_baseline_tas.weighted(np.cos(np.deg2rad(output_gauss_baseline_tas.lat))).mean(('lat', 'lon')))["tas"].item()
+    mean_diff_1_5 = (
+        output_gauss_1_5_tas.weighted(np.cos(np.deg2rad(output_gauss_1_5_tas.lat))).mean(('lat', 'lon')) - 
+        output_gauss_baseline_tas.weighted(np.cos(np.deg2rad(output_gauss_baseline_tas.lat))).mean(('lat', 'lon'))
+    )["tas"].item()
+    mean_diff_1_0 = (
+        output_gauss_1_0_tas.weighted(np.cos(np.deg2rad(output_gauss_1_0_tas.lat))).mean(('lat', 'lon')) - 
+        output_gauss_baseline_tas.weighted(np.cos(np.deg2rad(output_gauss_baseline_tas.lat))).mean(('lat', 'lon'))
+    )["tas"].item()
+    mean_diff_0_5 = (
+        output_gauss_0_5_tas.weighted(np.cos(np.deg2rad(output_gauss_0_5_tas.lat))).mean(('lat', 'lon')) - 
+        output_gauss_baseline_tas.weighted(np.cos(np.deg2rad(output_gauss_baseline_tas.lat))).mean(('lat', 'lon'))
+    )["tas"].item()
 
     # Fit a linear model to the three tas points
     x_values = np.array([mean_diff_1_5, mean_diff_1_0, mean_diff_0_5])
@@ -141,17 +153,32 @@ def fit_delta(var, data_dir, output_dir, ignore_existing=False):
                                        'lat': Y.lat.values})
     else:
         # Stack the data arrays along a new dimension ('sample'), aligning with the order of x_values
-        Y = xr.concat([output_gauss_1_5_rebased, output_gauss_1_0_rebased, output_gauss_0_5_rebased], dim='sample').sel(model="CESM2-WACCM", ssp="ssp245")[var]
+        Y = xr.concat(
+            [output_gauss_1_5_rebased, output_gauss_1_0_rebased, output_gauss_0_5_rebased],
+            dim='sample'
+        ).sel(model="CESM2-WACCM", ssp="ssp245")[var]
         Y_stacked = Y.stack(samples=('lat', 'lon'))
 
-        beta_numpy = np.linalg.lstsq(X_numpy, Y_stacked.values, rcond=None)[0]
-
-        # Reshape the beta coefficients to have dimensions (features, lat, lon)
-        beta_reshaped = beta_numpy.reshape((1, Y.lat.size, Y.lon.size))
-        beta_xr = xr.DataArray(beta_reshaped, dims=['features', 'lat', 'lon'], 
-                            coords={'features': ['slope'],
-                                    'lat': Y.lat.values, 
-                                    'lon': Y.lon.values})
+        if var == "icefrac":
+            sigmoid_reg = SigmoidRegression()
+            reg = sigmoid_reg.fit(X_numpy, Y_stacked.values)
+            # reshape back to (features, lat, lon)
+            reg_reshaped = reg.reshape((2, Y.lat.size, Y.lon.size))
+            beta_xr = xr.DataArray(
+                reg_reshaped,
+                dims=['features', 'lat', 'lon'],
+                coords={'features': ['lambda', 'beta'],
+                        'lat': Y.lat,
+                        'lon': Y.lon}
+            )
+        else:
+            beta_numpy = np.linalg.lstsq(X_numpy, Y_stacked.values, rcond=None)[0]
+            # Reshape the beta coefficients to have dimensions (features, lat, lon)
+            beta_reshaped = beta_numpy.reshape((1, Y.lat.size, Y.lon.size))
+            beta_xr = xr.DataArray(beta_reshaped, dims=['features', 'lat', 'lon'], 
+                                coords={'features': ['slope'],
+                                        'lat': Y.lat.values, 
+                                        'lon': Y.lon.values})
 
     # Convert to a Dataset and save to disk
     beta_xr = beta_xr.to_dataset(name=var)

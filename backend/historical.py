@@ -18,7 +18,7 @@ def get_historical_model(var, data_dir, cache_dir):
     else:
         is_above_below = "above" in var or "below" in var
         is_exposure = "exposure" in var
-        if var in ["pr", "tas", "p-e"]:
+        if var in ["pr", "tas", "p-e", "icefrac"]:
             historical_model_data = xr.open_dataarray(data_dir / var / "output_gauss-baseline.nc", autoclose=True)
             historical_model_data = historical_model_data.sel(model="CESM2-WACCM", ssp="ssp245")
             historical_model_data = historical_model_data.drop_vars(["ssp", "model"])
