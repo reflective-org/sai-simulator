@@ -75,7 +75,7 @@ def get_regional_models(variable_dir):
 
 def get_smip(global_temp, fair2smip):
     # Get regional projections for each model
-    X = global_temp.sel(timebounds=slice(2015, None)).values[:, np.newaxis]
+    X = global_temp.sel(timebounds=slice(2015, None)).values #[:, np.newaxis]
     smip = fair2smip.predict(X)
     smip = smip.reshape((smip.shape[0], len(REGIONAL_MODEL_NAMES), NUM_EMULATORS, NUM_LAT, NUM_LON))
     return smip
