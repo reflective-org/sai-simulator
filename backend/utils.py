@@ -3,6 +3,7 @@ import xarray as xr
 import geopandas as gpd
 from functools import lru_cache
 from scipy.signal import butter, filtfilt
+from pathlib import Path
 
 
 @lru_cache(maxsize=32)  # Caches the last 32 unique calls
@@ -93,3 +94,24 @@ def clip_to_land(data_dir, regional_map):
     land_mask = create_mask(regional_map, continental_gdf)
     regional_map = regional_map.where(land_mask, np.nan)
     return regional_map
+
+
+def load_spatial_aggregation_gdfs(data_dir):
+    data_dir = Path(data_dir)
+    geojsons_dir = data_dir / "geojsons"
+    
+    if not geojsons_dir.exists():
+        raise FileNotFoundError(f"Geojsons directory not found: {geojsons_dir}")
+    
+    spatial_agg_gdfs = {}
+    for geojson_file in geojsons_dir.glob("*.geojson"):
+        try:
+            gdf = gpd.read_file(geojson_file)
+            # Normalize column naming to match downstream expectations
+            if "Name" in gdf.columns and "name" not in gdf.columns:
+                gdf = gdf.rename(columns={"Name": "name"})
+            spatial_agg_gdfs[geojson_file.stem] = gdf
+        except Exception as e:
+            print(f"Warning: Could not load {geojson_file}: {e}")
+    
+    return spatial_agg_gdfs

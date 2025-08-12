@@ -2,6 +2,8 @@ import rasterio
 import numpy as np
 import xarray as xr
 import geopandas as gpd
+import hashlib
+from pathlib import Path
 from functools import lru_cache
 from collections import defaultdict
 
@@ -54,7 +56,7 @@ def get_so2_by_latitude(interpolator, temp_diff, ramp_up):
 
 def get_outputs(ssp_scenario, temp_target, spatial_gdf, spatial_item,
                 decade_start_year, decade_end_year, start_year, ramp_up,
-                data_dir, model_dir, cache_dir, var=None, variable_injection=None):
+                data_dir, model_dir, cache_dir, var=None, variable_injection=None, output_config={}):
 
     ### Set up directories ###
     data_dir = Path(data_dir)
@@ -167,6 +169,10 @@ def get_outputs(ssp_scenario, temp_target, spatial_gdf, spatial_item,
 
         output_data[var]["regional_no_sai_p_values"] = regional_no_sai_p_values
         output_data[var]["regional_sai_p_values"] = regional_sai_p_values
+
+        ### Create GeoTIFF files ###
+        if output_config.get("create_geotiffs", False):
+            output_data["geotiff_paths"] = create_geotiff_files(**locals())
 
         #### Mean over time plot ####
         # Get period between 2015 and SAI start year, SAI start year to SAI end year, and SAI end year to 2100
@@ -389,3 +395,137 @@ def get_outputs(ssp_scenario, temp_target, spatial_gdf, spatial_item,
     output_data["global_so2"] = global_so2
 
     return output_data
+
+
+def create_geotiff_files(var, regional_mean, regional_delta_mean,
+                        regional_no_sai_p_values, regional_sai_p_values,
+                        ssp_scenario, temp_target=None,
+                        decade_start_year=None, decade_end_year=None,
+                        start_year=None, ramp_up=None, variable_injection=None,
+                        output_config={}, **kwargs):
+    """
+    Create GeoTIFF files for a given variable with both no_sai and with_sai scenarios.
+    
+    Returns:
+        dict: Dictionary mapping scenario keys to file paths
+    """
+    geotiff_paths = {}
+    
+    output_dir = Path(output_config.get("output_dir", "output")) / "geotiffs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create a hash of the input parameters for GeoTIFF filenames
+    if variable_injection is None:
+        geotiff_params = [
+            ssp_scenario,
+            temp_target,
+            decade_start_year,
+            decade_end_year,
+            start_year,
+            ramp_up,
+        ]
+    else:
+        # Hash the variable_injection array to include in the cache key
+        variable_injection_str = str(variable_injection)
+        variable_hash = hashlib.md5(variable_injection_str.encode()).hexdigest()[:8]
+        geotiff_params = [
+            ssp_scenario,
+            decade_start_year,
+            decade_end_year,
+            f"vinj_{variable_hash}"
+        ]
+    
+    geotiff_params_str = "_".join(map(str, geotiff_params))
+    geotiff_params_hash = hashlib.md5(geotiff_params_str.encode()).hexdigest()[:10]
+
+    for data, suffix in [(regional_mean, "no_sai"), (regional_mean + regional_delta_mean, "with_sai")]:
+        output_filename = f"{var}_{suffix}_{geotiff_params_hash}.tif"
+        output_path = output_dir / output_filename
+
+        # Skip if file already exists
+        if output_path.exists():
+            geotiff_paths[f"{var}_{suffix}"] = str(output_path)
+            continue
+        
+        # Adjust longitude values from 0-360 to -180-180
+        data_adjusted = data.assign_coords(lon=(((data.lon + 180) % 360) - 180))
+        data_adjusted = data_adjusted.sortby('lon')
+        
+        # Flip the data vertically and reverse the latitude coordinates
+        data_adjusted = data_adjusted.isel(lat=slice(None, None, -1))
+        
+        # Prepare the data for GeoTIFF
+        data_array = data_adjusted.values
+        
+        # Get the appropriate significance mask
+        if suffix == "no_sai" and regional_no_sai_p_values is not None:
+            # For no_sai map, adjust p-values the same way we adjusted the data
+            p_values_adjusted = regional_no_sai_p_values.assign_coords(lon=(((regional_no_sai_p_values.lon + 180) % 360) - 180))
+            p_values_adjusted = p_values_adjusted.sortby('lon')
+            p_values_adjusted = p_values_adjusted.isel(lat=slice(None, None, -1))
+            
+            # 1 = not significant, NaN = either significant or not included
+            significance_mask = np.where(
+                (~np.isnan(p_values_adjusted.values)) & (p_values_adjusted.values >= 0.05),
+                1,
+                np.nan
+            ).astype(np.float32)
+            
+        elif suffix == "with_sai" and regional_sai_p_values is not None:
+            # For with_sai map, adjust p-values the same way we adjusted the data
+            p_values_adjusted = regional_sai_p_values.assign_coords(lon=(((regional_sai_p_values.lon + 180) % 360) - 180))
+            p_values_adjusted = p_values_adjusted.sortby('lon')
+            p_values_adjusted = p_values_adjusted.isel(lat=slice(None, None, -1))
+
+            # 1 = not significant, NaN = either significant or not included
+            significance_mask = np.where(
+                (~np.isnan(p_values_adjusted.values)) & (p_values_adjusted.values >= 0.05),
+                1,
+                np.nan
+            ).astype(np.float32)
+            
+        else:
+            # Default to all NaN (no hatching) if p-values not available
+            significance_mask = np.full_like(data_array, np.nan, dtype=np.float32)
+        
+        # Convert to float32 if it's not already
+        if data_array.dtype != np.float32:
+            data_array = data_array.astype(np.float32)
+        
+        # Calculate the correct transform
+        lon_res = (data_adjusted.lon.max() - data_adjusted.lon.min()) / (data_adjusted.lon.size - 1)
+        lat_res = (data_adjusted.lat.max() - data_adjusted.lat.min()) / (data_adjusted.lat.size - 1)
+        transform = rasterio.transform.from_origin(
+            data_adjusted.lon.min() - lon_res/2, 
+            data_adjusted.lat.max() + lat_res/2, 
+            lon_res, lat_res
+        )
+
+        # Write to memory first, then save to disk atomically
+        with rasterio.MemoryFile() as memfile:
+            with memfile.open(
+                driver='GTiff',
+                height=data_array.shape[0],
+                width=data_array.shape[1],
+                count=2,  # Now using 2 bands
+                dtype=data_array.dtype,
+                crs='+proj=longlat +datum=WGS84 +no_defs',
+                transform=transform,
+                compress='deflate',
+                zlevel=9,
+                predictor=3,
+                tiled=False,
+                blockxsize=data_array.shape[1],
+                blockysize=1,
+            ) as dst:
+                dst.write(data_array, 1)  # Data values in band 1
+                dst.write(significance_mask, 2)  # Significance mask in band 2
+            
+            # Only write to disk if file doesn't exist
+            if not output_path.exists():
+                with open(output_path, 'wb') as f:
+                    f.write(memfile.read())
+
+        geotiff_paths[f"{var}_{suffix}"] = str(output_path)
+    
+    return geotiff_paths
