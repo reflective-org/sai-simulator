@@ -2,6 +2,7 @@ import pooch
 import numpy as np
 import pandas as pd
 import pickle as pkl
+import os
 from pathlib import Path
 from fair_wrap.custom_fair import FAIR
 from fair_wrap.custom_fair.io import read_properties
@@ -30,7 +31,9 @@ FANCY_SSP_TITLES = {
 REVERSE_FANCY_SSP_TITLES = {
     title: scenario for scenario, title in FANCY_SSP_TITLES.items()
 }
-FAIR_DIR = Path("fair_wrap")
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+FAIR_DIR = Path(HERE)
 F_INIT_DIR = FAIR_DIR / "f_no_sai"
 F_INIT_DIR.mkdir(exist_ok=True)
 
