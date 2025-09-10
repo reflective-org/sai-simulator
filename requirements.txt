@@ -7,6 +7,7 @@ appdirs==1.4.4
 asciitree==0.3.3
 attrs==24.2.0
 bokeh==3.5.1
+bottleneck==1.4.0
 cachetools==5.4.0
 Cartopy==0.23.0
 certifi==2024.7.4
