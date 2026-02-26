@@ -4,7 +4,7 @@ from launch_gradio import *
 
 def process_so2_data(paths):
     latitudes = ["30S(Tg)", "15S(Tg)", "15N(Tg)", "30N(Tg)"]
-    data = [pd.read_csv(path, sep="\s+").set_index("Timestamp")[latitudes].loc["2035":"2070"] for path in paths]
+    data = [pd.read_csv(path, sep=r"\s+").set_index("Timestamp")[latitudes].loc["2035":"2070"] for path in paths]
     # Slice each between 2035 and 2070
     data = [df.loc["2035":"2070"] for df in data]
     # Take mean of the three members
@@ -41,7 +41,7 @@ def generate_gradio_plots(ssp_scenario, spatial_agg, spatial_item, decade_visual
     # Repeat the other decades 10 times
     other_decades = np.repeat(other_decades, 10, axis=1)
     variable_injection_amounts = np.concatenate([first_decade, other_decades], axis=1)
-    vars = ["tas", "p-e"]
+    vars = ["tas", "p-e", "icefrac"]
     output_data = get_outputs(ssp_scenario, None, spatial_gdf, spatial_item,
                               decade_start_year, decade_end_year, None, None,
                               DATA_DIR, MODEL_DIR, CACHE_DIR, var=vars,
@@ -65,9 +65,19 @@ def generate_gradio_plots(ssp_scenario, spatial_agg, spatial_item, decade_visual
         delta_vmin, delta_vmax = get_vmin_vmax(var, var in ["tas", "tasmin", "tasmax"], True)
 
         #### Regional map plots ####
-        regional_fig, regional_axs = plt.subplots(1, 1, figsize=REGIONAL_FIGSIZE, subplot_kw={'projection': projection})    
-        sai_fig, sai_axs = plt.subplots(1, 1, figsize=REGIONAL_FIGSIZE, subplot_kw={'projection': projection})
-        delta_fig, delta_axs = plt.subplots(1, 1, figsize=REGIONAL_FIGSIZE, subplot_kw={'projection': projection})
+        # Use North Polar projection for ICEFRAC
+        if var == "icefrac":
+            regional_fig, regional_axs = plt.subplots(1, 1, figsize=REGIONAL_FIGSIZE, subplot_kw={'projection': ccrs.NorthPolarStereo(globe=None)})    
+            sai_fig, sai_axs = plt.subplots(1, 1, figsize=REGIONAL_FIGSIZE, subplot_kw={'projection': ccrs.NorthPolarStereo(globe=None)})
+            delta_fig, delta_axs = plt.subplots(1, 1, figsize=REGIONAL_FIGSIZE, subplot_kw={'projection': ccrs.NorthPolarStereo(globe=None)})
+            # Set arctic extent for ICEFRAC plots
+            regional_axs.set_extent([-180, 180, 60, 90], crs=ccrs.PlateCarree())
+            sai_axs.set_extent([-180, 180, 60, 90], crs=ccrs.PlateCarree())
+            delta_axs.set_extent([-180, 180, 60, 90], crs=ccrs.PlateCarree())
+        else:
+            regional_fig, regional_axs = plt.subplots(1, 1, figsize=REGIONAL_FIGSIZE, subplot_kw={'projection': projection})    
+            sai_fig, sai_axs = plt.subplots(1, 1, figsize=REGIONAL_FIGSIZE, subplot_kw={'projection': projection})
+            delta_fig, delta_axs = plt.subplots(1, 1, figsize=REGIONAL_FIGSIZE, subplot_kw={'projection': projection})
 
         var_plots["delta"] = delta_fig
 
@@ -201,12 +211,12 @@ def generate_gradio_plots(ssp_scenario, spatial_agg, spatial_item, decade_visual
             global_mean_ax.plot(mean_with_sai.time.values, mean_with_sai.values, label='With SAI', color='tab:blue', linestyle='--')
             global_mean_ax.plot(historical_model_global_mean.time.values, historical_model_global_mean.values, label='Historical CESM2-WACCM', color='tab:red')
 
-            if "natural_variability" in output_data[var]["mean_over_time"]:
-                # Add shading of natural variability around each of the above 3 lines
-                natural_variability = output_data[var]["mean_over_time"]["natural_variability"]
-                global_mean_ax.fill_between(mean_no_sai.time.values, mean_no_sai.values - natural_variability*2, mean_no_sai.values + natural_variability*2, color='tab:red', alpha=0.3)
-                global_mean_ax.fill_between(mean_with_sai.time.values, mean_with_sai.values - natural_variability*2, mean_with_sai.values + natural_variability*2, color='tab:blue', alpha=0.3)
-                global_mean_ax.fill_between(historical_model_global_mean.time.values, historical_model_global_mean.values - natural_variability*2, historical_model_global_mean.values + natural_variability*2, color='tab:red', alpha=0.3)
+            if "model_internal_variability" in output_data[var]["mean_over_time"]:
+                # Add shading of model_internal variability around each of the above 3 lines
+                model_internal_variability = output_data[var]["mean_over_time"]["model_internal_variability"]
+                global_mean_ax.fill_between(mean_no_sai.time.values, mean_no_sai.values - model_internal_variability*2, mean_no_sai.values + model_internal_variability*2, color='tab:red', alpha=0.3)
+                global_mean_ax.fill_between(mean_with_sai.time.values, mean_with_sai.values - model_internal_variability*2, mean_with_sai.values + model_internal_variability*2, color='tab:blue', alpha=0.3)
+                global_mean_ax.fill_between(historical_model_global_mean.time.values, historical_model_global_mean.values - model_internal_variability*2, historical_model_global_mean.values + model_internal_variability*2, color='tab:red', alpha=0.3)
 
             if var == 'tas':
                 historical_obs_data = output_data[var]["mean_over_time"]["historical_obs"]
@@ -359,6 +369,7 @@ if __name__ == "__main__":
         other_variables = [
             # ("Precipitation", "red"),
             ("Water Availability", "red"),
+            ("Ice Fraction", "blue"),
         ]
         for var, slider_color in other_variables:
             outputs.append(ImageSlider(label=f"Regional {var}", type="pil", slider_color=slider_color))

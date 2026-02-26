@@ -4,13 +4,10 @@ import xarray as xr
 import pandas as pd
 from pathlib import Path
 
-import sys
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-from backend.sigmoid import SigmoidRegression
 
 def process_so2_data(paths):
     latitudes = ["30S(Tg)", "15S(Tg)", "15N(Tg)", "30N(Tg)"]
-    data = [pd.read_csv(path, sep="\s+").set_index("Timestamp")[latitudes].loc["2035":"2070"] for path in paths]
+    data = [pd.read_csv(path, sep=r"\s+").set_index("Timestamp")[latitudes].loc["2035":"2070"] for path in paths]
     # Slice each between 2035 and 2070
     data = [df.loc["2035":"2070"] for df in data]
     # Take mean of the three members
@@ -159,26 +156,14 @@ def fit_delta(var, data_dir, output_dir, ignore_existing=False):
         ).sel(model="CESM2-WACCM", ssp="ssp245")[var]
         Y_stacked = Y.stack(samples=('lat', 'lon'))
 
-        if var == "icefrac":
-            sigmoid_reg = SigmoidRegression()
-            reg = sigmoid_reg.fit(X_numpy, Y_stacked.values)
-            # reshape back to (features, lat, lon)
-            reg_reshaped = reg.reshape((2, Y.lat.size, Y.lon.size))
-            beta_xr = xr.DataArray(
-                reg_reshaped,
-                dims=['features', 'lat', 'lon'],
-                coords={'features': ['lambda', 'beta'],
-                        'lat': Y.lat,
-                        'lon': Y.lon}
-            )
-        else:
-            beta_numpy = np.linalg.lstsq(X_numpy, Y_stacked.values, rcond=None)[0]
-            # Reshape the beta coefficients to have dimensions (features, lat, lon)
-            beta_reshaped = beta_numpy.reshape((1, Y.lat.size, Y.lon.size))
-            beta_xr = xr.DataArray(beta_reshaped, dims=['features', 'lat', 'lon'], 
-                                coords={'features': ['slope'],
-                                        'lat': Y.lat.values, 
-                                        'lon': Y.lon.values})
+        beta_numpy = np.linalg.lstsq(X_numpy, Y_stacked.values, rcond=None)[0]
+
+        # Reshape the beta coefficients to have dimensions (features, lat, lon)
+        beta_reshaped = beta_numpy.reshape((1, Y.lat.size, Y.lon.size))
+        beta_xr = xr.DataArray(beta_reshaped, dims=['features', 'lat', 'lon'], 
+                            coords={'features': ['slope'],
+                                    'lat': Y.lat.values, 
+                                    'lon': Y.lon.values})
 
     # Convert to a Dataset and save to disk
     beta_xr = beta_xr.to_dataset(name=var)

@@ -255,12 +255,12 @@ def generate_gradio_plots(ssp_scenario, temp_target, spatial_agg, spatial_item,
                 global_mean_ax.set_title("")
                 # ## 
 
-            if "natural_variability" in output_data[var]["mean_over_time"]:
-                # Add shading of natural variability around each of the above 3 lines
-                natural_variability = output_data[var]["mean_over_time"]["natural_variability"]
-                global_mean_ax.fill_between(mean_no_sai.time.values, mean_no_sai.values - natural_variability*2, mean_no_sai.values + natural_variability*2, color='tab:red', alpha=0.3)
-                global_mean_ax.fill_between(mean_with_sai.time.values, mean_with_sai.values - natural_variability*2, mean_with_sai.values + natural_variability*2, color='tab:blue', alpha=0.3)
-                global_mean_ax.fill_between(historical_model_global_mean.time.values, historical_model_global_mean.values - natural_variability*2, historical_model_global_mean.values + natural_variability*2, color='tab:red', alpha=0.3)
+            if "model_internal_variability" in output_data[var]["mean_over_time"]:
+                # Add shading of model_internal variability around each of the above 3 lines
+                model_internal_variability = output_data[var]["mean_over_time"]["model_internal_variability"]
+                global_mean_ax.fill_between(mean_no_sai.time.values, mean_no_sai.values - model_internal_variability*2, mean_no_sai.values + model_internal_variability*2, color='tab:red', alpha=0.3)
+                global_mean_ax.fill_between(mean_with_sai.time.values, mean_with_sai.values - model_internal_variability*2, mean_with_sai.values + model_internal_variability*2, color='tab:blue', alpha=0.3)
+                global_mean_ax.fill_between(historical_model_global_mean.time.values, historical_model_global_mean.values - model_internal_variability*2, historical_model_global_mean.values + model_internal_variability*2, color='tab:red', alpha=0.3)
 
             if var == 'tas':
                 historical_obs_data = output_data[var]["mean_over_time"]["historical_obs"]
@@ -304,6 +304,21 @@ def generate_gradio_plots(ssp_scenario, temp_target, spatial_agg, spatial_item,
             pdf_ax.bar(index+bar_width, height=with_sai_counts, width=bar_width, alpha=0.5, label=f'With SAI  ({decade_start_year}-{decade_end_year})', color='tab:blue')
             if "historical" in output_data[var]["distribution"]:
                 historical_bins = [f"{int(historical_bins[i])}-{int(historical_bins[i+1])-1}" for i in range(len(historical_bins)-2)] + [f"{int(historical_bins[-2])}+"]
+                pdf_ax.bar(index+2*bar_width, height=historical_counts, width=bar_width, alpha=0.5, label='Historical Observations', color='black')
+            pdf_ax.set_xticks(index + bar_width)
+            pdf_ax.set_xticklabels(no_sai_bins)
+            # ylabel = 'Log Frequency'
+            ylabel = 'Frequency'
+        elif "icefrac" in var:
+            bar_width = 0.25  # width of each bar
+            # Convert bins to string ranges, inclusive of the lft bin and exclusive of the right bin
+            no_sai_bins = [f"{no_sai_bins[i]:.1f}-{no_sai_bins[i+1]:.1f}" for i in range(len(no_sai_bins)-1)]
+            with_sai_bins = [f"{with_sai_bins[i]:.1f}-{with_sai_bins[i+1]:.1f}" for i in range(len(with_sai_bins)-1)]
+            index = np.arange(len(no_sai_bins))
+            pdf_ax.bar(index, height=no_sai_counts, width=bar_width, alpha=0.5, label=f'No SAI  ({decade_start_year}-{decade_end_year})', color='tab:red')
+            pdf_ax.bar(index+bar_width, height=with_sai_counts, width=bar_width, alpha=0.5, label=f'With SAI  ({decade_start_year}-{decade_end_year})', color='tab:blue')
+            if "historical" in output_data[var]["distribution"]:
+                historical_bins = [f"{historical_bins[i]:.1f}-{historical_bins[i+1]:.1f}" for i in range(len(historical_bins)-1)]
                 pdf_ax.bar(index+2*bar_width, height=historical_counts, width=bar_width, alpha=0.5, label='Historical Observations', color='black')
             pdf_ax.set_xticks(index + bar_width)
             pdf_ax.set_xticklabels(no_sai_bins)

@@ -123,7 +123,7 @@ celerybeat.pid
 
 # Environments
 .env
-.venv
+.venv*
 env/
 venv/
 ENV/
@@ -165,7 +165,25 @@ cython_debug/
 *.nc
 *.joblib
 natural_variability.npy
+model_internal_variability.npy
 *.pkl
 
 # notebooks
 *.ipynb
+
+# macos
+.DS_Store
+
+# zip files
+*.zip
+
+# plots
+*png
+*.tif
+*.svg
+
+# so2 csv generated
+so2_by_latitude_*.csv
+
+# esmf
+esmf/

@@ -49,6 +49,9 @@ DEFAULT_SPECIES_CONFIG_FILE = os.path.join(
     HERE, "defaults", "data", "ar6", "species_configs_properties.csv"
 )
 
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+}
 
 class FAIR:
     r"""Initialise FaIR.
@@ -834,6 +837,7 @@ class FAIR:
                 "rcmip-emissions-annual-means-v5-1-0.csv"
             ),
             known_hash="md5:4044106f55ca65b094670e7577eaf9b3",
+            downloader=pooch.HTTPDownloader(headers=headers),
         )
 
         rcmip_concentration_file = pooch.retrieve(
@@ -842,6 +846,7 @@ class FAIR:
                 "rcmip-concentrations-annual-means-v5-1-0.csv"
             ),
             known_hash="md5:0d82c3c3cdd4dd632b2bb9449a5c315f",
+            downloader=pooch.HTTPDownloader(headers=headers),
         )
 
         rcmip_forcing_file = pooch.retrieve(
@@ -850,6 +855,7 @@ class FAIR:
                 "rcmip-radiative-forcing-annual-means-v5-1-0.csv"
             ),
             known_hash="md5:87ef6cd4e12ae0b331f516ea7f82ccba",
+            downloader=pooch.HTTPDownloader(headers=headers),
         )
 
         df_emis = pd.read_csv(rcmip_emissions_file)

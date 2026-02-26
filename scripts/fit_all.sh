@@ -25,8 +25,6 @@ echo "fit regional pr_above_20"
 python scripts/fit_map.py --var pr_above_20 --data_dir $1 --output_dir $2
 echo "fit regional p-e"
 python scripts/fit_map.py --var p-e --data_dir $1 --output_dir $2
-echo "fit regional icefrac"
-python scripts/fit_map.py --var icefrac --data_dir $1 --output_dir $2
 
 # Fit all the delta global T -> delta map regressors
 echo "fit delta tas"
@@ -51,5 +49,9 @@ echo "fit delta p-e"
 python scripts/fit_delta.py --var p-e --data_dir $1 --output_dir $2
 echo "fit delta so2"
 python scripts/fit_delta.py --var so2 --data_dir $1 --output_dir $2
-echo "fit delta icefrac"
-python scripts/fit_delta.py --var icefrac --data_dir $1 --output_dir $2
+
+# fit arctic icefrac
+echo "fit arctic icefrac"
+python scripts/fit_icefrac_arctic.py --var icefrac --data_dir $1 --output_dir $2
+
+echo "done"

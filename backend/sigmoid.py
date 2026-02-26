@@ -1,186 +1,121 @@
 import numpy as np
 from scipy.optimize import curve_fit
-from functools import partial
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+from dataclasses import dataclass
 from scipy.optimize import curve_fit
+from scipy.special import expit
 
-def stretched_sigmoid(x, lam, beta):
-    """Vectorised stretched sigmoid (λ, β, x0 all scalars)."""
-    z = -x/lam    # z ≥ 0 for valid domain
-    z = np.maximum(z, 0.0) # clip to domain  z ≥ 0
-    return 1.0 - np.exp(-(z ** beta))
 
-def stretched_sigmoid_x0(x, lam, beta, x0):
-    """Vectorised stretched sigmoid (λ, β, x0 all scalars)."""
-    z = -(x - x0) / lam    # z ≥ 0 for valid domain
-    z = np.maximum(z, 0.0) # clip to domain  z ≥ 0
-    return 1.0 - np.exp(-(z ** beta))
+def logistic(x, L, x0, k, b):
+    # expit(z) = 1/(1+exp(-z)) is stable for large |z|
+    return b + L * expit(-(x - x0) * k) # minus gives decreasing curve for k>0
 
-class SigmoidRegression:
-    """
-    A class for fitting a sigmoid regression model.
-    """
-    def __init__(self):
-        self.X_ = None
-        self.y_ = None
+@dataclass
+class LogisticFitResult:
+    i: int
+    j: int
+    c: int
+    params: np.ndarray
+    rmse: float
+    mae: float
+    r2: float
+    ok: bool
+    error: str | None = None
 
-    def fit(self, X, y):
+class LogisticFitter:
+    def __init__(self, X, Y, dtype=np.float64):
         """
-        Fit the sigmoid regression model.
-        
-        Parameters
-        ----------
-        X : np.ndarray, shape (n_samples,)
-        y : np.ndarray, shape (n_samples, n_features)
-        
-        Returns
-        -------
-        reg : np.ndarray, shape (2, n_features)  [row0=λ̂, row1=β̂]
+        X: (n_lon, n_lat, n_time)
+        Y: (n_lon, n_lat, n_time, n_cells)
         """
-        self.X_ = X
-        self.y_ = y
-        return self.fit_sigmoid_columns_2par(y, X)
+        self.X = X
+        self.Y = Y
+        self.dtype = dtype
 
-    def _fit_column_2par(self, y_col, x_data, p0, bounds, maxfev):
-        if not np.isfinite(y_col).all() or np.all(y_col == 0):
-            return np.inf, np.inf              # sentinel
+        self.n_lon, self.n_lat, self.n_time = X.shape
+        assert Y.shape[:3] == (self.n_lon, self.n_lat, self.n_time)
+        self.n_cells = Y.shape[3]
 
-        popt, _ = curve_fit(
-            stretched_sigmoid,
-            x_data, y_col,
-            p0=p0, bounds=bounds,
-            maxfev=maxfev
-        )
-        return popt # (λ̂, β̂)
+        # allocate outputs
+        self.params = np.full((4, self.n_lon, self.n_lat, self.n_cells), np.nan, dtype=dtype)
+        self.rmse   = np.full((self.n_lon, self.n_lat, self.n_cells), np.nan, dtype=dtype)
+        self.mae    = np.full((self.n_lon, self.n_lat, self.n_cells), np.nan, dtype=dtype)
+        self.r2     = np.full((self.n_lon, self.n_lat, self.n_cells), np.nan, dtype=dtype)
 
-    def fit_sigmoid_columns_2par(
-            self,
-            Y,
-            X,
-            maxfev=10_000,
-            n_jobs=None,
-            tiny_thr=1e-12
-        ):
-        """
-        Parameters
-        ----------
-        Y : np.ndarray, shape (n_time, n_cols)
-        X : np.ndarray, shape (n_time,)
-        Returns
-        -------
-        reg : np.ndarray, shape (2, n_cols)  [row0=λ̂, row1=β̂]
-        """
-        x_data = X.ravel().astype(float)
-        n_cols = Y.shape[1]
-        reg    = np.empty((2, n_cols), dtype=float)
+    @staticmethod
+    def _initial_guess(x, y):
+        y_min = float(np.nanmin(y))
+        y_max = float(np.nanmax(y))
+        b0 = y_min
+        L0 = max(y_max - y_min, 1e-6)
+        x00 = float(np.nanmedian(x))
+        x_std = float(np.nanstd(x))
+        k0 = 1.0 / (x_std + 1e-6)
+        return [L0, x00, k0, b0]
 
-        # ---- skip perfectly-zero columns quickly ---------------------------
-        zero_mask = (np.abs(Y).max(axis=0) < tiny_thr)
-        reg[:, zero_mask] = np.inf
+    def _fit_one(self, i, j, c):
+        try:
+            y = self.Y[i, j, :, c]
+            x = self.X[i, j, :]
 
-        cols = np.where(~zero_mask)[0]
-        if cols.size == 0:
-            return reg
+            mask = (~np.isnan(y)) & (~np.isnan(x))
+            x_clean, y_clean = x[mask], y[mask]
 
-        # ---- shared p0 / bounds -------------------------------------------
-        p0     = (np.percentile(-x_data, 75), 0.9)
-        bounds = ([1e-9, 0.3],   [np.inf, 1.0])
+            if x_clean.size < 10:
+                return LogisticFitResult(i, j, c, np.full(4, np.nan), np.nan, np.nan, np.nan, False, "insufficient_points")
 
-        worker = partial(self._fit_column_2par,
-                        x_data=x_data, p0=p0,
-                        bounds=bounds, maxfev=maxfev)
+            p0 = self._initial_guess(x_clean, y_clean)
 
-        with ThreadPoolExecutor(max_workers=n_jobs) as pool:
-            res = pool.map(worker, (Y[:, i] for i in cols))
+            lower = [0.0, float(np.min(x_clean)), 0.0, 0.0]
+            upper = [1.0, float(np.max(x_clean)), np.inf, 1.0]
 
-        reg[:, cols] = np.array(list(res)).T
-        return reg    
+            popt, _ = curve_fit(
+                logistic, x_clean, y_clean,
+                p0=p0, bounds=(lower, upper),
+                maxfev=100000
+            )
 
-class SigmoidRegression_x0:
-    """
-    A class for fitting a sigmoid regression model with intercept (x0).
-    """
-    def __init__(self):
-        self.coef_ = None
-        self.intercept_ = None
-        self.x0_ = None
+            y_pred = logistic(x_clean, *popt)
 
-    def _fit_one_column(self, y_col, x_data, p0, bounds, maxfev):
-        """
-        Returns (λ, β, x0) for a single 1-D y column.
-        """
-        popt, _ = curve_fit(
-            stretched_sigmoid_x0,
-            x_data, y_col,
-            p0=p0, bounds=bounds,
-            maxfev=maxfev
-        )
-        return popt              # tuple length 3
+            rmse = float(np.sqrt(np.mean((y_clean - y_pred) ** 2)))
+            mae  = float(np.mean(np.abs(y_clean - y_pred)))
+            ss_tot = float(np.sum((y_clean - np.mean(y_clean)) ** 2))
+            if ss_tot == 0.0:
+                r2 = 1.0 if np.allclose(y_clean, y_pred) else 0.0
+            else:
+                ss_res = float(np.sum((y_clean - y_pred) ** 2))
+                r2 = 1.0 - ss_res / ss_tot
 
-    def fit(self, X, y, tiny_thr=1e-3, maxfev=10_000, n_jobs=None):
-        """
-        Fit the sigmoid regression model.
-        
-        Parameters
-        ----------
-        X : ndarray, shape (n_time,) or broadcastable to (n_time, 1)
-            Predictor array.
-        y : ndarray, shape (n_time, n_cols)
-            Target array - each column is one time-series to fit.
-        tiny_thr : float
-            Columns whose mean < tiny_thr are treated as "all zeros"
-            and assigned (λ=∞, β=∞, x0=0).
-        maxfev : int
-            Max function evaluations passed to `curve_fit`.
-        n_jobs : int or None
-            Number of worker processes. None → os.cpu_count().
+            return LogisticFitResult(i, j, c, np.asarray(popt), rmse, mae, r2, True)
 
-        Returns
-        -------
-        self : SigmoidRegression_x0
-            The fitted model.
-        """
-        # --- 1 set up shared x-data, initial guess, bounds ---------------------
-        x_data = np.ascontiguousarray(X.squeeze())
-        x_min = x_data.min()
-        x_max = x_data.max()
-        p0 = (np.ptp(x_data) / 2.0, 1.0, x_min)
-        bounds = ((1e-9, 0.01, x_min - 1),
-                 (np.inf, 10.0, x_max + 2))
+        except Exception as e:
+            return LogisticFitResult(i, j, c, np.full(4, np.nan), np.nan, np.nan, np.nan, False, str(e))
 
-        n_cols = y.shape[1]
-        reg = np.empty((3, n_cols), dtype=float)
+    def fit_all(self, n_jobs=0):
+        tasks = [(i, j, c)
+                 for i in range(self.n_lon)
+                 for j in range(self.n_lat)
+                 for c in range(self.n_cells)]
 
-        # --- 2 skip tiny columns in vectorised fashion -------------------------
-        tiny_mask = y.mean(axis=0) < tiny_thr
-        reg[:, tiny_mask] = np.array([np.inf, np.inf, 0.0]).reshape(3, 1)
+        if n_jobs and n_jobs != 1:
+            with ThreadPoolExecutor(max_workers=None if n_jobs < 0 else n_jobs) as ex:
+                futures = [ex.submit(self._fit_one, i, j, c) for (i, j, c) in tasks]
+                for fut in tqdm(as_completed(futures), total=len(futures), desc="Fitting grid"):
+                    res = fut.result()
+                    self._store_result(res)
+        else:
+            for i, j, c in tqdm(tasks, desc="Fitting grid"):
+                res = self._fit_one(i, j, c)
+                self._store_result(res)
 
-        cols_to_fit = np.where(~tiny_mask)[0]
-        if cols_to_fit.size == 0:        # nothing left
-            self.coef_ = reg[0]  # lambda
-            self.intercept_ = reg[1]  # beta
-            self.x0_ = reg[2]  # x0
-            return self
+        return self.params, self.rmse, self.mae, self.r2
 
-        # --- 3 run the expensive fits in parallel ------------------------------
-        _worker = partial(
-            self._fit_one_column,
-            x_data=x_data,
-            p0=p0,
-            bounds=bounds,
-            maxfev=maxfev
-        )
-
-        with ProcessPoolExecutor(max_workers=n_jobs) as pool:
-            results = pool.map(_worker, (y[:, idx] for idx in cols_to_fit))
-        reg[:, cols_to_fit] = np.array(list(results)).T
-
-        # Store the fitted parameters
-        self.coef_ = reg[0]  # lambda
-        self.intercept_ = reg[1]  # beta
-        self.x0_ = reg[2]  # x0
-
-        return self
-    
-    def predict(self, X):
-        return stretched_sigmoid_x0(X, self.coef_, self.intercept_, self.x0_)
+    def _store_result(self, res: LogisticFitResult):
+        if res.ok:
+            self.params[:, res.i, res.j, res.c] = res.params
+            self.rmse[res.i, res.j, res.c] = res.rmse
+            self.mae[res.i, res.j, res.c]  = res.mae
+            self.r2[res.i, res.j, res.c]   = res.r2
+        # else:
+        #     print(f"Error fitting grid {res.i}, {res.j}, {res.c}: {res.error}")

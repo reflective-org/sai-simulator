@@ -14,21 +14,29 @@ def get_historical_model(var, data_dir, cache_dir):
 
     if historical_cache_path.exists():
         print(f"Found {historical_cache_path}")
-        historical_model_data = xr.open_dataarray(historical_cache_path, autoclose=True)
+        with xr.open_dataarray(historical_cache_path) as da:
+            historical_model_data = da.load()
     else:
         is_above_below = "above" in var or "below" in var
         is_exposure = "exposure" in var
-        if var in ["pr", "tas", "p-e", "icefrac"]:
-            historical_model_data = xr.open_dataarray(data_dir / var / "output_gauss-baseline.nc", autoclose=True)
+        if var in [
+            "tas", "tasmin", "tasmax", "tas_above_40", "tas_above_35", "tas_below_0",
+            "pr", "p-e", "pr_above_10", "pr_above_20",
+            "icefrac"
+        ]:
+            with xr.open_dataarray(data_dir / var / "output_gauss-baseline.nc") as da:
+                historical_model_data = da.load()
             historical_model_data = historical_model_data.sel(model="CESM2-WACCM", ssp="ssp245")
             historical_model_data = historical_model_data.drop_vars(["ssp", "model"])
-        elif var in ["tasmin", "tasmax", "tas_above_40", "tas_above_35", "tas_below_0", "pr_above_10", "pr_above_20"]:
-            historical_model_data = xr.open_dataarray(data_dir / var / "output_gauss-cmip_historical.nc", autoclose=True)
-            historical_model_data = historical_model_data.sel(model="CESM2-WACCM", ssp="ssp245")
-            historical_model_data = historical_model_data.drop_vars(["ssp", "model"])
+        # elif var in []:
+        #     with xr.open_dataarray(data_dir / var / "output_gauss-cmip_historical.nc") as da:
+        #         historical_model_data = da.load()
+        #     historical_model_data = historical_model_data.sel(model="CESM2-WACCM", ssp="ssp245")
+        #     historical_model_data = historical_model_data.drop_vars(["ssp", "model"])
         elif is_exposure:
             daily_var = exposurevar2var[var]
-            historical_model_data = xr.open_dataarray(data_dir / daily_var / "output_gauss-cmip_historical.nc", autoclose=True)
+            with xr.open_dataarray(data_dir / daily_var / "output_gauss-baseline.nc") as da:
+                historical_model_data = da.load()
             historical_model_data = historical_model_data.sel(model="CESM2-WACCM", ssp="ssp245")
             historical_model_data = historical_model_data.drop_vars(["ssp", "model"])
         else:
@@ -51,7 +59,7 @@ def get_historical_model(var, data_dir, cache_dir):
 
 def get_historical_obs_global_mean_temp(data_dir):
     # Source: https://berkeley-earth-temperature.s3.us-west-1.amazonaws.com/Global/Land_and_Ocean_summary.txt
-    historical_obs_data = pd.read_csv(data_dir / "Land_and_Ocean_summary.txt", skiprows=56, sep="\s+")
+    historical_obs_data = pd.read_csv(data_dir / "Land_and_Ocean_summary.txt", skiprows=56, sep=r"\s+")
     historical_obs_data = historical_obs_data.rename(columns={"%": "Year", "Year,": "Temperature"})
 
     # Convert to xarray
@@ -59,5 +67,22 @@ def get_historical_obs_global_mean_temp(data_dir):
 
     # Rebase by datasets 1850-1900 mean
     historical_obs_data = historical_obs_data - historical_obs_data.sel(time=slice(1850, 1900)).mean()
+
+    return historical_obs_data
+
+
+def get_historical_obs_sea_ice_extent(data_dir):
+    # Source: NSIDC September Arctic sea ice extent (1979-2025)
+    historical_obs_data = pd.read_csv(
+        data_dir / "september-sea-ice-extent-observation.csv",
+        skipinitialspace=True,
+    )
+
+    # Convert to xarray using year and extent columns
+    historical_obs_data = xr.DataArray(
+        historical_obs_data["extent"].values,
+        dims=('time'),
+        coords={'time': historical_obs_data["year"].values},
+    )
 
     return historical_obs_data

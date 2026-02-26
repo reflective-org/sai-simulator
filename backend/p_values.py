@@ -3,7 +3,8 @@ import xarray as xr
 from scipy.stats import t
 
 from .constants import *
-from .utils import clip_to_land
+from .utils import clip_to_land, clip_to_ocean
+from .population import get_population_xr
 
 
 def compute_ttest(mean1, mean2, std, n):
@@ -19,7 +20,13 @@ def compute_ttest(mean1, mean2, std, n):
     """
     # Compute the t-statistic
     mean_diff = mean1 - mean2
-    t_stat = mean_diff / (std * np.sqrt(2 / n))
+    # Avoid division by zero by masking where std is 0
+    denominator = std * np.sqrt(2 / n)
+    # Set denominator to 1 where it's 0 to avoid division warning, result will be overwritten
+    safe_denominator = np.where(denominator == 0, 1, denominator)
+    t_stat = mean_diff / safe_denominator
+    # Override t_stat where denominator was 0
+    t_stat = np.where(denominator == 0, 0, t_stat)
 
     # Degrees of freedom
     df = 2 * n - 2
@@ -36,30 +43,42 @@ def compute_ttest(mean1, mean2, std, n):
     return p_values
 
 
-def get_regional_p_values(var, data_dir, reference, comparison):
+def get_grid_level_p_values(var, data_dir, reference, comparison):
+    
     # Compute two-sided t-test p-values between reference and comparison
     is_exposure = "exposure" in var
     if is_exposure:
         var = exposurevar2var[var]
+        # Apply global population weighting
+        population_xr = get_population_xr(data_dir)
 
-    std_np = xr.open_dataarray(data_dir / var / f"regional_natural_variability.nc", autoclose=True).values
+    with xr.open_dataarray(data_dir / var / f"grid_level_model_internal_variability.nc") as da:
+        std_np = da.load().values
+        if is_exposure:
+            std_np = std_np * population_xr
+            std_np = std_np.values / 1.0e6
 
     # For every decade, compute the p-values, then concatenate across the time dimension
-    decadal_regional_p_values = []
+    decadal_grid_level_p_values = []
     decades = list(zip(range(2041, 2092, 10), range(2050, 2101, 10)))
     for _decade_start_year, _decade_end_year in decades:
-        reference_np = reference.values
+        reference_np = reference.values # this is historical rebase
         comparison_np = comparison.sel(time=slice(_decade_start_year, _decade_end_year)).mean(dim='time').values
 
-        regional_p_values = compute_ttest(reference_np, comparison_np, std_np, n=(2030-2010+1) * 3) # 3 members, 2010-2030
+        grid_level_p_values = compute_ttest(reference_np, comparison_np, std_np, n=(2039-2025+1) * 3) # 3 members, 2025-2039
         # Convert regional_p_values to xarray DataArray
-        regional_p_values = xr.DataArray(regional_p_values, dims=('lat', 'lon'), coords={'lat': reference.lat, 'lon': reference.lon})
+        grid_level_p_values = xr.DataArray(grid_level_p_values, dims=('lat', 'lon'), coords={'lat': reference.lat, 'lon': reference.lon})
         # Use the end of the decade as the time coordinate
-        regional_p_values = regional_p_values.expand_dims(time=[_decade_end_year])
-        decadal_regional_p_values.append(regional_p_values)
-    regional_p_values = xr.concat(decadal_regional_p_values, dim='time').sortby('time')
+        grid_level_p_values = grid_level_p_values.expand_dims(time=[_decade_end_year])
+        decadal_grid_level_p_values.append(grid_level_p_values)
+    decadal_grid_level_p_values = xr.concat(decadal_grid_level_p_values, dim='time').sortby('time')
 
     # Always clip p values to land
-    regional_p_values = clip_to_land(data_dir, regional_p_values)
+    if "icefrac" in var:
+        grid_level_p_values = clip_to_ocean(data_dir, decadal_grid_level_p_values)
+        # Set p-values to NaN for latitudes below 60
+        grid_level_p_values = grid_level_p_values.where(grid_level_p_values.lat >= 60, np.nan)
+    else:    
+        grid_level_p_values = clip_to_land(data_dir, decadal_grid_level_p_values)
 
-    return regional_p_values
+    return grid_level_p_values

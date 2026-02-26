@@ -6,11 +6,6 @@ from pathlib import Path
 from joblib import dump, load
 from collections import defaultdict
 from sklearn.linear_model import LinearRegression
-import os
-
-import sys
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-from backend.sigmoid import SigmoidRegression_x0
 
 
 def fit_map(var, data_dir, output_dir, num_bootstrap_replicates=100, ignore_existing=False):
@@ -22,9 +17,26 @@ def fit_map(var, data_dir, output_dir, num_bootstrap_replicates=100, ignore_exis
         raise ValueError(f"output_path {output_path} does not exist. Need to run process_monthly_gauss.py first.")
 
     input_fair = xr.open_dataset(input_fair_path)
-
     output = xr.open_dataset(output_path)
-    output = output.sel(time=input_fair.time)
+
+    # get the overlapping time range between input_fair and GCM model output
+    fair_time_min, fair_time_max = input_fair.time.min().values, input_fair.time.max().values
+    print(f"input_fair time range: {fair_time_min} to {fair_time_max}")
+    output_time_min, output_time_max = output.time.min().values, output.time.max().values
+    print(f"output time range: {output_time_min} to {output_time_max}")
+    # overlapping time range
+    time_min, time_max = max(fair_time_min, output_time_min), min(fair_time_max, output_time_max)
+    
+    if time_min > time_max:
+        raise ValueError(f"No overlapping times between input_fair ({fair_time_min} to {fair_time_max}) and output ({output_time_min} to {output_time_max})")
+    
+    if time_max < fair_time_max or time_max < output_time_max:
+        print(f"Note: input_fair has times from {fair_time_min} to {fair_time_max}, output has times from {output_time_min} to {output_time_max}")
+        print(f"Using overlapping time range: {time_min} to {time_max}")
+    
+    # take only the overlapping time range
+    output = output.sel(time=slice(time_min, time_max))
+    input_fair = input_fair.sel(time=slice(time_min, time_max))
 
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
@@ -54,6 +66,11 @@ def fit_map(var, data_dir, output_dir, num_bootstrap_replicates=100, ignore_exis
             for ssp in scenariomip_ssps:
                 fair_model_data = input_fair.sel(ssp=ssp)
                 scenariomip_model_data = output.sel(model=model, ssp=ssp)
+
+                fair_model_data, scenariomip_model_data = xr.align(
+                    fair_model_data, scenariomip_model_data, join="inner"
+                )
+                
                 X = fair_model_data.tas.values # (time)
                 X = X[:, np.newaxis] # (time, 1)
                 y = scenariomip_model_data[var].values # (time, lat, lon)
@@ -70,11 +87,7 @@ def fit_map(var, data_dir, output_dir, num_bootstrap_replicates=100, ignore_exis
             X = np.concatenate(Xs, axis=0) # (time * ssp, 1)
             y = np.concatenate(ys, axis=0) # (time * ssp, lat * lon)
             # For every climate model, train a linear regression that inputs global fair tas and outputs regional smip tas
-            if var == "icefrac": # icefrac is a special case since the fit is not linear
-                # fit a stretched sigmoid to the data
-                reg = SigmoidRegression_x0().fit(X, y, n_jobs=os.cpu_count())
-            else:
-                reg = LinearRegression().fit(X, y)
+            reg = LinearRegression().fit(X, y)
             model2bootstrapped_fair_emulators[model].append(reg)
             dump(reg, model_path)
 
