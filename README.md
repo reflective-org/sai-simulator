@@ -18,7 +18,6 @@ Official repository for [the SAI Simulator](https://simulator.reflective.org/), 
   - [Fit the Regression Models](#d-fit-the-regression-models)
   - [Variability Calculation](#e-variability-calculation)
   - [Cache the Data](#f-cache-the-data)
-  - [Launch Gradio](#g-launch-gradio)
 - [License](#-license)
 - [Citation](#%EF%B8%8F-citation)
 
@@ -56,13 +55,7 @@ The script will:
 5. Process the data and fit regression models
 6. Cache the data for the simulator
 
-After setup completes, launch the simulator with:
-
-```bash
-python launch_gradio.py --use_local_cache
-```
-
-**Note:** Use Firefox browser (not Safari) for the web UI.
+After setup completes, see the [Manual Setup](#-option-2-manual-setup) section for usage instructions.
 
 ---
 
@@ -242,20 +235,6 @@ The simulator caches all the data to be loaded more efficiently by the frontend.
 
 ```bash
 python scripts/cache.py --data_dir data/processed --model_dir data/models --output_dir data/cache
-```
-
-### G. Launch gradio
-
-Gradio handles the connection between the frontend and backend and builds the interactive web interface for the simulator. Run the prompt below and use the web UI that it returns in the Firefox browser (not Safari).
-
-```bash
-python launch_gradio.py --use_local_cache
-```
-
-For custom injection
-
-```bash
-python variable_launch_gradio.py --use_local_cache
 ```
 
 ## 🔒 License

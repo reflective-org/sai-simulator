@@ -367,13 +367,8 @@ main() {
     echo "  Models:         $MODELS_DIR"
     echo "  Cache:          $CACHE_DIR"
     echo ""
-    print_info "To launch the simulator, run:"
-    echo "  python launch_gradio.py --use_local_cache"
-    echo ""
-    print_info "For custom injection, run:"
-    echo "  python variable_launch_gradio.py --use_local_cache"
-    echo ""
-    print_info "Note: Use Firefox browser (not Safari) for the web UI."
+    print_info "Setup complete. You can now use the simulator modules directly."
+    print_info "See README.md for usage instructions."
 }
 
 # A. Environment Setup
