@@ -3,7 +3,6 @@ from scipy.optimize import curve_fit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from dataclasses import dataclass
-from scipy.optimize import curve_fit
 from scipy.special import expit
 
 

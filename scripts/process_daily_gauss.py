@@ -253,9 +253,9 @@ def day_to_month(var, data_dir, ignore_existing=False):
         print(f"\n##### Scenario {key} finished in {(scenario_end_time - scenario_start_time):.2f}s #####")
 
     overall_end_time = time.time()
-    print(f"\n" + "="*50)
+    print("\n" + "="*50)
     print(f"Total script run time: {(overall_end_time - overall_start_time):.2f} seconds")
-    print(f"="*50 + "\n")
+    print("="*50 + "\n")
 
 if __name__ == "__main__":
     fire.Fire(day_to_month)

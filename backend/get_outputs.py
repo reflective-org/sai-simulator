@@ -10,8 +10,6 @@ from matplotlib import colors
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature 
 import matplotlib.pyplot as plt
-import logging
-import time
 import struct
 from datetime import datetime
 
@@ -1075,7 +1073,7 @@ def generate_sai_netcdf(
         elif historical_rebase is None:
             ds[v].attrs['description'] = f"Projected values of {var} without historical rebase."
         else:
-            ds[v].attrs['description'] = f"Values calculated as delta from PI (1850-1900) rebased to historical mean."
+            ds[v].attrs['description'] = "Values calculated as delta from PI (1850-1900) rebased to historical mean."
 
     ds['model_std_dev'].attrs.update({
         'units': meta['units'],

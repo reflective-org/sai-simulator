@@ -1,6 +1,3 @@
-import os
-import geopandas as gpd
-from pathlib import Path
 from matplotlib.colors import LinearSegmentedColormap
 import matplotlib.pyplot as plt
 

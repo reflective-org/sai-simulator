@@ -12,7 +12,7 @@ def fit_map(var, data_dir, output_dir, num_bootstrap_replicates=100, ignore_exis
     data_dir = Path(data_dir)
     input_fair_path = data_dir / "input_fair.nc"
     data_dir = data_dir / var
-    output_path = data_dir / f"output_gauss-baseline.nc"
+    output_path = data_dir / "output_gauss-baseline.nc"
     if not output_path.exists():
         raise ValueError(f"output_path {output_path} does not exist. Need to run process_monthly_gauss.py first.")
 

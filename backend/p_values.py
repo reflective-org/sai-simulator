@@ -52,7 +52,7 @@ def get_grid_level_p_values(var, data_dir, reference, comparison):
         # Apply global population weighting
         population_xr = get_population_xr(data_dir)
 
-    with xr.open_dataarray(data_dir / var / f"grid_level_model_internal_variability.nc") as da:
+    with xr.open_dataarray(data_dir / var / "grid_level_model_internal_variability.nc") as da:
         std_np = da.load().values
         if is_exposure:
             std_np = std_np * population_xr

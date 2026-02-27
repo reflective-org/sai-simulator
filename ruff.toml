@@ -1,0 +1,13 @@
+[lint]
+ignore = [
+    "F403",  # wildcard imports (used throughout for constants/utils)
+    "F405",  # may be undefined from star imports
+    "F841",  # unused variables (often intentional in scientific code)
+    "E722",  # bare except (legacy patterns)
+    "E712",  # == True comparisons (xarray mask pattern)
+]
+
+[lint.per-file-ignores]
+"launch_gradio.py" = ["F401"]
+"variable_launch_gradio.py" = ["F401"]
+"scripts/fit_delta.py" = ["F821"]  # variable referenced before assignment in conditional block

@@ -1,7 +1,6 @@
 import fire
 import xarray as xr
 import numpy as np
-import matplotlib.pyplot as plt
 import sys
 from typing import Union, Tuple
 from pathlib import Path

@@ -164,7 +164,7 @@ def pair_precc_precl_files(data_dir, prect_member2paths):
 
     # 4. Report Results
     print("-" * 40)
-    print(f"Processing Complete.")
+    print("Processing Complete.")
     print(f"  Valid Pairs Found: {len(valid_keys)}")
     
     if missing_l:
@@ -498,7 +498,7 @@ def compute_and_save_variability(exp2member2data_combined, var_name, output_dir,
     print(f"  Internal Variability (std): {std_value:.4f}")
     if out_path.exists() and not overwrite:
         print(f"  File already exists and overwrite is False: {out_path}")
-        print(f"  Skipping export of model internal variability.")
+        print("  Skipping export of model internal variability.")
         return std_value, weights
     print(f"  Saving model internal variability to {out_path}")
     np.save(out_path, std_value)
@@ -579,7 +579,7 @@ def compute_and_save_grid_variability(
     out_path = Path(output_dir) / "grid_level_model_internal_variability.nc"
     if out_path.exists() and not overwrite:
         print(f"  File already exists and overwrite is False: {out_path}")
-        print(f"  Skipping export of grid-level model internal variability.")
+        print("  Skipping export of grid-level model internal variability.")
         return ds_out
     print(f"  Saving grid variability to {out_path}")
     ds_out.to_netcdf(out_path)

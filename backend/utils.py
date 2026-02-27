@@ -5,7 +5,6 @@ from functools import lru_cache
 from scipy.signal import butter, filtfilt
 from pathlib import Path
 from typing import Union
-from pathlib import Path
 
 
 @lru_cache(maxsize=32)  # Caches the last 32 unique calls
