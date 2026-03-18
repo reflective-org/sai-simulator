@@ -2,15 +2,47 @@ import numpy as np
 import xarray as xr
 import geopandas as gpd
 from functools import lru_cache
+from pathlib import Path
 
 
 @lru_cache(maxsize=1)  # Caches the last call
-def get_population_data(data_dir):
+def get_population_data(data_dir:Path):
     # Went with the pregridded data from Dan instead of our processed data
     processed_population_path = data_dir / "Regridded_pop_num.npy"
     population_np = np.load(processed_population_path)
 
     return population_np
+
+
+@lru_cache(maxsize=1)  # Caches the last call
+def get_population_xr(data_dir:Path):
+    """
+    Loads regridded population data and returns it as an xarray.DataArray
+    matching the latitude and longitude grid of `ds_4latlon`.
+
+    Parameters:
+        data_dir (Path or str): Directory where population data (Regridded_pop_num.npy) is stored.
+        ds_4latlon (xarray.DataArray or xarray.Dataset): DataArray or Dataset from which
+            the target latitude (`lat`) and longitude (`lon`) coordinates are extracted.
+
+    Returns:
+        xarray.DataArray: Population data aligned to the grid and coordinates of `ds_4latlon`,
+        with longitude shifted from [-180, 180) to [0, 360), sorted and transposed appropriately.
+
+    Notes:
+        - Longitude values are shifted by 180 degrees and wrapped to [0, 360) for consistency
+          with other datasets, then sorted and transposed.
+        - The population data grid must match the dimensions of the `lat` and `lon` coordinates
+          in `ds_4latlon`.
+    """
+    population_np = get_population_data(data_dir)
+    with xr.open_dataset(data_dir / "area.nc") as ds:
+        ds_4latlon = ds.load()
+    population_xr = xr.DataArray(population_np, dims=('lon', 'lat'), coords={'lat': ds_4latlon.lat, 'lon': ds_4latlon.lon})
+    # Shift lon values by 180
+    population_xr = population_xr.assign_coords(lon=(((population_xr.lon + 180) % 360))).sortby('lon').transpose()
+
+    return population_xr
 
 
 def aggregate_xarray_by_geopandas(xr_data, gdf, fill_value=0):

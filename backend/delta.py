@@ -15,7 +15,8 @@ def get_regional_delta_without_rampup(var, data_dir, model_dir, cache_dir, ssp_s
 
     if regional_delta_cache_path.exists():
         print(f"Found {regional_delta_cache_path}")
-        regional_delta = xr.open_dataarray(regional_delta_cache_path, autoclose=True)
+        with xr.open_dataarray(regional_delta_cache_path) as da:
+            regional_delta = da.load()
 
     else:
         is_above_below = "above" in var or "below" in var

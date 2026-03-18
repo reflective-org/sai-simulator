@@ -4,6 +4,12 @@ if [ "$#" -ne 3 ]; then
     exit 1
 fi
 
+# Check if the local destination is a relative path (does not start with / or ~)
+if [[ "$3" != /* && "$3" != ~* ]]; then
+    echo "ERROR: The local destination must be an absolute path. Do not use relative paths."
+    exit 1
+fi
+
 # Obtain the endpoints from the CLI
 source_endpoint_id=$1
 destination_endpoint_id=$2
@@ -28,7 +34,12 @@ for dir in "${base_dirs[@]}"
 do
     echo "Listing files in $dir..."
     # List files in the directory and filter for specific patterns
-    files=$(globus ls $source_endpoint_id:$dir | grep -E "\.TREFHT\.|\.\PRECT\.|\.TREFHTMN\.|\.TREFHTMX\.|\.QFLX\." | grep -E "\.h0\.")
+    # Exclude TREFHTMN and TREFHTMX for MA-BASELINE directories because there is only 1 member (use ARISE data instead - see below)
+    if [[ $dir == *"MA-BASELINE"* ]]; then
+        files=$(globus ls $source_endpoint_id:$dir | grep -E "\.TREFHT\.|\.\PRECT\.|\.QFLX\.|\.ICEFRAC\." | grep -E "\.h0\.")
+    else
+        files=$(globus ls $source_endpoint_id:$dir | grep -E "\.TREFHT\.|\.\PRECT\.|\.TREFHTMN\.|\.TREFHTMX\.|\.QFLX\.|\.ICEFRAC\." | grep -E "\.h0\.")
+    fi
 
     # Loop through filtered files and initiate transfer
     for file in $files
@@ -38,7 +49,7 @@ do
             echo "Skipping $file, already exists at destination."
         else
             echo "Transferring $file from $dir..."
-            globus transfer $source_endpoint_id:$dir/$file $destination_endpoint_id:$local_destination$file
+            globus transfer $source_endpoint_id:$dir/$file $destination_endpoint_id:$local_destination/$file
         fi
     done
 done
@@ -54,7 +65,7 @@ do
             echo "Skipping $file, already exists at destination."
         else
             echo "Transferring $file from /MA-BASELINE.00$i/atm/proc/tseries/month_1..."
-            globus transfer $source_endpoint_id:/MA-BASELINE.00$i/atm/proc/tseries/month_1/$file $destination_endpoint_id:$local_destination$file
+            globus transfer $source_endpoint_id:/MA-BASELINE.00$i/atm/proc/tseries/month_1/$file $destination_endpoint_id:$local_destination/$file
         fi
     done
 done
@@ -70,7 +81,7 @@ do
             echo "Skipping $file, already exists at destination."
         else
             echo "Transferring $file from /MA-HISTORICAL.00$i/atm/proc/tseries/month_1..."
-            globus transfer $source_endpoint_id:/MA-HISTORICAL.00$i/atm/proc/tseries/month_1/$file $destination_endpoint_id:$local_destination$file
+            globus transfer $source_endpoint_id:/MA-HISTORICAL.00$i/atm/proc/tseries/month_1/$file $destination_endpoint_id:$local_destination/$file
         fi
     done
 done
@@ -88,7 +99,7 @@ do
             echo "Skipping $file, already exists at destination."
         else
             echo "Transferring $file from $dir..."
-            globus transfer $source_endpoint_id:$dir/$file $destination_endpoint_id:$local_destination$file
+            globus transfer $source_endpoint_id:$dir/$file $destination_endpoint_id:$local_destination/$file
         fi
     done
 done
@@ -102,6 +113,40 @@ do
         echo "Skipping $file, already exists at destination."
     else
         echo "Transferring $file from /ARISE-HISTORICAL..."
-        globus transfer $source_endpoint_id:/ARISE-HISTORICAL/$file $destination_endpoint_id:$local_destination$file
+        globus transfer $source_endpoint_id:/ARISE-HISTORICAL/$file $destination_endpoint_id:$local_destination/$file
     fi
+done
+
+######################################################################################################################
+# Download tasmin and tasmax from ARISE-SSP245 via AWS S3 bucket
+######################################################################################################################
+echo "Listing files in /ARISE-SSP245"
+BUCKET="s3://ncar-cesm2-arise/CESM2-WACCM-SSP245"
+SUB="atm/proc/tseries/month_1"
+
+# Define the members, variables, and time ranges to download
+members=(007 008 009)
+vars=(TREFHTMN TREFHTMX)
+time_ranges=(201501-206412 206501-206912)
+
+# Loop through each member, variable, and time range combination
+for m in "${members[@]}"
+do
+    for v in "${vars[@]}"
+    do
+        for r in "${time_ranges[@]}"
+        do
+            FILE="b.e21.BWSSP245cmip6.f09_g17.CMIP6-SSP2-4.5-WACCM.${m}.cam.h0.${v}.${r}.nc"
+            S3PATH="${BUCKET}/b.e21.BWSSP245cmip6.f09_g17.CMIP6-SSP2-4.5-WACCM.${m}/${SUB}/${FILE}"
+            
+            # Check if file already exists at destination
+            if [ -f "$local_destination/$FILE" ]; then
+                echo "Skipping $FILE, already exists at destination."
+            else
+                echo "Downloading $FILE from AWS S3..."
+                echo "local_destination: ${local_destination}"
+                aws s3 cp --no-sign-request --region us-west-2 "$S3PATH" "$local_destination"
+            fi
+        done
+    done
 done

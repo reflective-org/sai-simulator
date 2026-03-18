@@ -2,6 +2,7 @@ import pooch
 import numpy as np
 import pandas as pd
 import pickle as pkl
+import os
 from pathlib import Path
 from fair_wrap.custom_fair import FAIR
 from fair_wrap.custom_fair.io import read_properties
@@ -30,15 +31,22 @@ FANCY_SSP_TITLES = {
 REVERSE_FANCY_SSP_TITLES = {
     title: scenario for scenario, title in FANCY_SSP_TITLES.items()
 }
-FAIR_DIR = Path("fair_wrap")
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+FAIR_DIR = Path(HERE)
 F_INIT_DIR = FAIR_DIR / "f_no_sai"
 F_INIT_DIR.mkdir(exist_ok=True)
 
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+}
 
 def get_df_emis():
     rcmip_emissions_file = pooch.retrieve(
-        url="doi:10.5281/zenodo.4589756/rcmip-emissions-annual-means-v5-1-0.csv",
+        url="https://zenodo.org/records/4589756/files/rcmip-emissions-annual-means-v5-1-0.csv",
+        # original url: "doi:10.5281/zenodo.4589756/rcmip-emissions-annual-means-v5-1-0.csv",
         known_hash="md5:4044106f55ca65b094670e7577eaf9b3",
+        downloader=pooch.HTTPDownloader(headers=headers),
     )
     df_emis = pd.read_csv(rcmip_emissions_file)
     return df_emis
@@ -48,6 +56,7 @@ def get_df_configs(ensemble=True):
     fair_params_1_2_0_obj = pooch.retrieve(
         url = 'https://zenodo.org/record/8399112/files/calibrated_constrained_parameters.csv',
         known_hash = 'md5:de3b83432b9d071efdd1427ad31e9076',
+        downloader=pooch.HTTPDownloader(headers=headers),
     )
     df_configs = pd.read_csv(fair_params_1_2_0_obj, index_col=0)
     if not ensemble:
@@ -143,8 +152,8 @@ def get_aerosols():
     )
 
     volcanic_obj = pooch.retrieve(
-        url = 'https://raw.githubusercontent.com/chrisroadmap/fair-calibrate/main/data/forcing/volcanic_ERF_1750-2101_timebounds.csv',
-        known_hash = 'md5:c0801f80f70195eb9567dbd70359219d',
+        url = 'https://raw.githubusercontent.com/chrisroadmap/fair-calibrate/refs/heads/main/data/forcing/volcanic_erf_timebounds_cmip6.csv',
+        known_hash = 'md5:4e467954c3ab5a18fc61cfa20ce41e74',
     )
 
     df_solar = pd.read_csv(solar_obj, index_col="year")
@@ -167,13 +176,13 @@ def fill_aerosols(f, df_configs, df_solar, df_volcanic, sai_input, sim_start_yea
 
     solar_forcing = np.zeros(551)
     volcanic_forcing = np.zeros(551)
-    volcanic_forcing[:352] = df_volcanic.erf.values
+    volcanic_forcing[:352] = df_volcanic.erf.values[:352]
     solar_forcing = df_solar["erf"].loc[1750:2300].values
 
     trend_shape = np.ones(551)
     trend_shape[:271] = np.linspace(0, 1, 271)
 
-    volcanic_start_year = df_volcanic['timebounds'].min()
+    volcanic_start_year = df_volcanic['year'].min()
     start_index = sim_start_year - volcanic_start_year
     end_index = sim_end_year - volcanic_start_year + 1
 

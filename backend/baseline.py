@@ -9,7 +9,7 @@ from .constants import *
 from .historical import get_historical_model
 from .utils import clip_to_land
 from .population import get_population_exposure
-from .p_values import get_regional_p_values
+from .p_values import get_grid_level_p_values
 
 
 def get_global_temp(ssp_scenario, initial_dir=None):
@@ -48,16 +48,15 @@ def get_global_temp(ssp_scenario, initial_dir=None):
 
     return global_temp
 
-
-
 @lru_cache(maxsize=32)  # Caches the last 32 unique calls
-def get_regional_models(model_dir):
-
+def get_regional_models(variable_dir):
+    var = variable_dir.name
+    
     fair2smip_coefs, fair2smip_intercepts = [], []
 
     for model in REGIONAL_MODEL_NAMES:
         for i in range(NUM_EMULATORS):
-            fair2smip = joblib.load(model_dir / f"fair_to_smip_{model}_{i}.joblib")
+            fair2smip = joblib.load(variable_dir / f"fair_to_smip_{model}_{i}.joblib")
             fair2smip_coefs.append(fair2smip.coef_)
             fair2smip_intercepts.append(fair2smip.intercept_)
 
@@ -70,7 +69,6 @@ def get_regional_models(model_dir):
 
     return fair2smip
 
-
 def get_smip(global_temp, fair2smip):
     # Get regional projections for each model
     smip = fair2smip.predict(global_temp.sel(timebounds=slice(2015, None)))
@@ -78,7 +76,6 @@ def get_smip(global_temp, fair2smip):
     smip = smip.reshape((smip.shape[0], len(REGIONAL_MODEL_NAMES), NUM_EMULATORS, NUM_LAT, NUM_LON))
 
     return smip
-
 
 def get_regional_map_from_global_temp(global_temp, fair2smip, var, data_dir, cache_dir):
     # Get regional map from global temperature
@@ -111,7 +108,7 @@ def get_regional_map_from_global_temp(global_temp, fair2smip, var, data_dir, cac
     # Get regional p values
     if historical_map is not None:
         historical_rebase = historical_map.sel(time=slice(1850, 1900)).mean('time')
-        regional_p_values = get_regional_p_values(var, data_dir, historical_rebase, regional_map)
+        regional_p_values = get_grid_level_p_values(var, data_dir, historical_rebase, regional_map)
     else:
         regional_p_values = None
 
@@ -132,8 +129,10 @@ def get_regional_map(var, data_dir, model_dir, cache_dir, ssp_scenario):
 
     if regional_cache_path.exists() and regional_p_cache_path.exists():
         print(f"Found {regional_cache_path} and {regional_p_cache_path}")
-        regional_map = xr.open_dataarray(regional_cache_path, autoclose=True)
-        regional_p_values = xr.open_dataarray(regional_p_cache_path, autoclose=True)
+        with xr.open_dataarray(regional_cache_path) as da:
+            regional_map = da.load()
+        with xr.open_dataarray(regional_p_cache_path) as da:
+            regional_p_values = da.load()
     else:
         # First get FaIR global temperature
         global_temp = get_global_temp(ssp_scenario)
