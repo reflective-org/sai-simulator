@@ -32,6 +32,45 @@ USER_OVERWRITE_LENS=""     # "yes" or "no"
 USER_OVERWRITE_DAILY=""    # "yes" or "no"
 USER_OVERWRITE_MONTHLY=""  # "yes" or "no"
 
+# Optional automation hook for API cache pregeneration on EC2.
+# Enable by exporting RUN_API_PREGENERATION_DOCKER=yes before running this script.
+RUN_API_PREGENERATION_DOCKER="${RUN_API_PREGENERATION_DOCKER:-no}"
+PREGENERATION_DOCKER_IMAGE_URI="${PREGENERATION_DOCKER_IMAGE_URI:-}"
+PREGENERATION_ENV_FILE="${PREGENERATION_ENV_FILE:-}"
+PREGENERATION_CELERY_WORKERS="${PREGENERATION_CELERY_WORKERS:-2}"
+
+# Run fully unattended by setting NON_INTERACTIVE=yes.
+# Optional one-flag preset:
+#   AUTO_PROFILE=ec2
+#     - enables NON_INTERACTIVE
+#     - uses EC2-safe defaults (skips heavy local data/model build steps)
+#     - enables Docker pregeneration step if image URI is provided
+# Optional overrides in this mode:
+#   NON_INTERACTIVE_DEFAULT_ANSWER=yes|no (fallback for unexpected prompts)
+#   AUTO_ENV_TYPE=conda|venv
+#   AUTO_INSTALL_ESMF=yes|no
+#   AUTO_ESMF_VERSION=release/8.9.0
+#   AUTO_DOWNLOAD_DATA=yes|no
+#   AUTO_PROCESS_DATA=yes|no
+#   AUTO_FIT_MODELS=yes|no
+#   AUTO_CALC_VARIABILITY=yes|no
+#   AUTO_CACHE_DATA=yes|no
+#   AUTO_OVERWRITE_LENS=yes|no
+#   AUTO_OVERWRITE_DAILY=yes|no
+#   AUTO_OVERWRITE_MONTHLY=yes|no
+#   AUTO_RAW_DATA_DIR=...
+#   AUTO_PROCESSED_DATA_DIR=...
+#   AUTO_MODELS_DIR=...
+#   AUTO_CACHE_DIR=...
+NON_INTERACTIVE="${NON_INTERACTIVE:-no}"
+AUTO_PROFILE="${AUTO_PROFILE:-}"
+# Skip conda/venv creation in Step A, but still run Step A installs against the
+# current Python environment (requirements + optional ESMF).
+SKIP_ENV_SETUP="${SKIP_ENV_SETUP:-no}"
+# Skip requirements installation when reusing existing env (e.g. runtime container step
+# where dependencies were already installed at image build time).
+SKIP_REQUIREMENTS_INSTALL="${SKIP_REQUIREMENTS_INSTALL:-no}"
+
 # Helper functions
 print_header() {
     echo -e "\n${BLUE}===================================================${NC}"
@@ -56,6 +95,17 @@ print_info() {
 }
 
 prompt_yes_no() {
+    if is_non_interactive; then
+        local default_answer="${NON_INTERACTIVE_DEFAULT_ANSWER:-yes}"
+        if [[ "$default_answer" =~ ^([Yy]|yes|YES)$ ]]; then
+            print_info "$1 -> auto-answer: yes (NON_INTERACTIVE)"
+            return 0
+        else
+            print_info "$1 -> auto-answer: no (NON_INTERACTIVE)"
+            return 1
+        fi
+    fi
+
     while true; do
         read -p "$1 (y/n): " yn
         case $yn in
@@ -64,6 +114,50 @@ prompt_yes_no() {
             * ) echo "Please answer yes (y) or no (n).";;
         esac
     done
+}
+
+is_non_interactive() {
+    [[ "$NON_INTERACTIVE" =~ ^([Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|1)$ ]]
+}
+
+is_truthy() {
+    local value="${1:-}"
+    [[ "$value" =~ ^([Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|1)$ ]]
+}
+
+apply_auto_profile() {
+    case "$AUTO_PROFILE" in
+        ec2|EC2)
+            print_info "Applying AUTO_PROFILE=ec2 preset..."
+            NON_INTERACTIVE="yes"
+            NON_INTERACTIVE_DEFAULT_ANSWER="${NON_INTERACTIVE_DEFAULT_ANSWER:-yes}"
+
+            # Conservative EC2 preset: skip heavyweight simulator build steps
+            # unless explicitly overridden by AUTO_* env vars.
+            AUTO_ENV_TYPE="${AUTO_ENV_TYPE:-conda}"
+            AUTO_INSTALL_ESMF="${AUTO_INSTALL_ESMF:-no}"
+            AUTO_DOWNLOAD_DATA="${AUTO_DOWNLOAD_DATA:-no}"
+            AUTO_PROCESS_DATA="${AUTO_PROCESS_DATA:-no}"
+            AUTO_FIT_MODELS="${AUTO_FIT_MODELS:-no}"
+            AUTO_CALC_VARIABILITY="${AUTO_CALC_VARIABILITY:-no}"
+            AUTO_CACHE_DATA="${AUTO_CACHE_DATA:-no}"
+
+            # Enable API pregeneration hook only when image is provided.
+            if [ -n "${PREGENERATION_DOCKER_IMAGE_URI:-}" ]; then
+                RUN_API_PREGENERATION_DOCKER="yes"
+            else
+                RUN_API_PREGENERATION_DOCKER="${RUN_API_PREGENERATION_DOCKER:-no}"
+                print_warning "AUTO_PROFILE=ec2 set but PREGENERATION_DOCKER_IMAGE_URI is empty."
+                print_warning "Docker pregeneration hook will be skipped unless image URI is provided."
+            fi
+            ;;
+        "")
+            # No profile selected.
+            ;;
+        *)
+            print_warning "Unknown AUTO_PROFILE='$AUTO_PROFILE'. Ignoring preset."
+            ;;
+    esac
 }
 
 check_python_version() {
@@ -145,8 +239,63 @@ configure_data_directories() {
     echo ""
 }
 
+configure_data_directories_non_interactive() {
+    print_header "Data Directory Configuration (Non-Interactive)"
+
+    RAW_DATA_DIR="${AUTO_RAW_DATA_DIR:-data/raw}"
+    PROCESSED_DATA_DIR="${AUTO_PROCESSED_DATA_DIR:-data/processed}"
+    MODELS_DIR="${AUTO_MODELS_DIR:-data/models}"
+    CACHE_DIR="${AUTO_CACHE_DIR:-data/cache}"
+
+    print_success "Raw data will be stored in: $RAW_DATA_DIR"
+    print_success "Processed data will be stored in: $PROCESSED_DATA_DIR"
+    print_success "Models will be stored in: $MODELS_DIR"
+    print_success "Cache will be stored in: $CACHE_DIR"
+    echo ""
+}
+
 collect_all_choices() {
     print_header "Setup Configuration"
+
+    if is_non_interactive; then
+        print_info "NON_INTERACTIVE mode detected. Applying automatic configuration."
+        echo ""
+
+        USER_ENV_TYPE="${AUTO_ENV_TYPE:-conda}"
+        USER_INSTALL_ESMF="${AUTO_INSTALL_ESMF:-yes}"
+        USER_ESMF_VERSION="${AUTO_ESMF_VERSION:-release/8.9.0}"
+        USER_DOWNLOAD_DATA="${AUTO_DOWNLOAD_DATA:-yes}"
+        USER_OVERWRITE_LENS="${AUTO_OVERWRITE_LENS:-no}"
+        USER_PROCESS_DATA="${AUTO_PROCESS_DATA:-yes}"
+        USER_OVERWRITE_DAILY="${AUTO_OVERWRITE_DAILY:-no}"
+        USER_OVERWRITE_MONTHLY="${AUTO_OVERWRITE_MONTHLY:-no}"
+        USER_FIT_MODELS="${AUTO_FIT_MODELS:-yes}"
+        USER_CALC_VARIABILITY="${AUTO_CALC_VARIABILITY:-yes}"
+        USER_CACHE_DATA="${AUTO_CACHE_DATA:-yes}"
+
+        configure_data_directories_non_interactive
+
+        print_header "Configuration Summary"
+        echo "  Environment type:      $USER_ENV_TYPE"
+        echo "  Install ESMF:          $USER_INSTALL_ESMF"
+        if [ "$USER_INSTALL_ESMF" = "yes" ]; then
+            echo "    ESMF version:        $USER_ESMF_VERSION"
+        fi
+        echo "  Download data:         $USER_DOWNLOAD_DATA"
+        echo "  Process data:          $USER_PROCESS_DATA"
+        echo "  Fit models:            $USER_FIT_MODELS"
+        echo "  Calculate variability: $USER_CALC_VARIABILITY"
+        echo "  Cache data:            $USER_CACHE_DATA"
+        echo ""
+        echo "  Data directories:"
+        echo "    Raw data:            $RAW_DATA_DIR"
+        echo "    Processed data:      $PROCESSED_DATA_DIR"
+        echo "    Models:              $MODELS_DIR"
+        echo "    Cache:               $CACHE_DIR"
+        echo ""
+        print_success "Auto-configuration accepted (NON_INTERACTIVE)."
+        return 0
+    fi
 
     # Ask if this is a first-time setup
     echo ""
@@ -298,6 +447,9 @@ collect_all_choices() {
 main() {
     print_header "SAI Simulator Setup Script"
 
+    # Apply optional profile presets before any prompting/decision logic.
+    apply_auto_profile
+
     # Note: Python version check is done per-environment type
     # - For venv: system Python 3.11+ is required
     # - For conda: Python version is managed by conda
@@ -306,7 +458,7 @@ main() {
     print_info "Required disk space: ~140GB"
     echo ""
 
-    if ! prompt_yes_no "Do you want to continue?"; then
+    if ! is_non_interactive && ! prompt_yes_no "Do you want to continue?"; then
         print_info "Setup cancelled."
         exit 0
     fi
@@ -316,7 +468,10 @@ main() {
 
     # Step A: Environment Setup
     print_header "Step A: Environment Setup"
-    if [ "$USER_ENV_TYPE" = "conda" ]; then
+    if is_truthy "$SKIP_ENV_SETUP"; then
+        print_warning "SKIP_ENV_SETUP is enabled. Reusing current Python environment."
+        setup_existing_python_env
+    elif [ "$USER_ENV_TYPE" = "conda" ]; then
         setup_conda
     else
         setup_venv
@@ -355,6 +510,13 @@ main() {
         cache_data
     else
         print_warning "Skipping data caching."
+    fi
+
+    # Optional step for EC2-style automation. This is controlled by env vars
+    # so standard local setup behavior remains unchanged.
+    if ! run_api_pregeneration_in_docker; then
+        print_error "Pregeneration failed. Setup incomplete."
+        exit 1
     fi
 
     # Final summary
@@ -407,7 +569,7 @@ setup_conda() {
             if check_python_version_in_env; then
                 print_success "Python version is compatible!"
                 echo ""
-                if prompt_yes_no "Do you want to continue with the existing 'sai-simulator' environment?"; then
+                if is_non_interactive || prompt_yes_no "Do you want to continue with the existing 'sai-simulator' environment?"; then
                     # Skip to ESMF installation
                     print_info "Continuing with existing environment."
                     offer_esmf_installation
@@ -423,7 +585,7 @@ setup_conda() {
             else
                 print_warning "Python version $PYTHON_VERSION is not compatible (requires 3.11+)."
                 echo ""
-                if prompt_yes_no "Do you want to recreate the environment with Python 3.12?"; then
+                if is_non_interactive || prompt_yes_no "Do you want to recreate the environment with Python 3.12?"; then
                     conda deactivate
                     conda env remove -n sai-simulator -y
                     print_success "Existing environment removed."
@@ -441,7 +603,12 @@ setup_conda() {
             echo "  2) Exit and let me manually manage environments"
             echo ""
 
-            while true; do
+            if is_non_interactive; then
+                print_info "NON_INTERACTIVE: deactivating '$CURRENT_ENV' and continuing."
+                conda deactivate
+                print_success "Environment deactivated."
+            else
+                while true; do
                 read -p "Enter your choice (1 or 2): " env_choice
                 case $env_choice in
                     1)
@@ -459,7 +626,8 @@ setup_conda() {
                         print_error "Invalid choice. Please enter 1 or 2."
                         ;;
                 esac
-            done
+                done
+            fi
         fi
     fi
 
@@ -479,6 +647,14 @@ setup_conda() {
             echo "  1) Use existing 'sai-simulator' environment (recommended)"
             echo "  2) Delete and recreate the environment"
             echo ""
+
+            if is_non_interactive; then
+                print_info "NON_INTERACTIVE: using existing 'sai-simulator' environment."
+                offer_esmf_installation
+                print_success "Environment setup complete!"
+                print_info "To activate this environment in the future, run: conda activate sai-simulator"
+                return 0
+            fi
 
             while true; do
                 read -p "Enter your choice (1 or 2): " existing_choice
@@ -505,7 +681,7 @@ setup_conda() {
         else
             print_warning "Python version $PYTHON_VERSION is not compatible (requires 3.11+)."
             echo ""
-            if prompt_yes_no "Do you want to recreate the environment with Python 3.12?"; then
+            if is_non_interactive || prompt_yes_no "Do you want to recreate the environment with Python 3.12?"; then
                 conda deactivate
                 conda env remove -n sai-simulator -y
                 print_success "Existing environment removed."
@@ -578,6 +754,14 @@ setup_venv() {
             echo "  2) Delete and recreate the virtual environment"
             echo ""
 
+            if is_non_interactive; then
+                print_info "NON_INTERACTIVE: using existing virtual environment."
+                offer_esmf_installation
+                print_success "Environment setup complete!"
+                print_info "To activate this environment in the future, run: source .venv/bin/activate"
+                return 0
+            fi
+
             while true; do
                 read -p "Enter your choice (1 or 2): " venv_choice
                 case $venv_choice in
@@ -603,7 +787,7 @@ setup_venv() {
         else
             print_warning "Python version $PYTHON_VERSION is not compatible (requires 3.11+)."
             echo ""
-            if prompt_yes_no "Do you want to recreate the virtual environment with system Python?"; then
+            if is_non_interactive || prompt_yes_no "Do you want to recreate the virtual environment with system Python?"; then
                 deactivate 2>/dev/null || true
                 rm -rf .venv
                 print_success "Existing virtual environment removed."
@@ -641,6 +825,41 @@ setup_venv() {
 
     print_success "Environment setup complete!"
     print_info "To activate this environment in the future, run: source .venv/bin/activate"
+}
+
+setup_existing_python_env() {
+    print_info "Using existing Python environment (no conda/venv creation)."
+
+    if ! command -v python &> /dev/null; then
+        print_error "Python is not available in the current environment."
+        exit 1
+    fi
+
+    PYTHON_VERSION=$(python -c 'import sys; print(".".join(map(str, sys.version_info[:2])))')
+    print_info "Detected Python version: $PYTHON_VERSION"
+
+    if ! check_python_version_in_env; then
+        print_error "Python version $PYTHON_VERSION is not compatible (requires 3.11+)."
+        exit 1
+    fi
+
+    if is_truthy "$SKIP_REQUIREMENTS_INSTALL"; then
+        print_warning "Skipping requirements install in existing environment (SKIP_REQUIREMENTS_INSTALL=$SKIP_REQUIREMENTS_INSTALL)."
+    else
+        if [ -f "requirements.txt" ]; then
+            print_info "Installing Python packages from requirements.txt..."
+            python -m pip install -r requirements.txt
+            print_success "Requirements installed."
+        else
+            print_error "requirements.txt not found!"
+            exit 1
+        fi
+    fi
+
+    # Keep ESMF behavior consistent with the normal setup flow.
+    offer_esmf_installation
+
+    print_success "Environment setup complete in existing Python environment."
 }
 
 configure_esmf_env() {
@@ -754,6 +973,15 @@ install_esmf() {
 
         while true; do
             if [ "$ESMF_IS_COMPILED" = true ]; then
+                if is_non_interactive; then
+                    # Auto-select safest fast path for unattended runs.
+                    export ESMFMKFILE="$EXISTING_ESMF_MK"
+                    print_success "NON_INTERACTIVE: using existing compiled ESMF installation."
+                    configure_esmf_env "$EXISTING_ESMF_MK"
+                    install_esmpy
+                    cd "$ORIGINAL_DIR"
+                    return $?
+                fi
                 read -p "Enter your choice (1, 2, or 3): " esmf_choice
                 case $esmf_choice in
                     1)
@@ -782,6 +1010,11 @@ install_esmf() {
                         ;;
                 esac
             else
+                if is_non_interactive; then
+                    # If repo exists but is not compiled, compile it in-place.
+                    print_info "NON_INTERACTIVE: compiling existing ESMF repository."
+                    break
+                fi
                 read -p "Enter your choice (1 or 2): " esmf_choice
                 case $esmf_choice in
                     1)
@@ -813,11 +1046,20 @@ install_esmf() {
         return 1
     fi
 
-    if ! command -v clang &> /dev/null || ! command -v clang++ &> /dev/null; then
-        print_error "clang/clang++ not found. Please install Xcode Command Line Tools:"
-        echo "  xcode-select --install"
-        cd "$ORIGINAL_DIR"
-        return 1
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        if ! command -v clang &> /dev/null || ! command -v clang++ &> /dev/null; then
+            print_error "clang/clang++ not found. Please install Xcode Command Line Tools:"
+            echo "  xcode-select --install"
+            cd "$ORIGINAL_DIR"
+            return 1
+        fi
+    else
+        if ! command -v gcc &> /dev/null || ! command -v g++ &> /dev/null; then
+            print_error "gcc/g++ not found. Please install build-essential:"
+            echo "  apt-get update && apt-get install -y build-essential"
+            cd "$ORIGINAL_DIR"
+            return 1
+        fi
     fi
 
     print_success "All required compilers found."
@@ -846,13 +1088,21 @@ install_esmf() {
     print_info "Setting up ESMF build environment..."
     export ESMF_DIR=$(pwd)
     export ESMF_BOPT=O
-    export ESMF_CXX=/usr/bin/clang++
-    export ESMF_C=/usr/bin/clang
     export ESMF_F90=gfortran
-    export ESMF_COMPILER=gfortranclang
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        export ESMF_CXX=/usr/bin/clang++
+        export ESMF_C=/usr/bin/clang
+        export ESMF_COMPILER=gfortranclang
+        export ESMF_CXXLINKLIBS="-lc++"
+        export ESMF_F90LINKLIBS="-lc++"
+    else
+        export ESMF_CXX=g++
+        export ESMF_C=gcc
+        export ESMF_COMPILER=gfortran
+        unset ESMF_CXXLINKLIBS
+        unset ESMF_F90LINKLIBS
+    fi
     export ESMF_SHARED_LIB_BUILD=ON
-    export ESMF_CXXLINKLIBS="-lc++"
-    export ESMF_F90LINKLIBS="-lc++"
     export ESMF_COMM=mpiuni
 
     print_info "Build configuration:"
@@ -1002,8 +1252,10 @@ download_data() {
 
     # Set overwrite flag based on earlier choice
     OVERWRITE_FLAG=""
+    OVERWRITE_ARGS=()
     if [ "$USER_OVERWRITE_LENS" = "yes" ]; then
         OVERWRITE_FLAG="--overwrite"
+        OVERWRITE_ARGS+=("$OVERWRITE_FLAG")
         print_info "Will overwrite existing LENS files"
     else
         print_info "Will skip existing LENS files"
@@ -1012,7 +1264,7 @@ download_data() {
     # Download LENS NCAR data
     print_info "Downloading LENS NCAR data for TREFHTMX..."
     if [ -f "scripts/run_download_CESM_LENS.sh" ]; then
-        sh scripts/run_download_CESM_LENS.sh TREFHTMX monthly "$RAW_DATA_DIR" 001 002 003 $OVERWRITE_FLAG
+        bash scripts/run_download_CESM_LENS.sh TREFHTMX monthly "$RAW_DATA_DIR" 001 002 003 "${OVERWRITE_ARGS[@]}"
         print_success "TREFHTMX data downloaded."
     else
         print_error "scripts/run_download_CESM_LENS.sh not found!"
@@ -1020,7 +1272,7 @@ download_data() {
 
     print_info "Downloading LENS NCAR data for TREFHTMN..."
     if [ -f "scripts/run_download_CESM_LENS.sh" ]; then
-        sh scripts/run_download_CESM_LENS.sh TREFHTMN monthly "$RAW_DATA_DIR" 001 002 003 $OVERWRITE_FLAG
+        bash scripts/run_download_CESM_LENS.sh TREFHTMN monthly "$RAW_DATA_DIR" 001 002 003 "${OVERWRITE_ARGS[@]}"
         print_success "TREFHTMN data downloaded."
     else
         print_error "scripts/run_download_CESM_LENS.sh not found!"
@@ -1045,7 +1297,7 @@ process_data() {
     # Process daily data
     print_info "Processing daily data to create monthly values..."
     if [ -f "scripts/process_all_daily.sh" ]; then
-        sh scripts/process_all_daily.sh "$RAW_DATA_DIR" $DAILY_OVERWRITE_FLAG
+        bash scripts/process_all_daily.sh "$RAW_DATA_DIR" $DAILY_OVERWRITE_FLAG
         print_success "Daily data processed."
     else
         print_error "scripts/process_all_daily.sh not found!"
@@ -1064,7 +1316,7 @@ process_data() {
     print_info "Processing monthly data to create annual values..."
     mkdir -p "$PROCESSED_DATA_DIR"
     if [ -f "scripts/process_all_monthly.sh" ]; then
-        sh scripts/process_all_monthly.sh "$RAW_DATA_DIR" "$PROCESSED_DATA_DIR" $MONTHLY_OVERWRITE_FLAG
+        bash scripts/process_all_monthly.sh "$RAW_DATA_DIR" "$PROCESSED_DATA_DIR" $MONTHLY_OVERWRITE_FLAG
         print_success "Monthly data processed."
     else
         print_error "scripts/process_all_monthly.sh not found!"
@@ -1081,7 +1333,7 @@ fit_models() {
     mkdir -p "$MODELS_DIR"
 
     if [ -f "scripts/fit_all.sh" ]; then
-        sh scripts/fit_all.sh "$PROCESSED_DATA_DIR" "$MODELS_DIR"
+        bash scripts/fit_all.sh "$PROCESSED_DATA_DIR" "$MODELS_DIR"
         print_success "Regression models fitted."
     else
         print_error "scripts/fit_all.sh not found!"
@@ -1121,6 +1373,48 @@ cache_data() {
     fi
 
     print_success "Data caching complete!"
+}
+
+run_api_pregeneration_in_docker() {
+    if [ "$RUN_API_PREGENERATION_DOCKER" != "yes" ]; then
+        return 0
+    fi
+
+    print_header "Step G: API Cache Pregeneration (Docker)"
+
+    if [ -z "$PREGENERATION_DOCKER_IMAGE_URI" ]; then
+        print_error "RUN_API_PREGENERATION_DOCKER=yes but PREGENERATION_DOCKER_IMAGE_URI is not set."
+        print_info "Set PREGENERATION_DOCKER_IMAGE_URI to your ECR image URI and re-run."
+        return 1
+    fi
+
+    if ! command -v docker &> /dev/null; then
+        print_error "Docker is not installed."
+        print_info "Install Docker and re-run setup, or disable RUN_API_PREGENERATION_DOCKER."
+        return 1
+    fi
+
+    print_info "Pulling pregeneration image: $PREGENERATION_DOCKER_IMAGE_URI"
+    if ! docker pull "$PREGENERATION_DOCKER_IMAGE_URI"; then
+        print_error "Failed to pull pregeneration image."
+        return 1
+    fi
+
+    local docker_args=(--rm --name sai-api-pregeneration)
+    docker_args+=(-e "CELERY_WORKERS=$PREGENERATION_CELERY_WORKERS")
+
+    if [ -n "$PREGENERATION_ENV_FILE" ] && [ -f "$PREGENERATION_ENV_FILE" ]; then
+        print_info "Using env file: $PREGENERATION_ENV_FILE"
+        docker_args+=(--env-file "$PREGENERATION_ENV_FILE")
+    fi
+
+    print_info "Running API cache pregeneration container..."
+    if ! docker run "${docker_args[@]}" "$PREGENERATION_DOCKER_IMAGE_URI"; then
+        print_error "Pregeneration container run failed."
+        return 1
+    fi
+    print_success "API cache pregeneration run completed."
+    return 0
 }
 
 # Run main function
