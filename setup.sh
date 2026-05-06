@@ -32,6 +32,8 @@ USER_OVERWRITE_LENS=""     # "yes" or "no"
 USER_OVERWRITE_DAILY=""    # "yes" or "no"
 USER_OVERWRITE_MONTHLY=""  # "yes" or "no"
 
+# Single source of truth for hosted dataset version.
+DATA_BUCKET_URI=$(python -c 'from version import DATA_BUCKET_URI; print(DATA_BUCKET_URI)')
 # Optional automation hook for API cache pregeneration on EC2.
 # Enable by exporting RUN_API_PREGENERATION_DOCKER=yes before running this script.
 RUN_API_PREGENERATION_DOCKER="${RUN_API_PREGENERATION_DOCKER:-no}"
@@ -1270,7 +1272,7 @@ download_data() {
     # Download data from S3
     print_info "Downloading data from S3 bucket (this may take a while)..."
     start_time=$(date +%s)
-    aws s3 sync s3://reflective-simulator-bucket/v1.3.0/ "$RAW_DATA_DIR/" --no-sign-request
+    aws s3 sync "$DATA_BUCKET_URI" "$RAW_DATA_DIR/" --no-sign-request
     end_time=$(date +%s)
     duration=$((end_time - start_time))
     minutes=$((duration / 60))
@@ -1304,6 +1306,21 @@ download_data() {
         print_success "TREFHTMN data downloaded."
     else
         print_error "scripts/run_download_CESM_LENS.sh not found!"
+    fi
+
+    # Sanity checks for download completeness and duplicates
+    print_info "Running sanity checks on downloaded files..."
+    if [ -f "scripts/data_sanity_checks.py" ]; then
+        python scripts/data_sanity_checks.py \
+            --data_dir "$RAW_DATA_DIR" \
+            --expected_bucket_uri "$DATA_BUCKET_URI" \
+            --include_lens_files \
+            --required_variables "TREFHT,PRECT,PRECC,PRECL,QFLX,ICEFRAC,TREFHTMN,TREFHTMX" \
+            --min_ensemble_members 3
+        print_success "Download sanity checks passed."
+    else
+        print_error "scripts/data_sanity_checks.py not found!"
+        exit 1
     fi
 
     print_success "Data download complete!"

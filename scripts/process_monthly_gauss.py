@@ -12,6 +12,17 @@ import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from backend.utils import open_xarray_datasets, save_processed_data
+from scripts.preprocessing_sanity import (
+    SanityCheckError,
+    build_monthly_cell_bounds,
+    validate_monthly_cell_bounds,
+    validate_no_nans,
+    validate_no_negative_values,
+    validate_year_continuity_strict,
+    validate_year_continuity_with_max_gap,
+    validate_variable_specific_ranges,
+    validate_year_count_for_experiment,
+)
 from scripts.variability import process_geojson_variability
 
 
@@ -31,6 +42,10 @@ UNIT_SCALERS = {
     "PRECT": 86400 * 1000,   # m/s -> mm/day
     "QFLX": 86400,         # kg/m2/s -> mm/day
 }
+
+# Largest allowed jump in calendar ``time`` (years) after hist + SSP245 merge.
+# Incomplete-year drops can leave multi-year holes at the 2014/2015 seam (e.g. gap 7).
+MERGED_HIST_BASELINE_MAX_YEAR_GAP = 10
 
 # Map user variables to aggregation methods
 AGGREGATION_RULES = {
@@ -57,6 +72,22 @@ var2esm_var = {
     }
 
 # --- Helper Functions --- #
+
+
+def _dataarray_to_single_var_dataset(da: xr.DataArray, name: str) -> xr.Dataset:
+    if da.name != name:
+        da = da.rename(name)
+    return da.to_dataset()
+
+
+def _ensure_regridded_ensemble_dataset(
+    obj: xr.DataArray | xr.Dataset, esm_var: str
+) -> xr.Dataset:
+    """``xr.concat`` on DataArrays can return a DataArray; downstream expects a Dataset."""
+    if isinstance(obj, xr.Dataset):
+        return obj
+    return _dataarray_to_single_var_dataset(obj, esm_var)
+
 
 # Helper to check if a variable is cumulative (like "days above 30C")
 def is_cumulative(var_name):
@@ -329,6 +360,22 @@ def validate_continuity(ds):
     one_month = np.timedelta64(1, 'M')
     if not np.all(time_diffs == one_month):
         raise ValueError("\033[91mData is not temporally continuous (missing months detected).\033[0m")
+
+
+def _combined_monthly_to_dataarray(
+    combined: xr.DataArray | xr.Dataset, esm_var: str
+) -> xr.DataArray:
+    """``combine_by_coords`` on DataArrays often returns a Dataset; downstream expects one variable."""
+    if isinstance(combined, xr.Dataset):
+        if esm_var not in combined.data_vars:
+            names = ", ".join(sorted(combined.data_vars))
+            raise ValueError(
+                f"Combined monthly data is a Dataset but does not contain {esm_var}. "
+                f"Variables present: {names}"
+            )
+        return combined[esm_var]
+    return combined
+
 
 def merge_historical_and_baseline(exp2member2data_combined):
     """
@@ -669,6 +716,7 @@ def process_monthly(var, data_dir, output_dir, overwrite=False):
 
     # Combination & Aggregation
     print(">> Combining & Aggregating...")
+    monthly_cell_bounds = build_monthly_cell_bounds(var, exp2member2data)
 
     # Create grid for output (lat/lon)
     # Get correct latitudes from CESM2-WACCM (center of bounds)
@@ -679,6 +727,9 @@ def process_monthly(var, data_dir, output_dir, overwrite=False):
     }
 
     exp2member2data_combined = defaultdict(lambda: defaultdict(list))
+    year_count_summary = defaultdict(dict)
+    failed_sanity_checks: list[tuple[str, str, str]] = []
+    failed_processing: list[tuple[str, str, str]] = []
     for exp, member2data in tqdm(exp2member2data.items(), desc="Experiments"):
         for member, data_list in member2data.items():
             # print(f"exp: {exp}")
@@ -688,10 +739,20 @@ def process_monthly(var, data_dir, output_dir, overwrite=False):
             # print(f"datalist size: {len(data_list)}")
             try:
                 # A. Combine time steps
-                ds_combined = xr.combine_by_coords(data_list, combine_attrs='drop_conflicts')
+                ds_combined = _combined_monthly_to_dataarray(
+                    xr.combine_by_coords(data_list, combine_attrs="drop_conflicts"),
+                    esm_var,
+                )
                 
                 # B. Validation
                 validate_continuity(ds_combined)
+                validate_monthly_cell_bounds(
+                    data=ds_combined,
+                    var_name=var,
+                    exp=exp,
+                    member=member,
+                    bounds=monthly_cell_bounds,
+                )
 
                 # C. Yearly Aggregation
                 # print(f"  Getting yearly aggregate for {var} experiment: {exp} member: {member} ...")
@@ -701,28 +762,131 @@ def process_monthly(var, data_dir, output_dir, overwrite=False):
                 # Extract years safely from the datetime index
                 years = ds_yearly.time.dt.year.values
                 ds_yearly = ds_yearly.assign_coords(time=years)
+                year_count_summary[exp][member] = len(ds_yearly.time)
+
+                # E. Sanity check yearly count by experiment type.
+                validate_year_count_for_experiment(
+                    exp=exp,
+                    year_count=year_count_summary[exp][member],
+                    var_name=var,
+                    member=member,
+                )
+                validate_year_continuity_strict(
+                    years=years,
+                    var_name=var,
+                    exp=exp,
+                    member=member,
+                    stage="unmerged yearly continuity",
+                )
+
+                validate_no_nans(
+                    data=ds_yearly,
+                    var_name=var,
+                    exp=exp,
+                    member=member,
+                    stage="yearly aggregation",
+                )
+                validate_no_negative_values(
+                    data=ds_yearly,
+                    var_name=var,
+                    exp=exp,
+                    member=member,
+                    stage="yearly aggregation",
+                )
+                validate_variable_specific_ranges(
+                    data=ds_yearly,
+                    var_name=var,
+                    exp=exp,
+                    member=member,
+                    stage="yearly aggregation",
+                )
                 
                 exp2member2data_combined[exp][member] = ds_yearly
 
-                # E. Save (Implementation depends on your specific save needs)
+                # F. Save (Implementation depends on your specific save needs)
                 # final_path = output_dir / f"{exp}_{member}_{var}.nc"
                 # ds_yearly.to_netcdf(final_path)
                 
+            except SanityCheckError as e:
+                print(f"\033[91mSanity check failed for {exp} member {member}: {e}\033[0m")
+                failed_sanity_checks.append((exp, member, str(e)))
             except Exception as e:
-                print(f"\033[91mError processing {exp} member {member}: {e}\033[0m")
+                print(f"\033[91mIO/parsing error for {exp} member {member}: {e}\033[0m")
+                failed_processing.append((exp, member, str(e)))
 
+    # Print a compact summary of yearly counts to aid debugging.
+    if year_count_summary:
+        print(f"Year-count summary for {var}:")
+        for exp in sorted(year_count_summary.keys()):
+            members = year_count_summary[exp]
+            detail = ", ".join(
+                f"{member}:{members[member]}" for member in sorted(members.keys())
+            )
+            print(f"  - {exp}: {detail}")
+    if failed_sanity_checks:
+        print(
+            f"\033[93mWarning: {len(failed_sanity_checks)} member(s) failed sanity checks:\033[0m"
+        )
+        for exp, member, message in failed_sanity_checks:
+            print(f"  - {exp}/{member}: {message}")
+    if failed_processing:
+        print(
+            f"\033[93mWarning: {len(failed_processing)} member(s) had IO/parsing errors:\033[0m"
+        )
+        for exp, member, message in failed_processing:
+            print(f"  - {exp}/{member}: {message}")
+
+    if not exp2member2data_combined:
+        raise ValueError(
+            f"No valid data remained for {var} after sanity checks. "
+            "See earlier per-member validation errors."
+        )
+
+    baseline_members = exp2member2data_combined.get("baseline", {})
+    if not baseline_members:
+        raise ValueError(
+            f"No valid baseline members remained for {var} after sanity checks. "
+            "Baseline is required for variability calculations."
+        )
 
     # output_dir is passed from process_monthly
-    std_value, weights = compute_and_save_variability(exp2member2data_combined, esm_var, output_dir, overwrite)
+    variability_result = compute_and_save_variability(
+        exp2member2data_combined, esm_var, output_dir, overwrite
+    )
+    if variability_result is None:
+        raise ValueError(
+            f"Could not compute model internal variability for {var}: baseline data unavailable."
+        )
+    std_value, weights = variability_result
     
     # Compute grid-level model internal variability
     grid_level_variability = compute_and_save_grid_variability(exp2member2data_combined, var, esm_var, output_dir, overwrite)
+    if grid_level_variability is None:
+        raise ValueError(
+            f"Could not compute grid-level variability for {var}: baseline data unavailable."
+        )
 
     # Calcualting regional variability
     process_geojson_variability(output_dir.parent / "geojsons/original", grid_level_variability, var, weights)
 
     # Stitch Historical + Baseline
     merge_historical_and_baseline(exp2member2data_combined)
+
+    # For merged data, gaps are allowed up to ``MERGED_HIST_BASELINE_MAX_YEAR_GAP``.
+    if "baseline" in exp2member2data_combined:
+        for member, ds in exp2member2data_combined["baseline"].items():
+            merged_years = ds.time.values
+            validate_year_continuity_with_max_gap(
+                years=merged_years,
+                var_name=var,
+                exp="baseline",
+                member=member,
+                stage="merged continuity",
+                max_gap_years=MERGED_HIST_BASELINE_MAX_YEAR_GAP,
+            )
+
+    if not exp2member2data_combined:
+        raise ValueError(f"No experiments available for regridding after merge for {var}.")
 
     print("Regridding and creating ensemble DataArrays...")
 
@@ -764,12 +928,34 @@ def process_monthly(var, data_dir, output_dir, overwrite=False):
 
             # Apply regridder
             regridded = regridder(ds)
+            validate_no_nans(
+                data=regridded,
+                var_name=var,
+                exp=exp,
+                member=member,
+                stage="regridding",
+            )
+            validate_no_negative_values(
+                data=regridded,
+                var_name=var,
+                exp=exp,
+                member=member,
+                stage="regridding",
+            )
+            validate_variable_specific_ranges(
+                data=regridded,
+                var_name=var,
+                exp=exp,
+                member=member,
+                stage="regridding",
+            )
             regridded = regridded.assign_coords(member=member)
             regridded_members.append(regridded)
 
         if regridded_members:
             # Concatenate
             ds_ensemble = xr.concat(regridded_members, dim="member", join="outer")
+            ds_ensemble = _ensure_regridded_ensemble_dataset(ds_ensemble, esm_var)
             final_output_data[exp] = ds_ensemble
 
     print("Regridding complete.")  
@@ -792,6 +978,31 @@ def process_monthly(var, data_dir, output_dir, overwrite=False):
             
             # Rename variable for consistency before saving
             ds_members_renamed = ds_ensemble.rename_vars({esm_var: var})
+            # ICEFRAC is masked to NH September only in ``process_file``; TAS all-members
+            # can also contain expected NaNs after member/time union with ``join='outer'``.
+            # Skip global NaN checks for these all-members exports.
+            if var not in {"icefrac", "tas"}:
+                validate_no_nans(
+                    data=ds_members_renamed[var],
+                    var_name=var,
+                    exp=exp,
+                    member="all-members",
+                    stage="all-members output",
+                )
+            validate_no_negative_values(
+                data=ds_members_renamed[var],
+                var_name=var,
+                exp=exp,
+                member="all-members",
+                stage="all-members output",
+            )
+            validate_variable_specific_ranges(
+                data=ds_members_renamed[var],
+                var_name=var,
+                exp=exp,
+                member="all-members",
+                stage="all-members output",
+            )
             
             # Save
             if overwrite or not out_path_members.exists():
@@ -803,6 +1014,7 @@ def process_monthly(var, data_dir, output_dir, overwrite=False):
         # The user code had an if/else that did the same thing for both cases.
         # We simplify it to just one operation.
         ds_mean = ds_ensemble.mean(dim="member")
+        ds_mean = _ensure_regridded_ensemble_dataset(ds_mean, esm_var)
 
         # Add Metadata Coordinates
         ds_mean = ds_mean.expand_dims({"ssp": 1, "model": 1})
@@ -832,6 +1044,28 @@ def process_monthly(var, data_dir, output_dir, overwrite=False):
                     print(f"\033[91m  [ERROR] Failed to calculate P-E: {e}\033[0m")
             else:
                 print(f"\033[93m  [WARNING] Cannot calculate P-E. Missing 'pr' file: {pr_path}\033[0m")
+
+        validate_no_nans(
+            data=ds_mean[var],
+            var_name=var,
+            exp=exp,
+            member="ensemble-mean",
+            stage="ensemble mean output",
+        )
+        validate_no_negative_values(
+            data=ds_mean[var],
+            var_name=var,
+            exp=exp,
+            member="ensemble-mean",
+            stage="ensemble mean output",
+        )
+        validate_variable_specific_ranges(
+            data=ds_mean[var],
+            var_name=var,
+            exp=exp,
+            member="ensemble-mean",
+            stage="ensemble mean output",
+        )
 
         # Save Final Averaged File
         out_path_mean = output_dir / f"output_gauss-{exp}.nc"
