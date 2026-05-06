@@ -187,3 +187,28 @@ so2_by_latitude_*.csv
 
 # esmf
 esmf/
+
+#terraform/opentofu
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+terraform.tfvars
+terraform.tfvars.json
+terraform.tfvars.json.backup
+terraform.tfvars.json.backup.*
+
+#pytest
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.hypothesis/
+.mypy_cache/
+.pytype/
+.pyre/
+.dmypy.json
+dmypy.json
+.pytest_cache/
+
+validation_celery_report.json

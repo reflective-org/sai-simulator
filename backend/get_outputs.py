@@ -22,7 +22,7 @@ from .delta import get_regional_delta
 from .p_values import get_grid_level_p_values
 from .population import get_population_data
 from .variable import get_variable_regional_delta
-from .utils import get_interpolator, create_mask, regional_aggregation, apply_constraints, clip_to_land
+from .utils import get_interpolator, create_mask, regional_aggregation, apply_constraints, clip_to_land, apply_ramp_up_factor
 from .icefrac import get_area, predict_icefrac
 
 
@@ -40,24 +40,13 @@ def get_temp_diff(data_dir, model_dir, cache_dir, ssp_scenario, temp_target):
 
 
 def get_so2_by_latitude(interpolator, temp_diff, ramp_up):
-    so2_by_latitude = interpolator.sel(features='slope') * temp_diff
+      so2_by_latitude = interpolator.sel(features='slope') * temp_diff
 
-    # Set all values to 0 for the indices of time where temp_diff > 0
-    no_sai_indices = temp_diff > 0
-    so2_by_latitude = so2_by_latitude.where(~no_sai_indices, 0)
+      no_sai_indices = temp_diff > 0
+      so2_by_latitude = so2_by_latitude.where(~no_sai_indices, 0)
+      so2_by_latitude = apply_ramp_up_factor(so2_by_latitude, temp_diff, ramp_up)
 
-    if ramp_up > 0 and not no_sai_indices.all():
-        # Apply a linear ramp-up from first year of > temp target for ramp_up years
-        actual_sai_start_year = temp_diff.time.values[~no_sai_indices][0]
-        # Ensure the ramp-up is not longer than the actual SAI period
-        ramp_up = min(ramp_up, SIM_END_YEAR - actual_sai_start_year)
-        # Get the indices of the ramp-up period
-        ramp_up_indices = np.arange(actual_sai_start_year, actual_sai_start_year + ramp_up)
-        # Multiply the so2 by the ramp-up factor, going from 1/ramp_up to 1
-        ramp_up_factor = np.linspace(1/ramp_up, 1, ramp_up)
-        so2_by_latitude.loc[dict(time=ramp_up_indices)] *= ramp_up_factor
-
-    return so2_by_latitude
+      return so2_by_latitude
 
 
 def get_outputs(
@@ -216,6 +205,11 @@ def get_outputs(
             output_data["geotiff_paths"] = create_geotiff_files(**locals())
         if output_config.get("create_pngs", False) or output_config.get("create_svgs", False):
             output_data["image_paths"] = create_vectorized_files(**locals())
+
+        # Validation-only: GeoTIFFs (and core regional fields above) are enough; skip
+        # mean-over-time, PDFs, NetCDF export, and per-variable plotting work.
+        if output_config.get("verification_minimal") or output_config.get("validation_minimal"):
+            continue
 
         #### Mean over time plot ####
         # Get period between 2015 and SAI start year, SAI start year to SAI end year, and SAI end year to 2100
@@ -480,6 +474,9 @@ def get_outputs(
                 output_config=output_config
             )
 
+    if output_config.get("verification_minimal") or output_config.get("validation_minimal"):
+        return output_data
+
     ### Latitude vs. Tg SO2 plot ###
     if variable_injection is None:
         temp_diff = temp_diff.sel(time=slice(start_year, SIM_END_YEAR))
@@ -577,6 +574,21 @@ def _reproject_to_arctic_stereo(data_array, significance_mask, src_transform):
     return dst_data, dst_sig, dst_transform, dst_crs
 
 
+def _geotiff_coord_step_degrees(coord: xr.DataArray, *, axis_name: str) -> float:
+    """Pixel size along one axis; avoids empty reductions on degenerate coordinates."""
+    vals = np.asarray(coord.values, dtype=np.float64).ravel()
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        raise ValueError(f"GeoTIFF build: {axis_name} has no finite coordinate values")
+    lo = float(np.min(vals))
+    hi = float(np.max(vals))
+    span = hi - lo
+    n = vals.size
+    if n == 1:
+        return 1.0
+    return span / (n - 1)
+
+
 def create_geotiff_files(var, regional_mean, regional_delta_mean,
                         regional_no_sai_p_values, regional_sai_p_values,
                         ssp_scenario, temp_target=None,
@@ -671,12 +683,16 @@ def create_geotiff_files(var, regional_mean, regional_delta_mean,
         if data_array.dtype != np.float32:
             data_array = data_array.astype(np.float32)
         
-        # Calculate the correct transform
-        lon_res = (data_adjusted.lon.max() - data_adjusted.lon.min()) / (data_adjusted.lon.size - 1)
-        lat_res = (data_adjusted.lat.max() - data_adjusted.lat.min()) / (data_adjusted.lat.size - 1)
+        # Calculate the correct transform (robust to single-point axes / bad caches)
+        lon_res = _geotiff_coord_step_degrees(data_adjusted.lon, axis_name="lon")
+        lat_res = _geotiff_coord_step_degrees(data_adjusted.lat, axis_name="lat")
+        lon_vals = np.asarray(data_adjusted.lon.values, dtype=np.float64).ravel()
+        lon_vals = lon_vals[np.isfinite(lon_vals)]
+        lat_vals = np.asarray(data_adjusted.lat.values, dtype=np.float64).ravel()
+        lat_vals = lat_vals[np.isfinite(lat_vals)]
         transform = rasterio.transform.from_origin(
-            data_adjusted.lon.min() - lon_res/2,
-            data_adjusted.lat.max() + lat_res/2,
+            float(np.min(lon_vals)) - lon_res / 2,
+            float(np.max(lat_vals)) + lat_res / 2,
             lon_res, lat_res
         )
 

@@ -1,9 +1,9 @@
-import numpy as np
 import xarray as xr
 
 from fair_wrap.fair_utils import REVERSE_FANCY_SSP_TITLES, SIM_END_YEAR
 from .constants import *
-from .utils import get_interpolator, clip_to_land
+from .utils import get_interpolator, clip_to_land, apply_ramp_up_factor
+from .utils import save_processed_data
 from .population import get_population_exposure
 
 
@@ -38,7 +38,7 @@ def get_regional_delta_without_rampup(var, data_dir, model_dir, cache_dir, ssp_s
             if is_exposure:
                 regional_delta = get_population_exposure(data_dir, regional_delta)
 
-        regional_delta.to_netcdf(regional_delta_cache_path)
+        save_processed_data(regional_delta, regional_delta_cache_path, overwrite=True)
 
     return regional_delta
 
@@ -54,16 +54,6 @@ def get_regional_delta(var, data_dir, model_dir, cache_dir, ssp_scenario, temp_t
     # Set all values to 0 for the indices of time where temp_diff > 0
     no_sai_indices = temp_diff > 0
     regional_delta = regional_delta.where(~no_sai_indices, 0)
-
-    if ramp_up > 0 and not no_sai_indices.all():
-        # Apply a linear ramp-up from first year of > temp target for ramp_up years
-        actual_sai_start_year = temp_diff.time.values[~no_sai_indices][0]
-        # Ensure the ramp-up is not longer than the actual SAI period
-        ramp_up = min(ramp_up, SIM_END_YEAR - actual_sai_start_year)
-        # Get the indices of the ramp-up period
-        ramp_up_indices = np.arange(actual_sai_start_year, actual_sai_start_year + ramp_up)
-        # Multiply the delta by the ramp-up factor, going from 1/ramp_up to 1
-        ramp_up_factor = np.linspace(1/ramp_up, 1, ramp_up)
-        regional_delta.loc[dict(time=ramp_up_indices)] *= ramp_up_factor
+    regional_delta = apply_ramp_up_factor(regional_delta, temp_diff, ramp_up)
 
     return regional_delta

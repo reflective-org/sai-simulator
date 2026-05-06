@@ -281,7 +281,7 @@ def load_icefrac_params(model_dir: Union[str, Path]) -> xr.DataArray:
 
     # Use a context manager to ensure file handles are released immediately
     with xr.open_dataarray(path) as da:
-        # Strict validation of the internal variable name
+        # Strict verification of the internal variable name
         if da.name != 'logistic_params':
             raise ValueError(
                 f"Invalid parameter file. Expected DataArray named 'logistic_params', "

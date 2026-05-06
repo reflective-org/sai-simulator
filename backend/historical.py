@@ -4,6 +4,7 @@ from functools import lru_cache
 
 from .constants import exposurevar2var
 from .utils import clip_to_land
+from .utils import save_processed_data
 from .population import get_population_exposure
 
 
@@ -14,45 +15,50 @@ def get_historical_model(var, data_dir, cache_dir):
 
     if historical_cache_path.exists():
         print(f"Found {historical_cache_path}")
-        with xr.open_dataarray(historical_cache_path) as da:
+        try:
+            with xr.open_dataarray(historical_cache_path) as da:
+                historical_model_data = da.load()
+            return historical_model_data
+        except (OSError, ValueError) as e:
+            print(f"Invalid historical cache at {historical_cache_path}; rebuilding. Error: {e}")
+            historical_cache_path.unlink(missing_ok=True)
+
+    is_above_below = "above" in var or "below" in var
+    is_exposure = "exposure" in var
+    if var in [
+        "tas", "tasmin", "tasmax", "tas_above_40", "tas_above_35", "tas_below_0",
+        "pr", "p-e", "pr_above_10", "pr_above_20",
+        "icefrac"
+    ]:
+        with xr.open_dataarray(data_dir / var / "output_gauss-baseline.nc") as da:
             historical_model_data = da.load()
+        historical_model_data = historical_model_data.sel(model="CESM2-WACCM", ssp="ssp245")
+        historical_model_data = historical_model_data.drop_vars(["ssp", "model"])
+    # elif var in []:
+    #     with xr.open_dataarray(data_dir / var / "output_gauss-cmip_historical.nc") as da:
+    #         historical_model_data = da.load()
+    #     historical_model_data = historical_model_data.sel(model="CESM2-WACCM", ssp="ssp245")
+    #     historical_model_data = historical_model_data.drop_vars(["ssp", "model"])
+    elif is_exposure:
+        daily_var = exposurevar2var[var]
+        with xr.open_dataarray(data_dir / daily_var / "output_gauss-baseline.nc") as da:
+            historical_model_data = da.load()
+        historical_model_data = historical_model_data.sel(model="CESM2-WACCM", ssp="ssp245")
+        historical_model_data = historical_model_data.drop_vars(["ssp", "model"])
     else:
-        is_above_below = "above" in var or "below" in var
-        is_exposure = "exposure" in var
-        if var in [
-            "tas", "tasmin", "tasmax", "tas_above_40", "tas_above_35", "tas_below_0",
-            "pr", "p-e", "pr_above_10", "pr_above_20",
-            "icefrac"
-        ]:
-            with xr.open_dataarray(data_dir / var / "output_gauss-baseline.nc") as da:
-                historical_model_data = da.load()
-            historical_model_data = historical_model_data.sel(model="CESM2-WACCM", ssp="ssp245")
-            historical_model_data = historical_model_data.drop_vars(["ssp", "model"])
-        # elif var in []:
-        #     with xr.open_dataarray(data_dir / var / "output_gauss-cmip_historical.nc") as da:
-        #         historical_model_data = da.load()
-        #     historical_model_data = historical_model_data.sel(model="CESM2-WACCM", ssp="ssp245")
-        #     historical_model_data = historical_model_data.drop_vars(["ssp", "model"])
-        elif is_exposure:
-            daily_var = exposurevar2var[var]
-            with xr.open_dataarray(data_dir / daily_var / "output_gauss-baseline.nc") as da:
-                historical_model_data = da.load()
-            historical_model_data = historical_model_data.sel(model="CESM2-WACCM", ssp="ssp245")
-            historical_model_data = historical_model_data.drop_vars(["ssp", "model"])
-        else:
-            historical_model_data = None
+        historical_model_data = None
 
-        if historical_model_data is not None:
-            if is_above_below:
-                historical_model_data = historical_model_data.where(historical_model_data > 0, 0)
+    if historical_model_data is not None:
+        if is_above_below:
+            historical_model_data = historical_model_data.where(historical_model_data > 0, 0)
 
-            if is_above_below or var in ["pr", "p-e"]:
-                historical_model_data = clip_to_land(data_dir, historical_model_data)
-                if is_exposure:
-                    historical_model_data = get_population_exposure(data_dir, historical_model_data)
-            historical_model_data = historical_model_data.sel(time=slice(None, 2014))
+        if is_above_below or var in ["pr", "p-e"]:
+            historical_model_data = clip_to_land(data_dir, historical_model_data)
+            if is_exposure:
+                historical_model_data = get_population_exposure(data_dir, historical_model_data)
+        historical_model_data = historical_model_data.sel(time=slice(None, 2014))
 
-            historical_model_data.to_netcdf(historical_cache_path)
+        save_processed_data(historical_model_data, historical_cache_path, overwrite=True)
 
     return historical_model_data
 

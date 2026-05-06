@@ -1,0 +1,444 @@
+# S3 validation on a self-hosted EC2 runner (large local data tree).
+#
+# This workflow starts the EC2 runner instance itself, waits for the self-hosted runner to come
+# online, runs validation, then stops the instance in a final cleanup job. That makes it work
+# both before and after merge without cross-workflow dispatch.
+#
+# Why self-hosted?
+# GitHub-hosted runners do not have your ~140GB simulator data tree. Validation must run
+# on a machine that already has data/processed, data/models, and data/cache (or you set
+# VALIDATION_*_DIR repository variables to those paths on the instance).
+#
+# Required GitHub configuration:
+# - Secret: VALIDATION_AWS_ROLE_ARN
+# - Secret: VALIDATION_GH_TOKEN
+# - Secret: VALIDATION_S3_BUCKET
+# - Variable: VALIDATION_RUNNER_INSTANCE_ID
+# - Variable: AWS_REGION (optional; defaults to us-west-2 in this file)
+#
+# One-time EC2 setup
+# -----------------
+# 1. GitHub → Settings → Actions → Runners → New self-hosted runner. Choose OS/arch, then
+#    run the download/config commands ON THE EC2 instance and install as a service.
+# 2. When configuring the runner, assign labels that include those in `runs-on` below
+#    (default: self-hosted + sai-simulator-validation). Install/run the service as `ec2-user`
+#    so Actions steps execute as `ec2-user`. Example:
+#      ./config.sh --url https://github.com/ORG/REPO --token TOKEN --labels sai-simulator-validation
+# 3. Attach an IAM instance profile to EC2 with s3:GetObject on the validation reference prefix
+#    (or configure AWS credentials another way boto3 understands).
+# 4. VALIDATION_S3_PREFIX: most recently created git tag if any; otherwise
+#    .github/validation/self-hosted.env -> VALIDATION_S3_PREFIX_FALLBACK
+#    (set it to match your S3 layout). Optional
+#    repository variables: VALIDATION_S3_FILETYPE, VALIDATION_DATA_DIR,
+#    VALIDATION_MODEL_DIR, VALIDATION_CACHE_DIR, VALIDATION_SEED, VALIDATION_DECADE,
+#    VALIDATION_RAMP_UP, VALIDATION_VARIABLES, VALIDATION_EPSILON,
+#    VALIDATION_CELERY_BROKER_URL, VALIDATION_CELERY_RESULT_BACKEND
+#    VALIDATION_CELERY_QUEUE (optional; default sai_verification): dedicated Celery queue so
+#    shared Redis is not serviced only by unrelated workers consuming the default "celery" queue.
+#    VALIDATION_CELERY_SAFE_MODE (set 1/true to force worker concurrency=1 for debugging)
+#    VALIDATION_CELERY_CONCURRENCY (optional explicit worker pool size)
+#    VALIDATION_CELERY_MEM_PER_CHILD_MIB (optional; default 12288): when auto-picking worker
+#    concurrency, cap by MemAvailable / this budget so prefork children do not OOM the box.
+#
+# Case count: pytest reads VALIDATION_LIMIT (and optional VALIDATION_GENERATE_COUNT, VALIDATION_CASES_JSON).
+# This workflow defaults to 2000 cases; set repository variable VALIDATION_LIMIT to override (e.g. smaller runs).
+#
+# This job uses Redis plus a transient Celery worker started by the workflow on the EC2 runner.
+# Ensure the broker/backend is reachable from the instance.
+
+name: S3 validation (self-hosted EC2)
+
+on:
+  pull_request:
+    branches: [main, public]
+  workflow_dispatch:
+
+# Do not cancel in-progress runs: a new push would abort mid-canary / mid-batch with
+# "Error: The operation was canceled" and leave a confusing partial state on the runner.
+# New runs for the same PR/ref queue until the current run finishes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-west-2' }}
+  RUNNER_LABEL: sai-simulator-validation
+  LEASE_MINUTES: "240"
+
+jobs:
+  start-runner:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number || 'manual' }}
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.VALIDATION_AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Start runner EC2 and set lease tag
+        env:
+          INSTANCE_ID: ${{ vars.VALIDATION_RUNNER_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$INSTANCE_ID" ]; then
+            echo "::error::Set repository variable VALIDATION_RUNNER_INSTANCE_ID."
+            exit 1
+          fi
+
+          aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null
+          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+          aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
+
+          EXPIRES_AT="$(date -u -d "+${LEASE_MINUTES} minutes" +%s)"
+          aws ec2 create-tags \
+            --resources "$INSTANCE_ID" \
+            --tags \
+              "Key=gh_validation_lease_expires_at,Value=${EXPIRES_AT}" \
+              "Key=gh_validation_repo,Value=${GITHUB_REPOSITORY}" \
+              "Key=gh_validation_pr,Value=${PR_NUMBER}"
+
+      - name: Wait for self-hosted runner online
+        env:
+          GH_TOKEN: ${{ secrets.VALIDATION_GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 36); do
+            RUNNERS_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runners?per_page=100")"
+            ONLINE_COUNT="$(echo "$RUNNERS_JSON" | jq --arg lbl "$RUNNER_LABEL" '[.runners[]? | select(.status == "online") | select([.labels[]?.name] | index($lbl) != null)] | length')"
+            if [ "$ONLINE_COUNT" -ge 1 ]; then
+              echo "Runner with label ${RUNNER_LABEL} is online."
+              exit 0
+            fi
+            echo "Waiting for runner online... attempt ${i}/36"
+            sleep 10
+          done
+          echo "::error::Runner did not come online in time."
+          exit 1
+
+  s3-validation:
+    needs: start-runner
+    runs-on: [self-hosted, sai-simulator-validation]
+    timeout-minutes: 180
+    env:
+      # Avoid HDF5 file-lock deadlocks when multiple Celery workers touch the same caches.
+      HDF5_USE_FILE_LOCKING: "FALSE"
+      PYTHONPATH: ${{ github.workspace }}
+      PYTHONUNBUFFERED: "1"
+      VALIDATION_S3_BUCKET: ${{ secrets.VALIDATION_S3_BUCKET }}
+      VALIDATION_S3_FILETYPE: ${{ vars.VALIDATION_S3_FILETYPE }}
+      VALIDATION_DATA_DIR: ${{ vars.VALIDATION_DATA_DIR || '/home/ec2-user/data/processed' }}
+      VALIDATION_MODEL_DIR: ${{ vars.VALIDATION_MODEL_DIR || '/home/ec2-user/data/models' }}
+      VALIDATION_CACHE_DIR: ${{ vars.VALIDATION_CACHE_DIR || '/home/ec2-user/data/cache' }}
+      VALIDATION_SEED: ${{ vars.VALIDATION_SEED }}
+      VALIDATION_RAMP_UP: ${{ vars.VALIDATION_RAMP_UP }}
+      VALIDATION_EPSILON: ${{ vars.VALIDATION_EPSILON }}
+      POOCH_HOME: "/home/ec2-user/.cache/pooch"
+      VALIDATION_CELERY_BROKER_URL: ${{ vars.VALIDATION_CELERY_BROKER_URL }}
+      VALIDATION_CELERY_RESULT_BACKEND: ${{ vars.VALIDATION_CELERY_RESULT_BACKEND }}
+      VALIDATION_CELERY_QUEUE: ${{ vars.VALIDATION_CELERY_QUEUE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Load self-hosted validation config
+        run: |
+          set -euo pipefail
+          CONFIG_FILE="${GITHUB_WORKSPACE}/.github/validation/self-hosted.env"
+          if [ ! -f "${CONFIG_FILE}" ]; then
+            echo "::error::Missing config file: ${CONFIG_FILE}"
+            exit 1
+          fi
+          cat "${CONFIG_FILE}" >> "${GITHUB_ENV}"
+
+      - name: Preflight disk space and prune stale logs
+        run: |
+          set -euo pipefail
+
+          echo "Disk usage before cleanup:"
+          df -h /
+
+          # Keep the newest 200 runner diag logs and remove older ones.
+          if [ -d /opt/actions-runner/_diag ]; then
+            mapfile -t OLD_DIAG_LOGS < <(
+              sudo find /opt/actions-runner/_diag -maxdepth 1 -type f -name '*.log' -printf '%T@ %p\n' \
+                | sort -n \
+                | head -n -200 \
+                | awk '{print $2}'
+            )
+            if [ "${#OLD_DIAG_LOGS[@]}" -gt 0 ]; then
+              printf '%s\0' "${OLD_DIAG_LOGS[@]}" | xargs -0r sudo rm -f
+            fi
+          fi
+
+          # Remove old temp trees from prior runs (safe to delete).
+          rm -rf /tmp/pytest-of-* "${RUNNER_TEMP}/pytest-of-"* || true
+          rm -rf /tmp/pip-* /tmp/pip-build-* /tmp/pip-ephem-wheel-cache-* || true
+
+          echo "Disk usage after cleanup:"
+          df -h /
+
+          FREE_GB="$(df -BG / | awk 'NR==2 {gsub(/G/, "", $4); print $4}')"
+          MIN_FREE_GB=25
+          if [ "${FREE_GB}" -lt "${MIN_FREE_GB}" ]; then
+            echo "::error::Only ${FREE_GB}GB free on / after cleanup (need >= ${MIN_FREE_GB}GB). Increase EBS root volume or reduce run size."
+            exit 1
+          fi
+
+      - name: Require validation bucket secret
+        env:
+          BUCKET: ${{ secrets.VALIDATION_S3_BUCKET }}
+        run: |
+          if [ -z "$BUCKET" ]; then
+            echo "::error::Set repository secret VALIDATION_S3_BUCKET (Settings → Secrets and variables → Actions)."
+            exit 1
+          fi
+      - name: Preflight Celery worker availability
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          VALIDATION_CELERY_BROKER_URL: ${{ vars.VALIDATION_CELERY_BROKER_URL }}
+          VALIDATION_CELERY_RESULT_BACKEND: ${{ vars.VALIDATION_CELERY_RESULT_BACKEND }}
+          VALIDATION_CELERY_QUEUE: ${{ vars.VALIDATION_CELERY_QUEUE }}
+          VALIDATION_CELERY_SAFE_MODE: ${{ vars.VALIDATION_CELERY_SAFE_MODE }}
+          VALIDATION_CELERY_CONCURRENCY: ${{ vars.VALIDATION_CELERY_CONCURRENCY }}
+          VALIDATION_CELERY_MEM_PER_CHILD_MIB: ${{ vars.VALIDATION_CELERY_MEM_PER_CHILD_MIB }}
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
+          source /home/ec2-user/miniconda3/etc/profile.d/conda.sh
+          conda activate sai-simulator
+
+          export HDF5_USE_FILE_LOCKING="${HDF5_USE_FILE_LOCKING:-FALSE}"
+
+          SAFE_RAW="${VALIDATION_CELERY_SAFE_MODE:-}"
+          EXPLICIT_RAW="${VALIDATION_CELERY_CONCURRENCY:-}"
+          if echo "${SAFE_RAW}" | grep -qiE '^(1|true|yes)$'; then
+            CONCURRENCY=1
+            echo "VALIDATION_CELERY_SAFE_MODE is set (${SAFE_RAW}): using concurrency=1"
+          elif [ -n "${EXPLICIT_RAW}" ]; then
+            CONCURRENCY="${EXPLICIT_RAW}"
+            echo "Using VALIDATION_CELERY_CONCURRENCY=${CONCURRENCY}"
+          else
+            TOTAL_CORES="$(nproc)"
+            RESERVED_CORES=4
+            if [ "${TOTAL_CORES}" -gt "${RESERVED_CORES}" ]; then
+              CORE_CAP="$((TOTAL_CORES - RESERVED_CORES))"
+            else
+              CORE_CAP=1
+            fi
+            MEM_AVAIL="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+            MEM_AVAIL="${MEM_AVAIL:-0}"
+            PER_CHILD_MIB="${VALIDATION_CELERY_MEM_PER_CHILD_MIB:-12288}"
+            PER_CHILD_KB=$((PER_CHILD_MIB * 1024))
+            if [ "${PER_CHILD_KB}" -lt 1 ]; then
+              PER_CHILD_KB=$((12 * 1024 * 1024))
+            fi
+            MEM_CAP=$((MEM_AVAIL / PER_CHILD_KB))
+            if [ "${MEM_CAP}" -lt 1 ]; then
+              MEM_CAP=1
+            fi
+            CONCURRENCY="${CORE_CAP}"
+            LIMIT_REASON="cpu"
+            if [ "${MEM_CAP}" -lt "${CONCURRENCY}" ]; then
+              CONCURRENCY="${MEM_CAP}"
+              LIMIT_REASON="memory"
+            fi
+            echo "Auto Celery concurrency=${CONCURRENCY} (${LIMIT_REASON}-limited: core_cap=${CORE_CAP}, mem_cap=${MEM_CAP}, MemAvailable=${MEM_AVAIL}kB, ${PER_CHILD_MIB}MiB/child budget)"
+          fi
+          export VALIDATION_CELERY_CONCURRENCY="${CONCURRENCY}"
+          echo "VALIDATION_CELERY_CONCURRENCY=${CONCURRENCY}" >> "${GITHUB_ENV}"
+          echo "HDF5_USE_FILE_LOCKING=${HDF5_USE_FILE_LOCKING}" >> "${GITHUB_ENV}"
+          QUEUE_NAME="${VALIDATION_CELERY_QUEUE:-sai_verification}"
+          echo "Starting Celery worker with concurrency=${CONCURRENCY} queue=${QUEUE_NAME}"
+
+          WORKER_LOG="${RUNNER_TEMP}/validation-celery-worker.log"
+          WORKER_PID_FILE="${RUNNER_TEMP}/validation-celery-worker.pid"
+          nohup celery -A tests.verification.celery_app worker \
+            --loglevel=INFO \
+            --concurrency="${CONCURRENCY}" \
+            -Q "${QUEUE_NAME}" >"${WORKER_LOG}" 2>&1 &
+          echo "$!" > "${WORKER_PID_FILE}"
+          echo "Celery worker PID=$(cat "${WORKER_PID_FILE}") log=${WORKER_LOG}"
+
+          python3 - <<'PY'
+          import sys
+          import time
+          from tests.verification.celery_app import celery_app
+          from tests.verification.celery_tasks import ping_task
+
+          inspect = celery_app.control.inspect(timeout=10)
+          deadline = time.time() + 60
+          last_error = None
+
+          while time.time() < deadline:
+              try:
+                  pings = inspect.ping()
+              except Exception as exc:
+                  last_error = exc
+                  time.sleep(2)
+                  continue
+
+              if pings:
+                  workers = ", ".join(sorted(pings.keys()))
+                  print(f"Celery ping OK. Responding workers: {workers}")
+                  try:
+                      pong = ping_task.delay().get(timeout=30)
+                  except Exception as exc:
+                      print(
+                          "::error::Workers answered inspect.ping but did not execute ping_task "
+                          f"(wrong queue, stale worker, or result-backend mismatch): {exc!r}"
+                      )
+                      sys.exit(1)
+                  if pong != "pong":
+                      print(f"::error::ping_task returned unexpected value: {pong!r}")
+                      sys.exit(1)
+                  print("Celery preflight OK (ping_task executed on worker).")
+                  sys.exit(0)
+
+              time.sleep(2)
+
+          if last_error is not None:
+              print(f"::error::Celery preflight failed to reach broker/worker: {last_error}")
+          else:
+              print("::error::No Celery workers responded within 60 seconds after startup.")
+          sys.exit(1)
+          PY
+
+      - name: Set VALIDATION_S3_PREFIX from latest git tag or config fallback
+        run: |
+          set -euo pipefail
+          TAG=""
+          if [ -d "${GITHUB_WORKSPACE}/.git" ]; then
+            TAG="$(git -C "${GITHUB_WORKSPACE}" for-each-ref --sort=-creatordate --format '%(refname:short)' refs/tags | head -n1)"
+          else
+            echo "No .git directory under ${GITHUB_WORKSPACE}; using VALIDATION_S3_PREFIX_FALLBACK if set."
+          fi
+          if [ -n "$TAG" ]; then
+            echo "VALIDATION_S3_PREFIX=${TAG}" >> "${GITHUB_ENV}"
+            echo "Using VALIDATION_S3_PREFIX=${TAG} (most recently created tag)."
+            exit 0
+          fi
+          FALLBACK="${VALIDATION_S3_PREFIX_FALLBACK:-}"
+          if [ -z "$FALLBACK" ]; then
+            echo "::error::No git tags and VALIDATION_S3_PREFIX_FALLBACK is empty. Set it in .github/validation/self-hosted.env."
+            exit 1
+          fi
+          echo "VALIDATION_S3_PREFIX=${FALLBACK}" >> "${GITHUB_ENV}"
+          echo "Using VALIDATION_S3_PREFIX=${FALLBACK} (VALIDATION_S3_PREFIX_FALLBACK from .github/validation/self-hosted.env; no tags)."
+
+      - name: Canary Celery validation (1 case)
+        env:
+          VALIDATION_DISPATCH_CHUNK: "1"
+          VALIDATION_NO_PROGRESS_TIMEOUT_SECONDS: "600"
+          AWS_REGION: ${{ env.AWS_REGION }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+        run: |
+          set -euo pipefail
+          REPORT_PATH="${RUNNER_TEMP}/validation_canary_report.json"
+          write_fallback_report() {
+            local exit_code="$1"
+            if [ ! -s "${REPORT_PATH}" ]; then
+              cat >"${REPORT_PATH}" <<EOF
+          {"status":"error","step":"canary","exit_code":${exit_code},"message":"Canary validation did not produce a report."}
+          EOF
+            fi
+          }
+          trap 'write_fallback_report "$?"' EXIT
+          source /home/ec2-user/miniconda3/etc/profile.d/conda.sh
+          conda activate sai-simulator
+          echo "Canary: single-case Celery path (600s no-progress timeout, dispatch chunk=1)"
+          python3 -u tests/verification/run_verification_celery.py \
+            --bucket "${VALIDATION_S3_BUCKET}" \
+            --limit 1 \
+            --dispatch-chunk 1 \
+            --heartbeat-seconds 10 \
+            --no-progress-timeout-seconds 600 \
+            --output-json "${REPORT_PATH}"
+
+      - name: Run S3 validation (Celery-dispatched batch)
+        env:
+          VALIDATION_DISPATCH_CHUNK: ${{ vars.VALIDATION_DISPATCH_CHUNK || '80' }}
+          VALIDATION_NO_PROGRESS_TIMEOUT_SECONDS: ${{ vars.VALIDATION_NO_PROGRESS_TIMEOUT_SECONDS || '1800' }}
+          VALIDATION_S3_BUCKET: ${{ secrets.VALIDATION_S3_BUCKET }}
+          VALIDATION_S3_FILETYPE: ${{ vars.VALIDATION_S3_FILETYPE }}
+          VALIDATION_LIMIT: ${{ vars.VALIDATION_LIMIT || '3000' }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+        run: |
+          set -euo pipefail
+          REPORT_PATH="validation_celery_report.json"
+          write_fallback_report() {
+            local exit_code="$1"
+            if [ ! -s "${REPORT_PATH}" ]; then
+              cat >"${REPORT_PATH}" <<EOF
+          {"status":"error","step":"batch","exit_code":${exit_code},"message":"Batch validation did not produce a report."}
+          EOF
+            fi
+          }
+          trap 'write_fallback_report "$?"' EXIT
+          source /home/ec2-user/miniconda3/etc/profile.d/conda.sh
+          conda activate sai-simulator
+          python3 -u tests/verification/run_verification_celery.py \
+            --bucket "${VALIDATION_S3_BUCKET}" \
+            --limit "${VALIDATION_LIMIT}" \
+            --dispatch-chunk "${VALIDATION_DISPATCH_CHUNK}" \
+            --heartbeat-seconds 10 \
+            --no-progress-timeout-seconds "${VALIDATION_NO_PROGRESS_TIMEOUT_SECONDS}" \
+            --output-json "${REPORT_PATH}"
+
+      - name: Stop transient Celery worker
+        if: always()
+        run: |
+          set -euo pipefail
+          WORKER_PID_FILE="${RUNNER_TEMP}/validation-celery-worker.pid"
+          if [ -f "${WORKER_PID_FILE}" ]; then
+            PID="$(cat "${WORKER_PID_FILE}")"
+            if kill -0 "${PID}" 2>/dev/null; then
+              kill "${PID}" || true
+            fi
+          fi
+        
+      - name: Upload validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-celery-report
+          path: |
+              validation_celery_report.json
+              ${{ runner.temp }}/validation_canary_report.json
+          if-no-files-found: ignore
+
+  stop-runner:
+    needs: [start-runner, s3-validation]
+    if: always() && needs.start-runner.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.VALIDATION_AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Stop runner EC2
+        env:
+          INSTANCE_ID: ${{ vars.VALIDATION_RUNNER_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$INSTANCE_ID" ]; then
+            echo "::error::Set repository variable VALIDATION_RUNNER_INSTANCE_ID."
+            exit 1
+          fi
+          aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null

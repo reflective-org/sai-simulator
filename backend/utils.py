@@ -1,3 +1,4 @@
+import uuid
 import numpy as np
 import xarray as xr
 import geopandas as gpd
@@ -5,6 +6,8 @@ from functools import lru_cache
 from scipy.signal import butter, filtfilt
 from pathlib import Path
 from typing import Union
+
+from fair_wrap.fair_utils import SIM_END_YEAR
 
 
 @lru_cache(maxsize=32)  # Caches the last 32 unique calls
@@ -227,13 +230,31 @@ def save_processed_data(
         if data.name:
             encoding[data.name] = comp_args
     
-    # Define a temporary path (atomic write strategy)
-    temp_path = target_path.with_suffix(target_path.suffix + '.tmp')
+    # Unique temp name so concurrent writers (e.g. Celery workers) never clobber
+    # the same ".tmp.nc" while building different copies of the same cache key.
+    temp_path = target_path.with_name(
+        f"{target_path.stem}.{uuid.uuid4().hex}.tmp{target_path.suffix}"
+    )
 
     try:
+        # Clear inherited encodings from source NetCDFs before writing derived outputs.
+        # Stale coordinate encodings (especially on "time") can cause netCDF4 write
+        # failures like "Invalid argument: (variable 'time', group '/')".
+        clean_data = data.copy(deep=False)
+        clean_data.encoding = {}
+
+        if isinstance(clean_data, xr.Dataset):
+            for var_name in clean_data.data_vars:
+                clean_data[var_name].encoding = {}
+            for coord_name in clean_data.coords:
+                clean_data[coord_name].encoding = {}
+        elif isinstance(clean_data, xr.DataArray):
+            for coord_name in clean_data.coords:
+                clean_data[coord_name].encoding = {}
+
         # Write to TEMPORARY file
         # Passing encoding ensures the file is compressed on disk
-        data.to_netcdf(temp_path, encoding=encoding, compute=True)
+        clean_data.to_netcdf(temp_path, encoding=encoding, compute=True)
         
         # Atomic Rename
         temp_path.replace(target_path)
@@ -247,3 +268,17 @@ def save_processed_data(
             except OSError:
                 pass 
         raise
+
+def apply_ramp_up_factor(data, temp_diff, ramp_up):
+      no_sai_indices = temp_diff > 0
+      if ramp_up > 0 and not no_sai_indices.all():
+          sai_mask = ~np.asarray(no_sai_indices, dtype=bool)
+          actual_sai_start_year = int(temp_diff.time.values[sai_mask][0])
+          ramp_up_eff = min(ramp_up, SIM_END_YEAR - actual_sai_start_year)
+          if ramp_up_eff > 0:
+              ramp_up_indices = np.arange(
+                  actual_sai_start_year, actual_sai_start_year + ramp_up_eff
+              )
+              ramp_up_factor = np.linspace(1 / ramp_up_eff, 1, ramp_up_eff)
+              data.loc[dict(time=ramp_up_indices)] *= ramp_up_factor
+      return data

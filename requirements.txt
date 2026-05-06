@@ -16,6 +16,9 @@ botocore==1.41.5
 brotli==1.2.0
 Cartopy==0.25.0
 certifi==2026.1.4
+celery
+# redis-py: Celery 5.x Redis backend imports CredentialProvider (needs redis-py >= ~4.2; pin 5+ for compatibility)
+redis>=5.0.0
 cf-units==3.3.0
 cf_xarray==0.10.10
 cftime==1.6.5
@@ -90,6 +93,7 @@ Pygments==2.19.2
 pyogrio==0.12.1
 pyparsing==3.3.1
 pyproj==3.7.2
+pytest==8.4.2
 pyshp==3.0.3
 python-dateutil==2.9.0.post0
 python-multipart==0.0.21

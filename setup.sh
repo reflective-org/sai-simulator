@@ -1040,8 +1040,12 @@ install_esmf() {
     # Check for required compilers
     print_info "Checking for required compilers..."
     if ! command -v gfortran &> /dev/null; then
-        print_error "gfortran not found. Please install it first:"
-        echo "  brew install gcc"
+        print_error "gfortran not found."
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            echo "  brew install gcc"
+        else
+            echo "  sudo dnf install -y gcc-gfortran gcc gcc-c++"
+        fi
         cd "$ORIGINAL_DIR"
         return 1
     fi
@@ -1055,8 +1059,8 @@ install_esmf() {
         fi
     else
         if ! command -v gcc &> /dev/null || ! command -v g++ &> /dev/null; then
-            print_error "gcc/g++ not found. Please install build-essential:"
-            echo "  apt-get update && apt-get install -y build-essential"
+            print_error "gcc/g++ not found."
+            echo "  sudo {package-manager} install -y gcc gcc-c++ OR install -y build-essentials"
             cd "$ORIGINAL_DIR"
             return 1
         fi
@@ -1104,6 +1108,30 @@ install_esmf() {
     fi
     export ESMF_SHARED_LIB_BUILD=ON
     export ESMF_COMM=mpiuni
+
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        export ESMF_CXX=/usr/bin/clang++
+        export ESMF_C=/usr/bin/clang
+        export ESMF_COMPILER=gfortranclang
+        export ESMF_CXXLINKLIBS="-lc++"
+        export ESMF_F90LINKLIBS="-lc++"
+    else
+        export ESMF_CXX=/usr/bin/g++
+        export ESMF_C=/usr/bin/gcc
+        export ESMF_COMPILER=gfortran
+        unset ESMF_CXXLINKLIBS
+        unset ESMF_F90LINKLIBS
+
+        # Remove macOS-specific linker flags if they leaked into the Linux environment.
+        for flag_var in LDFLAGS CFLAGS CXXFLAGS FFLAGS FCFLAGS CPPFLAGS; do
+            flag_val="${!flag_var}"
+            if [ -n "$flag_val" ]; then
+                flag_val="$(printf '%s' "$flag_val" | sed 's/-Wl,-ld_classic//g; s/-ld_classic//g')"
+                flag_val="$(printf '%s' "$flag_val" | xargs)"
+                export "$flag_var=$flag_val"
+            fi
+        done
+    fi
 
     print_info "Build configuration:"
     echo "  ESMF_DIR: $ESMF_DIR"

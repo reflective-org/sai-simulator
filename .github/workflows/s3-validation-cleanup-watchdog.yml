@@ -1,0 +1,74 @@
+# Stops the validation EC2 when the self-hosted validation workflow finishes, and on a
+# schedule stops the instance if the dispatcher lease tag has expired (covers stuck queues
+# or missed completion hooks).
+#
+# Required: same as dispatcher (VALIDATION_RUNNER_INSTANCE_ID, VALIDATION_AWS_ROLE_ARN).
+
+name: S3 validation cleanup watchdog
+
+on:
+  workflow_run:
+    workflows: ["S3 validation (self-hosted EC2)"]
+    types: [completed]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-west-2' }}
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.VALIDATION_AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Stop instance if validation finished or lease expired
+        env:
+          INSTANCE_ID: ${{ vars.VALIDATION_RUNNER_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$INSTANCE_ID" ]; then
+            echo "::error::Set repository variable VALIDATION_RUNNER_INSTANCE_ID."
+            exit 1
+          fi
+
+          STATE="$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].State.Name' \
+            --output text)"
+
+          if [ "$STATE" = "stopped" ] || [ "$STATE" = "stopping" ]; then
+            echo "Instance already ${STATE}."
+            exit 0
+          fi
+
+          EVENT_NAME="${{ github.event_name }}"
+
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            echo "Self-hosted validation workflow completed; stopping instance."
+            aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null
+            exit 0
+          fi
+
+          LEASE="$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].Tags[?Key=='gh_validation_lease_expires_at'] | [0].Value" \
+            --output text)"
+
+          NOW="$(date -u +%s)"
+          if [ -n "$LEASE" ] && [ "$LEASE" != "None" ] && [ "$NOW" -ge "$LEASE" ]; then
+            echo "Lease expired (${LEASE} <= ${NOW}); stopping instance."
+            aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null
+            exit 0
+          fi
+
+          echo "No stop condition (event=${EVENT_NAME}, lease=${LEASE:-none}); leaving instance as-is."
