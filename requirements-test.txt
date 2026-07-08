@@ -1,3 +1,25 @@
+# Minimum dependencies needed to run pytest under tests/.
+#
+# - numpy / pytest / xarray cover the existing scripts-only tests
+#   (test_data_sanity_checks.py, test_preprocessing_year_sanity.py).
+# - The remaining packages are required to import backend.get_outputs and
+#   its sibling modules (backend.utils, backend.icefrac, fair_wrap.*) so
+#   that test_get_outputs_unit.py can run. Pins match requirements.txt to
+#   keep CI and dev environments aligned.
 numpy==2.3.5
 pytest==8.3.4
 xarray==2025.12.0
+
+# Backend / fair_wrap transitive runtime deps (alpha-sorted)
+Cartopy==0.25.0
+geopandas==1.1.2
+joblib==1.5.3
+matplotlib==3.10.8
+netCDF4==1.7.4
+pandas==2.3.3
+pooch==1.8.2
+rasterio==1.5.0
+scikit-learn==1.8.0
+scipy==1.16.3
+shapely==2.1.2
+tqdm==4.67.1
