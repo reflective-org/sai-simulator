@@ -1,3 +1,11 @@
+"""Download-time sanity checks for the simulator's raw data directory.
+
+Verifies that the locally downloaded data tree matches an expected S3 manifest, contains the
+required ensemble members for each variable, has no duplicate basenames, and that every
+``*.nc`` file is at least header-readable. Designed to be invoked from ``setup.sh`` (or
+manually as ``python scripts/data_sanity_checks.py --data_dir ...``) before any of the
+processing/fitting scripts run, so missing or corrupted files are caught up front.
+"""
 import argparse
 import re
 import subprocess
@@ -291,6 +299,12 @@ def run_download_sanity_checks(
 
 
 def main() -> None:
+    """CLI entry point: parse args, run :func:`run_download_sanity_checks`, exit non-zero on failure.
+
+    On a sanity-check failure (``ValueError`` or ``FileNotFoundError``) the error is rendered
+    in red via :func:`print_cli_error` and the process exits with status ``2`` so callers
+    (e.g. ``setup.sh``) can distinguish "checks failed" from generic Python errors.
+    """
     parser = argparse.ArgumentParser(description="Sanity checks for downloaded raw data files.")
     parser.add_argument("--data_dir", required=True, help="Local raw data directory.")
     parser.add_argument(

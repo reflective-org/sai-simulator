@@ -1,3 +1,16 @@
+"""FaIR setup, calibration, and runner helpers for the SAI simulator.
+
+Builds a :class:`fair_wrap.custom_fair.FAIR` instance pre-loaded with RCMIP emissions,
+the chris-roadmap calibrated parameter ensemble (100 members, sampled with a fixed seed),
+solar / volcanic forcing time series, and optionally a CESM-tuned override of the climate
+configs. The runner is pickled per scenario under ``fair_wrap/f_no_sai/<ssp>.pkl`` so
+repeated dashboard requests for the same SSP reuse the same fully-built FaIR object instead
+of re-downloading and re-allocating.
+
+Module-level constants: ``SIM_START_YEAR`` / ``SIM_END_YEAR`` define the simulation horizon;
+``NUM_MEMBERS`` controls ensemble size; ``FANCY_SSP_TITLES`` and ``REVERSE_FANCY_SSP_TITLES``
+translate between the short FaIR scenario keys and the dashboard's display strings.
+"""
 import pooch
 import numpy as np
 import pandas as pd
@@ -41,7 +54,13 @@ headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 }
 
-def get_df_emis():
+def get_df_emis() -> pd.DataFrame:
+    """Download (and cache) the RCMIP v5.1.0 annual-mean emissions CSV and return it as a DataFrame.
+
+    :mod:`pooch` verifies the MD5 (``md5:4044106f55ca65b094670e7577eaf9b3``) so a corrupted
+    download is refused. A spoofed ``User-Agent`` is passed because Zenodo rejects the
+    default :mod:`urllib` UA.
+    """
     rcmip_emissions_file = pooch.retrieve(
         url="https://zenodo.org/records/4589756/files/rcmip-emissions-annual-means-v5-1-0.csv",
         # original url: "doi:10.5281/zenodo.4589756/rcmip-emissions-annual-means-v5-1-0.csv",
@@ -52,7 +71,13 @@ def get_df_emis():
     return df_emis
 
 
-def get_df_configs(ensemble=True):
+def get_df_configs(ensemble: bool = True) -> pd.DataFrame:
+    """Download (and cache) the FaIR 1.2.0 calibrated-constrained parameter ensemble.
+
+    When ``ensemble=True`` (the default) returns ``NUM_MEMBERS`` rows sampled with a fixed
+    ``random_state=42`` so runs are reproducible. When ``False``, returns a single-row median
+    of the full ensemble for deterministic / debugging runs.
+    """
     fair_params_1_2_0_obj = pooch.retrieve(
         url = 'https://zenodo.org/record/8399112/files/calibrated_constrained_parameters.csv',
         known_hash = 'md5:de3b83432b9d071efdd1427ad31e9076',
@@ -66,15 +91,30 @@ def get_df_configs(ensemble=True):
     return df_configs
 
 
-def get_dataframes():
+def get_dataframes() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """One-stop loader for the four input DataFrames FaIR needs: emissions, configs, solar, and volcanic forcing."""
     df_emis = get_df_emis()
     df_configs = get_df_configs()
     df_solar, df_volcanic = get_aerosols()
     return df_emis, df_configs, df_solar, df_volcanic
 
 
-def set_up_fair(df_emis, df_configs, sim_start_year, sim_end_year, scenario=None):
+def set_up_fair(
+    df_emis: pd.DataFrame,
+    df_configs: pd.DataFrame,
+    sim_start_year: int,
+    sim_end_year: int,
+    scenario: str | None = None,
+) -> FAIR:
+    """Build and populate a :class:`FAIR` instance for the requested scenario.
 
+    Walks the canonical FaIR init sequence (``define_time`` / ``define_scenarios`` /
+    ``define_configs`` / ``define_species`` / ``allocate`` / ``fill_from_rcmip``) using
+    ``species_configs_properties_calibration1.2.0.csv``, and then patches the NOx emissions
+    so the four GFED fire sectors are summed into a single AFOLU/agriculture+FFI series with
+    the standard 46.006/30.006 mass conversion. Returns the populated FaIR instance ready
+    for the caller to apply aerosol and config overrides.
+    """
     ## 1. Create FaIR instance
     f = FAIR(ch4_method="Thornhill2021")
 
@@ -145,7 +185,13 @@ def set_up_fair(df_emis, df_configs, sim_start_year, sim_end_year, scenario=None
     return f
 
 
-def get_aerosols():
+def get_aerosols() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Download (and cache) the solar and volcanic ERF timebound CSVs used to drive FaIR forcing.
+
+    Sources: Chris Smith's :mod:`fair-add-hfc` for solar (``solar_erf_timebounds.csv``) and
+    :mod:`fair-calibrate` for volcanic (``volcanic_erf_timebounds_cmip6.csv``). MD5 hashes
+    are pinned so a substitute upstream artifact is refused.
+    """
     solar_obj = pooch.retrieve(
         url = 'https://raw.githubusercontent.com/chrisroadmap/fair-add-hfc/main/data/solar_erf_timebounds.csv',
         known_hash = 'md5:98f6f4c5309d848fea89803683441acf',
@@ -162,7 +208,24 @@ def get_aerosols():
     return df_solar, df_volcanic
 
 
-def fill_aerosols(f, df_configs, df_solar, df_volcanic, sai_input, sim_start_year, sim_end_year):
+def fill_aerosols(
+    f: FAIR,
+    df_configs: pd.DataFrame,
+    df_solar: pd.DataFrame,
+    df_volcanic: pd.DataFrame,
+    sai_input: np.ndarray | None,
+    sim_start_year: int,
+    sim_end_year: int,
+) -> FAIR:
+    """Fill the ``Volcanic`` and ``Solar`` forcing arrays on ``f``, optionally injecting SAI ERF.
+
+    When ``sai_input`` is provided (an ``(N, 2)`` array of ``[year, AOD]`` rows), the
+    volcanic ERF for the SAI window is replaced with ``-0.28 * AOD`` to represent the
+    aerosol-induced cooling. Solar forcing is loaded from the 1750-2300 timebound table; the
+    forcing-trend shape ramps from 0 → 1 over 1750-2020 to match the CMIP6 calibration. Both
+    series are then sliced to the requested simulation window and broadcast against the
+    per-config scale factors from ``df_configs``.
+    """
     # Aerosol injections
     df_volcanic = df_volcanic.copy()
     if sai_input is not None:
@@ -201,7 +264,25 @@ def fill_aerosols(f, df_configs, df_solar, df_volcanic, sai_input, sim_start_yea
     return f
 
 
-def fill_in_configs(f, df_configs, co2_input=None, scenario=None, calibrate_to="cesm"):
+def fill_in_configs(
+    f: FAIR,
+    df_configs: pd.DataFrame,
+    co2_input: np.ndarray | None = None,
+    scenario: str | None = None,
+    calibrate_to: str = "cesm",
+) -> FAIR:
+    """Apply the climate-config + species-config calibrations and (optionally) override CO2 FFI emissions.
+
+    When ``calibrate_to == "cesm"``, the climate configs (``c1..c3``, ``kappa1..kappa3``,
+    ``epsilon``, ``gamma``, ``sigma_eta``, ``sigma_xi``, ``F_4xCO2``) are replaced with the
+    CESM-tuned values so FaIR's global ``tas`` response matches CESM2-WACCM's. The species
+    configs are filled from ``species_configs_properties_calibration1.2.0.csv`` and the
+    per-config aerosol-direct, aerosol-indirect, ozone, and forcing-scale factors.
+
+    When ``co2_input`` is supplied (an ``(N, 2)`` array of ``[year, Gt CO2]`` rows covering
+    ``[CANVAS_START_YEAR, CANVAS_END_YEAR]``), the CO2 FFI emissions are overridden in that
+    window and CO2 AFOLU is zeroed so the sum still represents total CO2 emissions.
+    """
     if calibrate_to == "cesm":
         df_configs.loc[:, "clim_c1":"clim_c3"] = [4.830712, 6.397801, 71.294445]
         df_configs.loc[:, "clim_kappa1":"clim_kappa3"] = [0.649448, 3.876076, 0.900808]
@@ -343,7 +424,15 @@ def fill_in_configs(f, df_configs, co2_input=None, scenario=None, calibrate_to="
     return f
 
 
-def initialize_run(f, initial_conditions=None):
+def initialize_run(f: FAIR, initial_conditions: dict | None = None) -> FAIR:
+    """Initialize FaIR's concentration / forcing / temperature / emissions buffers in place.
+
+    Without ``initial_conditions``, every state buffer starts at zero except the concentration
+    array, which is seeded from the species' ``baseline_concentration``. When
+    ``initial_conditions`` is supplied (a dict of pre-loaded arrays from a cached FaIR run),
+    each buffer is initialized from that dict and the gas-partitioning state is restored, so
+    the run can pick up from a previously-computed timestep without re-doing the spin-up.
+    """
     ### 8d. Initial conditions
     if initial_conditions is None:
         initialise(f.concentration, f.species_configs["baseline_concentration"])
@@ -362,12 +451,28 @@ def initialize_run(f, initial_conditions=None):
     return f
 
 
-def get_runner(df_emis, df_configs,
-               df_solar, df_volcanic,
-               co2_input, ssp_scenario,
-               initial_conditions=None,
-               calibrate_to="cesm"):
+def get_runner(
+    df_emis: pd.DataFrame,
+    df_configs: pd.DataFrame,
+    df_solar: pd.DataFrame,
+    df_volcanic: pd.DataFrame,
+    co2_input: np.ndarray | None,
+    ssp_scenario: str,
+    initial_conditions: dict | None = None,
+    calibrate_to: str = "cesm",
+) -> FAIR:
+    """High-level builder used by :mod:`backend.baseline`: returns a ready-to-``run`` FaIR instance.
 
+    Caches the post-``set_up_fair`` instance under ``f_no_sai/<ssp>.pkl`` so repeated calls
+    for the same SSP skip the expensive scenario-setup step (which downloads RCMIP, builds
+    all species buffers, and patches NOx). The cached instance is then routed through
+    :func:`fill_aerosols` (with no SAI), :func:`fill_in_configs` (with the CESM calibration
+    by default), and :func:`initialize_run` (with optional restart conditions) before being
+    handed back to the caller.
+
+    Accepts the dashboard's fancy SSP titles (``"SSP2-4.5"`` etc.) and translates them to
+    the FaIR short keys via :data:`REVERSE_FANCY_SSP_TITLES`.
+    """
     ssp_scenario = REVERSE_FANCY_SSP_TITLES[ssp_scenario]
     f_init_path = F_INIT_DIR / f"{ssp_scenario}.pkl"
     if not f_init_path.exists():

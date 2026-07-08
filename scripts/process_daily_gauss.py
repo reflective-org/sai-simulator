@@ -1,3 +1,14 @@
+"""Aggregate raw daily GAUSS CESM output into monthly count fields for exposure variables.
+
+For ``var == "tas"`` this produces three monthly count fields per (member, file pair):
+days above 40 °C (313.15 K), days above 35 °C (308.15 K), and days below 0 °C (273.15 K).
+For ``var == "pr"`` it produces days above 10 mm/day and days above 20 mm/day (with the
+m/s → mm/day conversion baked into the threshold). Each daily file is processed independently
+and the per-month counts are concatenated and saved under ``<data_dir>/<gauss_var>_<suffix>/``
+in CESM-style filenames so the monthly pipeline (:mod:`process_monthly_gauss`) can pick them up.
+
+CLI entry: ``python scripts/process_daily_gauss.py <var> <data_dir> [--ignore_existing]``.
+"""
 import fire
 import xarray as xr
 from tqdm import tqdm
@@ -9,7 +20,25 @@ import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from backend.utils import open_xarray_datasets
 
-def day_to_month(var, data_dir, ignore_existing=False):
+def day_to_month(
+    var: str,
+    data_dir: str | Path,
+    ignore_existing: bool = False,
+) -> None:
+    """Aggregate the raw daily GAUSS files for ``var`` into monthly count fields per scenario / member.
+
+    For each of the five GAUSS scenarios (``daily_historical``, ``daily_baseline``,
+    ``daily_1.5``, ``daily_1.0``, ``daily_0.5``) it globs the matching CESM file stem, groups
+    paths by ensemble member, and for every member runs the variable-specific threshold tasks
+    (e.g. ``days > 40 °C`` for ``tas``, ``days > 10 mm/day`` for ``pr``). Each file's daily
+    array is reduced to monthly counts immediately to keep memory bounded, and the per-task
+    monthly chunks are concatenated across files at the end and saved to
+    ``<data_dir>/<gauss_var>_<suffix>/<stem>.<member>.cam.h0.<gauss_var>_<suffix>.<t1>_<t2>.nc``.
+
+    Already-present output files are skipped unless ``ignore_existing`` is ``True``; missing-data
+    months (global mean = 0) are dropped before aggregation. Raises :class:`ValueError` for any
+    ``var`` other than ``"tas"`` or ``"pr"``.
+    """
     # Start profiling
     overall_start_time = time.time()
 

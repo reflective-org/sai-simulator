@@ -1,3 +1,11 @@
+"""Population grid loading and exposure-aggregation helpers.
+
+Loads the regridded CESM-aligned population array (``Regridded_pop_num.npy``) as either a
+raw NumPy array or an :class:`xr.DataArray` with shifted longitudes, plus the country
+boundaries GeoDataFrame. :func:`get_population_exposure` is the dashboard's entry point for
+turning a variable's per-cell rate (e.g., person-days above 40 °C per person) into total
+exposure in millions, optionally aggregated by country polygon.
+"""
 import numpy as np
 import xarray as xr
 import geopandas as gpd
@@ -6,7 +14,13 @@ from pathlib import Path
 
 
 @lru_cache(maxsize=1)  # Caches the last call
-def get_population_data(data_dir:Path):
+def get_population_data(data_dir: Path) -> np.ndarray:
+    """Load the precomputed regridded population grid (``Regridded_pop_num.npy``) as a NumPy array.
+
+    Cached with ``maxsize=1`` since the file is ~megabytes and reused across many calls in
+    the dashboard pipeline. Returned shape is ``(lon, lat)`` to match the original Dan-supplied
+    pregridded layout.
+    """
     # Went with the pregridded data from Dan instead of our processed data
     processed_population_path = data_dir / "Regridded_pop_num.npy"
     population_np = np.load(processed_population_path)
@@ -15,7 +29,7 @@ def get_population_data(data_dir:Path):
 
 
 @lru_cache(maxsize=1)  # Caches the last call
-def get_population_xr(data_dir:Path):
+def get_population_xr(data_dir: Path) -> xr.DataArray:
     """
     Loads regridded population data and returns it as an xarray.DataArray
     matching the latitude and longitude grid of `ds_4latlon`.
@@ -45,7 +59,24 @@ def get_population_xr(data_dir:Path):
     return population_xr
 
 
-def aggregate_xarray_by_geopandas(xr_data, gdf, fill_value=0):
+def aggregate_xarray_by_geopandas(
+    xr_data: xr.DataArray,
+    gdf: gpd.GeoDataFrame,
+    fill_value: float = 0,
+) -> xr.DataArray:
+    """Replace every grid cell with the sum of all cells inside its containing polygon.
+
+    Used to turn a per-cell exposure raster into a country-level value while keeping the
+    raster's lat/lon shape (so downstream code can still treat the result as a map). Every
+    cell in a given polygon ends up holding the polygon-wide total; cells outside any
+    polygon stay at ``fill_value``.
+
+    Step by step: aligns CRS between ``xr_data`` and ``gdf``, shifts longitudes from
+    ``[0, 360)`` to ``[-180, 180)`` for the geopandas join, rasterizes the polygons by
+    spatially joining grid-cell points back to ``gdf`` rows, and then for each ``time``
+    step replaces the values in each polygon with their nansum before shifting longitudes
+    back to ``[0, 360)``.
+    """
     # Ensure CRS alignment
     if not gdf.crs:
         raise ValueError("GeoDataFrame has no CRS. Define a CRS for the GeoDataFrame.")
@@ -106,15 +137,31 @@ def aggregate_xarray_by_geopandas(xr_data, gdf, fill_value=0):
 
 
 @lru_cache(maxsize=1)  # Caches the last call
-def get_country_boundaries(data_dir):
+def get_country_boundaries(data_dir: Path) -> gpd.GeoDataFrame:
+    """Load the world administrative boundaries GeoJSON used for country-level aggregation.
+
+    Cached with ``maxsize=1`` because the file is large enough that re-parsing on every
+    dashboard request would be wasteful. Source dataset: OpenDataSoft v2.1 world
+    administrative boundaries.
+    """
     # Source: world administrative boundaries from OpenDataSoft v2.1
     country_boundaries = gpd.read_file(data_dir / "world-administrative-boundaries.geojson")
     
     return country_boundaries
 
 
-def get_population_exposure(data_dir, ds, country_level=False):
+def get_population_exposure(
+    data_dir: Path,
+    ds: xr.DataArray,
+    country_level: bool = False,
+) -> xr.DataArray:
+    """Multiply a per-person-per-day rate map by gridded population and scale to millions.
 
+    Converts a variable like "fraction of population-days above 40 °C" into total
+    person-days (in millions). When ``country_level=True``, additionally replaces each
+    cell's value with the sum of all cells inside its containing country polygon via
+    :func:`aggregate_xarray_by_geopandas`, so the resulting map shows country-level totals.
+    """
     population_np = get_population_data(data_dir)
     population_xr = xr.DataArray(population_np, dims=('lon', 'lat'), coords={'lat': ds.lat, 'lon': ds.lon})
     # Shift lon values by 180

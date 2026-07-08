@@ -1,3 +1,13 @@
+"""Generic helpers shared by the SAI simulator backend.
+
+Hosts cached I/O loaders (:func:`get_interpolator`, :func:`open_xarray_datasets`), the
+land/ocean clipping primitives that wrap the IPCC-WGII continental geometries
+(:func:`create_mask`, :func:`clip_to_land`, :func:`clip_to_ocean`), the smoothing and
+regional-aggregation utilities used by the dashboard pipeline (:func:`apply_constraints`,
+:func:`regional_aggregation`), the GeoJSON loader for spatial-aggregation polygons
+(:func:`load_spatial_aggregation_gdfs`), the atomic NetCDF writer
+(:func:`save_processed_data`), and :func:`apply_ramp_up_factor` for SAI onset smoothing.
+"""
 import uuid
 import numpy as np
 import xarray as xr
@@ -12,10 +22,28 @@ from fair_wrap.fair_utils import SIM_END_YEAR
 
 @lru_cache(maxsize=32)  # Caches the last 32 unique calls
 def get_interpolator(interpolator_path: Path) -> xr.Dataset:
+    """Open and fully load an ``interpolator.nc`` file, returning the in-memory Dataset.
+
+    Uses :func:`xr.open_dataset` inside a context manager so the file handle is released
+    immediately after ``.load()``; the result is cached on ``interpolator_path`` so
+    re-opening the same file in another simulation iteration is free.
+    """
     with xr.open_dataset(interpolator_path) as ds:
         return ds.load()  # materialize -> file closed
 
-def create_mask(xarray_dataset, gdf):
+def create_mask(
+    xarray_dataset: xr.DataArray,
+    gdf: gpd.GeoDataFrame,
+) -> xr.DataArray:
+    """Build a boolean mask that is ``True`` for grid cells outside the ``gdf`` polygons.
+
+    Used by :func:`clip_to_land` / :func:`clip_to_ocean` and by the regional aggregation
+    code in :mod:`get_outputs`. The polygons live in a ``[-180, 180)`` longitude frame
+    while the simulator's xarrays use ``[0, 360)``, so the dataset is rotated, clipped via
+    :meth:`xr.Dataset.rio.clip` (``invert=True, drop=False`` to preserve shape), and then
+    rotated back. Returns ``mask.isnull()`` so callers can plug it straight into
+    :meth:`xr.DataArray.where`.
+    """
     # The geometries are -180 to 180 but the xarray dataset is 0 to 360, so convert this
     xarray_dataset = xarray_dataset.copy()
     original_lon = xarray_dataset.lon
@@ -34,7 +62,17 @@ def create_mask(xarray_dataset, gdf):
     return mask.isnull()
 
 
-def regional_aggregation(xarray_dataset, weights, op):
+def regional_aggregation(
+    xarray_dataset: xr.DataArray,
+    weights: xr.DataArray,
+    op: str,
+) -> xr.DataArray:
+    """Apply ``weights`` to ``xarray_dataset`` and reduce over the ``lat``/``lon`` dimensions.
+
+    ``op`` is one of ``"mean"`` (cos-lat-weighted mean), ``"sum"`` (used for exposure /
+    icefrac totals), ``"max"`` / ``"min"`` (mapped to the 1.0 / 0.0 spatial quantile so they
+    still respect the weighting). Anything else raises :class:`ValueError`.
+    """
     xarray_dataset = xarray_dataset.weighted(weights)
     if op == "mean":
         return xarray_dataset.mean(dim=('lat', 'lon'))
@@ -48,8 +86,25 @@ def regional_aggregation(xarray_dataset, weights, op):
         raise ValueError(f"Unknown operation: {op}")
 
 
-def apply_constraints(time_series, smooth_type, filter_width=10, filter_order=3):
+def apply_constraints(
+    time_series: xr.DataArray,
+    smooth_type: str,
+    filter_width: int = 10,
+    filter_order: int = 3,
+) -> xr.DataArray:
+    """Smooth ``time_series`` with a Butterworth low-pass filter under one of three boundary policies.
 
+    ``smooth_type`` selects how the series is extended before filtering:
+
+    * ``"min_norm"`` — pads with the long-term mean (minimum-norm boundary).
+    * ``"min_slope"`` — reflects about the boundary (preserves slope).
+    * ``"min_roughness"`` — reflects + flips vertically (preserves second derivative).
+
+    A Butterworth filter of order ``filter_order`` with normalized cutoff ``0.1`` is then
+    applied via :func:`scipy.signal.filtfilt` (zero-phase), and the ``filter_width``
+    padding is trimmed off before returning the result as an :class:`xr.DataArray` aligned
+    with the input's ``time`` coordinate.
+    """
     if smooth_type == "min_norm":
         # Calculate the long-term mean of the time series
         long_term_mean = np.mean(time_series)
@@ -88,7 +143,7 @@ def apply_constraints(time_series, smooth_type, filter_width=10, filter_order=3)
     return smoothed
 
 
-def clip_to_land(data_dir, regional_map):
+def clip_to_land(data_dir: Path, regional_map: xr.DataArray) -> xr.DataArray:
     """
     Mask regional_map to land areas only (continental regions included in IPCC-WGII definition).
     """
@@ -101,7 +156,7 @@ def clip_to_land(data_dir, regional_map):
     regional_map = regional_map.where(land_mask, np.nan)
     return regional_map
 
-def clip_to_ocean(data_dir, regional_map):
+def clip_to_ocean(data_dir: Path, regional_map: xr.DataArray) -> xr.DataArray:
     """
     Mask regional_map to ocean areas only (everything NOT included in the IPCC-WGII continental regions).
     """
@@ -118,7 +173,15 @@ def clip_to_ocean(data_dir, regional_map):
     return regional_map
 
 
-def load_spatial_aggregation_gdfs(data_dir):
+def load_spatial_aggregation_gdfs(data_dir: Union[str, Path]) -> dict[str, gpd.GeoDataFrame]:
+    """Load every ``*.geojson`` under ``data_dir / "geojsons"`` into a dict keyed by file stem.
+
+    Used by the dashboard to populate the spatial-aggregation dropdowns (continents, regions,
+    countries, …) without hardcoding the available layers. Normalizes the ``Name`` column to
+    lowercase ``name`` so downstream code can rely on a single attribute, and skips
+    individual GeoJSONs that fail to parse (printing a warning) instead of aborting the
+    whole load.
+    """
     data_dir = Path(data_dir)
     geojsons_dir = data_dir / "geojsons"
     
@@ -269,16 +332,28 @@ def save_processed_data(
                 pass 
         raise
 
-def apply_ramp_up_factor(data, temp_diff, ramp_up):
-      no_sai_indices = temp_diff > 0
-      if ramp_up > 0 and not no_sai_indices.all():
-          sai_mask = ~np.asarray(no_sai_indices, dtype=bool)
-          actual_sai_start_year = int(temp_diff.time.values[sai_mask][0])
-          ramp_up_eff = min(ramp_up, SIM_END_YEAR - actual_sai_start_year)
-          if ramp_up_eff > 0:
-              ramp_up_indices = np.arange(
-                  actual_sai_start_year, actual_sai_start_year + ramp_up_eff
-              )
-              ramp_up_factor = np.linspace(1 / ramp_up_eff, 1, ramp_up_eff)
-              data.loc[dict(time=ramp_up_indices)] *= ramp_up_factor
-      return data
+def apply_ramp_up_factor(
+    data: xr.DataArray,
+    temp_diff: xr.DataArray,
+    ramp_up: int,
+) -> xr.DataArray:
+    """Linearly ramp ``data`` from ``1/ramp_up`` up to ``1`` over the first ``ramp_up`` SAI years.
+
+    Identifies the first year where SAI is actually active (``temp_diff <= 0``) and scales
+    ``data`` in-place from ``1/ramp_up_eff`` at that year up to ``1`` over the next
+    ``ramp_up_eff`` years, where ``ramp_up_eff = min(ramp_up, SIM_END_YEAR - start_year)`` so
+    the ramp never exceeds the remaining simulation horizon. ``ramp_up <= 0`` or a temp_diff
+    that is always positive (i.e., SAI is never triggered) is a no-op.
+    """
+    no_sai_indices = temp_diff > 0
+    if ramp_up > 0 and not no_sai_indices.all():
+        sai_mask = ~np.asarray(no_sai_indices, dtype=bool)
+        actual_sai_start_year = int(temp_diff.time.values[sai_mask][0])
+        ramp_up_eff = min(ramp_up, SIM_END_YEAR - actual_sai_start_year)
+        if ramp_up_eff > 0:
+            ramp_up_indices = np.arange(
+                actual_sai_start_year, actual_sai_start_year + ramp_up_eff
+            )
+            ramp_up_factor = np.linspace(1 / ramp_up_eff, 1, ramp_up_eff)
+            data.loc[dict(time=ramp_up_indices)] *= ramp_up_factor
+    return data

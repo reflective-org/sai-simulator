@@ -1,3 +1,13 @@
+"""Download CESM2 Large Ensemble members from the public NCAR S3 bucket as NetCDF.
+
+Opens the appropriate Zarr store at ``s3://ncar-cesm2-lens/atm/{frequency}/...`` with
+anonymous credentials, selects the requested ensemble members (by their 3-digit suffixes),
+and writes one ``.nc`` file per member to ``output_dir``. Used by ``setup.sh`` to seed the
+``tasmin`` / ``tasmax`` raw inputs for the daily-processing pipeline.
+
+CLI entry: ``python scripts/download_CESM_LENS.py --var TREFHTMN --frequency monthly
+--output_dir ... --members 001,002,003 [--overwrite]``.
+"""
 import xarray as xr
 import sys
 import time

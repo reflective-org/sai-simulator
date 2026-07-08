@@ -1,3 +1,12 @@
+"""Preprocessing-time sanity checks shared between the daily/monthly processing scripts.
+
+Builds plausibility bounds from historical minima and the SSP2-4.5 baseline maxima and
+asserts that derived variables stay within them; checks for NaNs and out-of-range exposure
+or icefrac values; validates that yearly time series are continuous (with a configurable
+maximum gap for the historical→SSP245 seam). All checks raise :class:`SanityCheckError`
+(a :class:`ValueError` subclass) so callers can distinguish data-quality failures from
+generic errors.
+"""
 import numpy as np
 import xarray as xr
 

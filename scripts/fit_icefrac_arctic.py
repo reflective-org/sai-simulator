@@ -1,3 +1,15 @@
+"""Fit per-grid-cell logistic regressions mapping Arctic ``tas`` anomaly to ``icefrac``.
+
+Stitches together baseline + GAUSS SAI experiments, loads the matching Arctic temperature
+and ice-fraction fields, filters out grid cells with too little signal or too few valid
+observations, then drives :class:`backend.sigmoid.LogisticFitter` to fit a four-parameter
+decreasing logistic for every cell in the Arctic. The resulting ``(features, lon_band, lat_band,
+lat, lon)`` parameter array is expanded back to the global grid (non-Arctic = NaN) and saved
+as ``output_dir/<var>_arctic/interpolator.nc`` — this is the ``logistic_params`` file consumed
+by :func:`backend.icefrac.predict_icefrac`.
+
+CLI entry: ``python scripts/fit_icefrac_arctic.py <var> <data_dir> <output_dir> [--ignore_existing]``.
+"""
 import fire
 import numpy as np
 import xarray as xr

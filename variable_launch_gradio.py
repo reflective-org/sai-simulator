@@ -1,7 +1,22 @@
+"""Gradio dashboard entry point for the custom-injection SAI explorer.
+
+Variant of :mod:`launch_gradio` where the user provides a per-latitude × per-decade SO2
+injection grid (7 lat bands × 7 decades) instead of choosing a temperature target. The grid
+is expanded to a yearly ``(7, 66)`` array, the analytic ``temp_target`` / ``start_year`` /
+``ramp_up`` knobs are bypassed by passing ``None``, and the resulting maps / time series /
+PDFs are rendered for ``tas`` / ``p-e`` / ``icefrac`` only (the smaller variable list keeps
+the custom-injection panel responsive).
+"""
 from launch_gradio import *
 
 
-def process_so2_data(paths):
+def process_so2_data(paths: list[Path]) -> xr.DataArray:
+    """Load and ensemble-average the three GAUSS SO2 injection text files into a (lat, time) DataArray.
+
+    Duplicate of :func:`scripts.fit_delta.process_so2_data` kept here so the custom-injection
+    Gradio app can run without importing from ``scripts``. Each file's four latitude columns
+    (``30S/15S/15N/30N``) are sliced to 2035-2070 and averaged across members.
+    """
     latitudes = ["30S(Tg)", "15S(Tg)", "15N(Tg)", "30N(Tg)"]
     data = [pd.read_csv(path, sep=r"\s+").set_index("Timestamp")[latitudes].loc["2035":"2070"] for path in paths]
     # Slice each between 2035 and 2070
@@ -19,7 +34,13 @@ def process_so2_data(paths):
     return data
 
 
-def generate_gradio_plots(ssp_scenario, spatial_agg, spatial_item, decade_visualization, *variable_injection_amounts):
+def generate_gradio_plots(
+    ssp_scenario: str,
+    spatial_agg: str,
+    spatial_item: str | None,
+    decade_visualization: str,
+    *variable_injection_amounts: float,
+) -> tuple:
     """
     Create plots for gradio.
     """

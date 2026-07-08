@@ -1,18 +1,48 @@
+"""Custom-injection path: convolve SO2-by-latitude injection profiles into regional deltas.
+
+Implements the impulse-response chain used when the dashboard runs with a user-supplied
+SO2 injection array instead of an analytic ``temp_target`` / ``ramp_up`` setting. The chain
+is: SO2 injection → AOD (first-order differential with γ-dependent decay), AOD → climate
+response (semi-infinite diffusion), and finally pattern-scaled to a per-latitude climate
+pattern. Vectorized variants of the inner loops live alongside the reference implementations.
+"""
 import scipy.io
 import numpy as np
 import xarray as xr
+from pathlib import Path
 from scipy.special import erfc
 
 from .constants import *
 
 
-def impulse_firstOdiff_wGammaInj(beta, alpha, gamma, q, t):
+def impulse_firstOdiff_wGammaInj(
+    beta: float,
+    alpha: float,
+    gamma: float,
+    q: float,
+    t: float,
+) -> float:
+    """Evaluate the first-order AOD impulse response ``beta * exp(-(alpha + gamma * q) * t)``.
+
+    Models the per-month AOD response to one Tg of SO2 at lag ``t``; the ``gamma * q`` term
+    introduces a quenching effect where larger injection amounts (``q``) decay faster.
+    """
     # Impulse response for AOD
     ydata = beta*np.exp(-(alpha+gamma*q)*t)
     return ydata
 
 
-def AOD_from_injection(param_AOD, injection):
+def AOD_from_injection(
+    param_AOD: np.ndarray,
+    injection: np.ndarray,
+) -> np.ndarray:
+    """Reference (loop-based) convolution: turn a single-latitude monthly SO2 series into AOD.
+
+    Wraps the impulse-response :func:`impulse_firstOdiff_wGammaInj` in the standard
+    monthly-Volterra double loop ``sum_j h(j+1, q=inj[k-j]) * inj[k-j]``. Kept as the
+    canonical reference for the much faster :func:`AOD_from_injection_vectorized`; the all-zero
+    injection case short-circuits to a zero array.
+    """
     # Calculates AOD from SO2 injection at one latitude
     # param_AOD_all: AOD parameters, for all injection latitudes
     # injection: single latitude injection timeseries (monthly)
@@ -33,7 +63,10 @@ def AOD_from_injection(param_AOD, injection):
     return AOD_emulated
 
 
-def AOD_from_injection_vectorized(param_AOD, injection):
+def AOD_from_injection_vectorized(
+    param_AOD: np.ndarray,
+    injection: np.ndarray,
+) -> np.ndarray:
     """
     Vectorized version of the AOD_from_injection routine.
     
@@ -96,7 +129,15 @@ def AOD_from_injection_vectorized(param_AOD, injection):
     return AOD_emulated
 
 
-def impulse_semiInfDiff(t, impulse_p):
+def impulse_semiInfDiff(t: float, impulse_p: dict[str, float]) -> float:
+    """Semi-infinite-diffusion climate impulse response at lag ``t`` for parameters ``{tau, mu}``.
+
+    Closed form: ``h(t) = mu * (1/sqrt(pi * t/tau) - exp(t/tau) * erfc(sqrt(t/tau)))``.
+    Substitutes ``np.finfo(float).tiny`` for ``t == 0`` to avoid the singularity at the
+    origin, and falls back to an asymptotic-equivalent expression whenever
+    ``exp(t/tau) * erfc(...)`` overflows to inf/nan (large ``t/tau``) so the response stays
+    numerically meaningful in long-horizon convolutions.
+    """
     # Impulse response for climate
     if t == 0:
         t = np.finfo(float).tiny
@@ -108,7 +149,16 @@ def impulse_semiInfDiff(t, impulse_p):
     return h
 
 
-def response_from_1_forcing(params, forcing):
+def response_from_1_forcing(
+    params: np.ndarray | list[float] | tuple[float, float],
+    forcing: np.ndarray,
+) -> np.ndarray:
+    """Reference (loop-based) convolution of a forcing series with the climate impulse response.
+
+    Wraps :func:`impulse_semiInfDiff` in the standard ``sum_j h(j+1) * forcing[k-j]`` double
+    loop. Kept as the canonical reference for :func:`response_from_1_forcing_vectorized`.
+    ``params`` is ``[tau, mu]`` and corresponds to ``impulse_p_SAI = {tau, mu}``.
+    """
     # Emulated response for climate from a single forcing
     impulse_p_SAI = {'tau': params[0], 'mu': params[1]}
     emulated_response = np.zeros(len(forcing))
@@ -120,7 +170,10 @@ def response_from_1_forcing(params, forcing):
     return emulated_response
 
 
-def response_from_1_forcing_vectorized(params, forcing):
+def response_from_1_forcing_vectorized(
+    params: np.ndarray | list[float] | tuple[float, float],
+    forcing: np.ndarray,
+) -> np.ndarray:
     """
     Vectorized version of 'response_from_1_forcing' with 'impulse_semiInfDiff'.
     Parameters
@@ -206,14 +259,30 @@ def response_from_1_forcing_vectorized(params, forcing):
     return emulated_response
 
 
-def pattern_scale(mean_response, pattern_to_scale):
-    # Scale pattern_to_scale by mean_response
+def pattern_scale(mean_response: np.ndarray, pattern_to_scale: np.ndarray) -> np.ndarray:
+    """Outer-product a ``(lon, lat)`` pattern by a per-time mean response to get ``(lon, lat, time)``.
+
+    Adds a trailing axis to ``pattern_to_scale``, reshapes ``mean_response`` to broadcast
+    across ``(1, 1, time)``, and multiplies. Used to give the impulse-response convolution
+    a spatial footprint matching the per-latitude climate-pattern field.
+    """
     pattern_to_scale = pattern_to_scale[:,:,np.newaxis]
     pattern = pattern_to_scale * mean_response.reshape(1, 1, -1)
     return pattern
 
 
-def pattern_from_1_injection(injection, param_AOD, param_climate, pattern_to_scale):
+def pattern_from_1_injection(
+    injection: np.ndarray,
+    param_AOD: np.ndarray,
+    param_climate: np.ndarray,
+    pattern_to_scale: np.ndarray,
+) -> np.ndarray:
+    """Run the full injection → AOD → climate-response → spatial-pattern pipeline for one latitude.
+
+    Composes :func:`AOD_from_injection_vectorized` → :func:`response_from_1_forcing_vectorized`
+    → :func:`pattern_scale`. The result is the per-latitude contribution to the regional
+    delta; :func:`pattern_from_all_injections` sums these across latitudes.
+    """
     # Emulate response pattern from 1 latitude of SAI injection
     # injection: single latitude injection timeseries (monthly)
     # param_AOD: inj->AOD parameters
@@ -231,7 +300,19 @@ def pattern_from_1_injection(injection, param_AOD, param_climate, pattern_to_sca
     return response_pattern
 
 
-def pattern_from_all_injections(all_injection, all_param_AOD, all_param_climate, all_pattern_to_scale):
+def pattern_from_all_injections(
+    all_injection: np.ndarray,
+    all_param_AOD: np.ndarray,
+    all_param_climate: np.ndarray,
+    all_pattern_to_scale: np.ndarray,
+) -> np.ndarray:
+    """Sum :func:`pattern_from_1_injection` across all injection latitudes.
+
+    Iterates the columns of ``all_injection`` (one per injection latitude) and accumulates
+    each :func:`pattern_from_1_injection` result into a ``(lon, lat, time)`` array. Skips
+    latitudes whose injection time series is identically zero so an unused-latitude column
+    costs nothing.
+    """
     # Emulate response pattern from all latitudes of SAI injection
     # all_injection: all injection timeseries (monthly), formatted as a matrix
     # all_param_AOD: AOD parameters, for all injection latitudes
@@ -262,7 +343,18 @@ def pattern_from_all_injections(all_injection, all_param_AOD, all_param_climate,
     return total_pattern
 
 
-def pattern_from_all_injections_and_CO2(all_injection_and_CO2, all_param_AOD, all_param_climate, all_pattern_to_scale):
+def pattern_from_all_injections_and_CO2(
+    all_injection_and_CO2: np.ndarray,
+    all_param_AOD: np.ndarray,
+    all_param_climate: np.ndarray,
+    all_pattern_to_scale: np.ndarray,
+) -> np.ndarray:
+    """Same as :func:`pattern_from_all_injections` but adds CO2 as an extra last "latitude" column.
+
+    The trailing column of ``all_injection_and_CO2`` is a CO2 forcing series (which does
+    not go through the AOD step); it is convolved with its own ``param_climate`` row and
+    pattern-scaled separately, then added to the SAI-only total.
+    """
     # Emulate response pattern from all latitudes of SAI injection and CO2
     # all_injection_and_CO2: all injection timeseries and CO2 forcing (monthly), forcing as last column
     # all_param_AOD: AOD parameters, for all injection latitudes
@@ -281,7 +373,26 @@ def pattern_from_all_injections_and_CO2(all_injection_and_CO2, all_param_AOD, al
     return total_pattern
 
 
-def get_variable_regional_delta(var, data_dir, cache_dir, variable_injection):
+def get_variable_regional_delta(
+    var: str,
+    data_dir: Path,
+    cache_dir: Path,
+    variable_injection: np.ndarray,
+) -> xr.DataArray:
+    """Compute the SAI ``regional_delta`` for ``var`` from a user-supplied SO2 injection array.
+
+    Expands the (7-latitude × 65-year) annual injection into a monthly series by repeating
+    each year 12× and dividing by 12 (per-month Tg). Runs the full convolution chain via
+    :func:`pattern_from_all_injections_and_CO2` against the relevant ``param_*_all`` /
+    ``pattern_*_all`` matrices from ``CESM_params.mat`` (``tas``, ``pr``, or ``e``), assumes
+    zero CO2 forcing, and reshapes monthly → yearly by averaging over 12-month windows.
+    The output is wrapped as a ``(time, lat, lon)`` :class:`xr.DataArray` covering 2035-2100.
+
+    Raises :class:`ValueError` for any ``var`` other than ``"tas"``, ``"pr"``, or ``"e"`` —
+    other variables either are not supported by the variable-injection path or are derived
+    upstream from these three (e.g., ``"p-e"`` is computed by :mod:`get_outputs` from
+    ``"pr"`` and ``"e"`` separately).
+    """
     # Assumes variable injection is the amount of Tg per latitude per year, of shape (7, 65)
     # Repeat the variable injection to an amount per month so it becomes (7, 65*12)
     # And spread it over each year by dividing by 12

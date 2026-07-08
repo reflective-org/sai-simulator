@@ -1,3 +1,10 @@
+"""Unit tests for :mod:`scripts.preprocessing_sanity`.
+
+Exercises the per-experiment year-count tables, the NaN / non-negative / variable-specific
+range checks, the monthly-cell-bound builder + validator (including the SAI-vs-historical
+asymmetry where SAI runs may legitimately escape the historical-baseline envelope), and the
+strict / max-gap year-continuity validators.
+"""
 import pytest
 import xarray as xr
 import numpy as np
@@ -105,6 +112,7 @@ def test_validate_no_negative_values_ignores_non_required_var() -> None:
 
 
 def _make_monthly_da(value: float, name: str = "tas") -> xr.DataArray:
+    """Build a tiny ``(time=2, lat=1, lon=1)`` DataArray filled with ``value`` for bounds-check fixtures."""
     return xr.DataArray(
         np.full((2, 1, 1), value, dtype=float),
         dims=["time", "lat", "lon"],

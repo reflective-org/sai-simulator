@@ -141,6 +141,8 @@ def compare_geotiff_files(
 
 @dataclass
 class VerificationConfig:
+    """Inputs needed to run one verification pass: local data/model/cache dirs, S3 reference location, and comparison knobs."""
+
     data_dir: Path
     model_dir: Path
     cache_dir: Path
@@ -166,6 +168,8 @@ class VerificationConfig:
 
 @dataclass
 class GeotiffComparisonResult:
+    """One ``(variable, suffix)`` row: where the reference lived in S3, where the candidate is locally, and the relative-error stats from :func:`compare_geotiff_files`."""
+
     variable: str
     suffix: str
     s3_key: str
@@ -175,6 +179,8 @@ class GeotiffComparisonResult:
 
 @dataclass
 class CaseVerificationResult:
+    """Aggregate result for one verification case: input ``case`` dict, per-GeoTIFF comparisons, and any string errors collected along the way."""
+
     case: dict[str, Any]
     comparisons: list[GeotiffComparisonResult] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)

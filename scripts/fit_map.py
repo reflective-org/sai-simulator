@@ -1,3 +1,14 @@
+"""Fit the FaIR-global-temperature → ScenarioMIP-regional-variable linear emulators.
+
+For each ``(model, bootstrap)`` pair, this script trains a single-feature
+:class:`sklearn.linear_model.LinearRegression` that takes FaIR global ``tas`` as input and
+emits a flattened ``(lat × lon)`` regional ``var`` field. The set of bootstrap replicates is
+saved as ``output_dir/<var>/fair_to_smip_<model>_<i>.joblib`` — these are the per-emulator
+files concatenated by :func:`backend.baseline.get_regional_models` at request time.
+
+CLI entry: ``python scripts/fit_map.py <var> <data_dir> <output_dir>
+[--num_bootstrap_replicates 100] [--ignore_existing]``.
+"""
 import fire
 import numpy as np
 import xarray as xr
@@ -8,7 +19,28 @@ from collections import defaultdict
 from sklearn.linear_model import LinearRegression
 
 
-def fit_map(var, data_dir, output_dir, num_bootstrap_replicates=100, ignore_existing=False):
+def fit_map(
+    var: str,
+    data_dir: str | Path,
+    output_dir: str | Path,
+    num_bootstrap_replicates: int = 100,
+    ignore_existing: bool = False,
+) -> None:
+    """Train bootstrapped FaIR-to-regional-``var`` linear emulators and dump each one to disk.
+
+    Aligns ``input_fair.nc`` (FaIR global ``tas`` per SSP) with ``<data_dir>/<var>/output_gauss-baseline.nc``
+    (ScenarioMIP regional ``var``) on their overlapping time range and the intersection of
+    their SSP sets, then for every regional model and every bootstrap index trains a
+    :class:`LinearRegression` on a resampled (with-replacement) stack of all SSPs.
+
+    Bootstrap files already present are skipped unless ``ignore_existing`` is ``True``. The
+    fitted regressors are persisted as ``output_dir/<var>/fair_to_smip_<model>_<i>.joblib``;
+    SSP slices that contain any NaN in ``var`` are dropped from that bootstrap rather than
+    poisoning the fit.
+
+    Raises :class:`ValueError` if ``<data_dir>/<var>/output_gauss-baseline.nc`` is missing —
+    in that case ``process_monthly_gauss.py`` needs to run first.
+    """
     data_dir = Path(data_dir)
     input_fair_path = data_dir / "input_fair.nc"
     data_dir = data_dir / var

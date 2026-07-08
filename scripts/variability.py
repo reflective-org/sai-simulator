@@ -1,3 +1,19 @@
+"""Compute and persist model internal-variability fields for the dashboard error bands.
+
+For the icefrac variable this script hindcasts the fitted logistic emulator over the same
+periods as the training data, subtracts the simulated truth, and saves two outputs:
+
+* ``grid_level_model_internal_variability.nc`` — per-cell residual standard deviation
+  (used to size the per-cell t-test in :mod:`backend.p_values`).
+* ``model_internal_variability.npy`` — a single global-extent residual standard deviation
+  (used for the dashboard's mean-over-time error band).
+
+It also exposes :func:`process_geojson_variability`, which assigns each region polygon a
+``variability_<var>`` column so the dashboard can show region-specific error bands without
+recomputing the t-test at request time.
+
+CLI entry: ``python scripts/variability.py <var_name> <data_dir> <model_dir>``.
+"""
 import fire
 import xarray as xr
 import numpy as np

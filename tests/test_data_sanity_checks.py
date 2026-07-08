@@ -1,3 +1,10 @@
+"""Unit tests for :mod:`scripts.data_sanity_checks`.
+
+Covers the pure helpers (S3 URI parsing, expected-filename builders, duplicate detection)
+plus end-to-end ``run_download_sanity_checks`` paths exercised against ``tmp_path`` trees.
+The corrupted-NetCDF path is tested with a stubbed validator so the suite stays fast and
+doesn't need real CESM files.
+"""
 from pathlib import Path
 
 import pytest

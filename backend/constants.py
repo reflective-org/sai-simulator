@@ -1,3 +1,10 @@
+"""Shared constants and lookup tables for the SAI simulator backend.
+
+Defines the regional model name list, grid dimensions, SAI start-year floor, dashboard
+temperature-target range, the per-variable ``VAR2INFO`` display table (title, units, colormap,
+SO2-overlay color), and the ``exposurevar2var`` mapping from exposure-variable names to their
+underlying daily climate variables.
+"""
 from matplotlib.colors import LinearSegmentedColormap
 import matplotlib.pyplot as plt
 

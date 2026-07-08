@@ -1,3 +1,19 @@
+"""Top-level SAI dashboard pipeline: :func:`get_outputs` plus its per-step helpers.
+
+Orchestrates the full per-request workflow used by the simulator front-end. For each variable
+in the request, the pipeline loads the no-SAI regional projection, computes the SAI ``delta``,
+runs grid-level t-tests, aggregates spatial means / smoothed time series / PDF histograms,
+optionally writes GeoTIFFs, PNG/SVG plots, and NetCDF exports, and finally tacks on the
+aggregate SO2 injection time series. Most of the public surface is intentionally narrow —
+:func:`get_outputs` is the entry point, with the per-output writers (:func:`create_geotiff_files`,
+:func:`create_vectorized_files`, :func:`generate_sai_netcdf`) callable directly when needed.
+
+Private helpers (``_load_variable_fields``, ``_compute_regional_delta``,
+``_compute_sai_p_values``, ``_compute_mean_over_time``, ``_compute_distribution``,
+``_compute_internal_variability``) decompose :func:`get_outputs` into per-stage units; their
+typed ``_VariableFields`` / ``_DeltaResult`` / ``_MeanOverTimeResult`` dataclasses are the
+glue between stages and intentionally not part of the public API.
+"""
 import rasterio
 import numpy as np
 import pandas as pd

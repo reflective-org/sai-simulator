@@ -1,5 +1,14 @@
+"""Grid-level significance testing between no-SAI and with-SAI fields.
+
+Provides a vectorized two-sided t-test (:func:`compute_ttest`) plus a higher-level wrapper
+(:func:`get_grid_level_p_values`) that loads the per-variable internal-variability map, runs
+the test for each decade in 2041-2100, and concatenates the result into a single time-coded
+DataArray. Ocean/land clipping is applied so the returned p-values cover only the regions
+where the variable is defined.
+"""
 import numpy as np
 import xarray as xr
+from pathlib import Path
 from scipy.stats import t
 
 from .constants import *
@@ -7,7 +16,12 @@ from .utils import clip_to_land, clip_to_ocean
 from .population import get_population_xr
 
 
-def compute_ttest(mean1, mean2, std, n):
+def compute_ttest(
+    mean1: np.ndarray,
+    mean2: np.ndarray,
+    std: np.ndarray,
+    n: int,
+) -> np.ndarray:
     """
     Perform per-cell two-sided t-tests on the given data.
     Parameters:
@@ -43,8 +57,24 @@ def compute_ttest(mean1, mean2, std, n):
     return p_values
 
 
-def get_grid_level_p_values(var, data_dir, reference, comparison):
-    
+def get_grid_level_p_values(
+    var: str,
+    data_dir: Path,
+    reference: xr.DataArray,
+    comparison: xr.DataArray,
+) -> xr.DataArray:
+    """Compute decadal grid-level p-values comparing ``comparison`` against the ``reference`` baseline.
+
+    Loads the precomputed grid-level internal-variability map for ``var`` (scaling by population
+    when ``var`` is an exposure variable). For each decade in 2041-2100 it averages
+    ``comparison`` over that decade and runs :func:`compute_ttest` against ``reference``,
+    using ``n = (2039 - 2025 + 1) * 3`` (3 ensemble members × 15 years) as the sample count.
+    The per-decade DataArrays are stamped with the decade end-year and concatenated into a
+    single ``time``-indexed result.
+
+    Ocean clipping is applied for ``icefrac`` (with latitudes < 60° N additionally masked to
+    ``NaN``); land clipping is applied for all other variables.
+    """
     # Compute two-sided t-test p-values between reference and comparison
     is_exposure = "exposure" in var
     if is_exposure:

@@ -1,3 +1,12 @@
+"""Gradio dashboard entry point for the analytic-target SAI scenario explorer.
+
+Wires the temperature-target / SSP / ramp-up / start-year / region controls to
+:func:`backend.get_outputs.get_outputs`, then builds the per-variable regional ImageSlider
+plots, mean-over-time line plots, and PDF histograms for the dashboard. CLI flags
+(``--port``, ``--share``, ``--use_robinson_projection``, ``--use_local_cache``,
+``--data_dir``, ``--model_dir``, ``--cache_dir``) are parsed in :func:`get_args` and
+materialized into the module-level globals in :func:`get_params`.
+"""
 import io
 import argparse
 import numpy as np
@@ -15,7 +24,8 @@ from backend.constants import *
 from backend.get_outputs import get_outputs
 
 
-def fig_to_image(fig):
+def fig_to_image(fig: "plt.Figure") -> Image.Image:
+    """Rasterize a Matplotlib figure to a copied PIL :class:`Image.Image` (no live buffer reference)."""
     buf = io.BytesIO()
     fig.savefig(buf, format='png')
     buf.seek(0)
@@ -24,7 +34,13 @@ def fig_to_image(fig):
     return img
 
 
-def get_vmin_vmax(var, var_is_rebased, delta):
+def get_vmin_vmax(var: str, var_is_rebased: bool, delta: bool) -> tuple[float, float]:
+    """Return the per-variable ``(vmin, vmax)`` color limits for the dashboard regional maps.
+
+    Rebased or delta maps always use the symmetric ``[-5, 5]`` range; absolute maps fall
+    back to a hand-tuned per-variable table (e.g. ``tas`` → ``(270, 300)``, ``icefrac`` →
+    ``(0, 1)``) so each panel keeps its colorbar stable across scenario changes.
+    """
     if var_is_rebased or delta:
         return -5, 5
 
@@ -50,8 +66,15 @@ def get_vmin_vmax(var, var_is_rebased, delta):
     return var2scale[var]
 
 
-def generate_gradio_plots(ssp_scenario, temp_target, spatial_agg, spatial_item,
-                          decade_visualization, start_year, ramp_up):
+def generate_gradio_plots(
+    ssp_scenario: str,
+    temp_target: float,
+    spatial_agg: str,
+    spatial_item: str | None,
+    decade_visualization: str,
+    start_year: int,
+    ramp_up: int,
+) -> tuple:
     """
     Create plots for gradio.
     """
@@ -383,11 +406,13 @@ def generate_gradio_plots(ssp_scenario, temp_target, spatial_agg, spatial_item,
     return tuple(outputs)
 
 
-def update_items_dropdown(spatial_agg_group):
+def update_items_dropdown(spatial_agg_group: str) -> gr.Dropdown:
+    """Refresh the per-region dropdown when the user picks a different spatial-aggregation group."""
     return gr.Dropdown(value=None, choices=SPATIALAGG_ITEMS.get(spatial_agg_group, []))
 
 
-def update_rampup_dropdown(start_year, ramp_up):
+def update_rampup_dropdown(start_year: int, ramp_up: int) -> gr.Slider:
+    """Re-bound the ramp-up slider so its max never exceeds the remaining years to ``SIM_END_YEAR``."""
     if ramp_up > SIM_END_YEAR - start_year:
         value = SIM_END_YEAR - start_year
     else:
@@ -395,7 +420,8 @@ def update_rampup_dropdown(start_year, ramp_up):
     return gr.Slider(value=value, minimum=0, maximum=SIM_END_YEAR - start_year, step=1, label="Ramp up (years)")
 
 
-def update_decade_dropdown(start_year, decade):
+def update_decade_dropdown(start_year: int, decade: str) -> gr.Dropdown:
+    """Drop decade options that start before ``start_year`` and reselect the first remaining one if needed."""
     # Remove decade options that are not possible given the start year
     decades = DECADES.copy()
     start_year = start_year
@@ -409,7 +435,8 @@ def update_decade_dropdown(start_year, decade):
     return gr.Dropdown(value=decade, choices=decades, label="Select decade to visualize")
 
 
-def get_args():
+def get_args() -> argparse.Namespace:
+    """Parse the dashboard CLI flags (port, share, projection, cache mode, data/model/cache dirs)."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--share", action="store_true")
@@ -421,7 +448,14 @@ def get_args():
     return parser.parse_args()
 
 
-def get_params():
+def get_params() -> dict:
+    """Materialize the dashboard's module-level constants (paths, figure sizes, GeoJSON cache) from CLI args.
+
+    Also loads every ``*.geojson`` under ``<data_dir>/geojsons/`` into ``SPATIALAGG2GDF``,
+    normalizes the polygon ``Name`` column to ``name``, and builds the ``SPATIALAGG_ITEMS``
+    lookup keyed by aggregation-group name so the dropdowns can populate without re-reading
+    the GeoJSONs.
+    """
     args = get_args()
     if args.use_local_cache:
         CACHE_DIR = Path(__file__).parent / "data/cache"

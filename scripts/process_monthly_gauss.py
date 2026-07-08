@@ -1,3 +1,17 @@
+"""Convert raw monthly CESM/GAUSS NetCDF files into the simulator's processed inputs.
+
+Walks the input ``data_dir``, parses each filename into ``(member, experiment)`` via
+:func:`identify_file`, applies variable-specific preprocessing (unit conversion, ICEFRAC
+Sept-only masking, PRECC+PRECL → PRECT pre-step, etc.), bilinearly regrids to the
+1.25°×0.9375° CESM2-WACCM target grid, runs the preprocessing sanity checks from
+:mod:`preprocessing_sanity`, and aggregates monthly data to yearly using the right method
+per variable (sum for cumulative exposure variables, min/max for tasmin/tasmax,
+1850-1900-rebased mean otherwise). The final per-experiment, per-member yearly Datasets are
+merged into the canonical ``output_gauss-*.nc`` files and the model internal variability
+(both global and grid-level) is computed and saved.
+
+CLI entry: ``python scripts/process_monthly_gauss.py <var> <data_dir> <output_dir> [--overwrite]``.
+"""
 import fire
 import numpy as np
 import xesmf as xe
@@ -75,6 +89,11 @@ var2esm_var = {
 
 
 def _dataarray_to_single_var_dataset(da: xr.DataArray, name: str) -> xr.Dataset:
+    """Wrap a DataArray as a single-variable Dataset, renaming to ``name`` if needed.
+
+    Used at the boundary between :mod:`xarray` operations that strip variable names (e.g.
+    arithmetic) and downstream code that addresses the variable by name.
+    """
     if da.name != name:
         da = da.rename(name)
     return da.to_dataset()
@@ -90,10 +109,15 @@ def _ensure_regridded_ensemble_dataset(
 
 
 # Helper to check if a variable is cumulative (like "days above 30C")
-def is_cumulative(var_name):
+def is_cumulative(var_name: str) -> bool:
+    """Return ``True`` for cumulative exposure variables (``*_above_*`` / ``*_below_*``).
+
+    These are summed across the year in :func:`get_yearly_aggregate`; everything else
+    falls through to the mean/min/max rules.
+    """
     return "above" in var_name or "below" in var_name
 
-def identify_file(filename):
+def identify_file(filename: str) -> tuple[str | None, str | None]:
     """Parses a filename to find member ID and experiment type."""
     
     # Extract Member ID
@@ -111,7 +135,7 @@ def identify_file(filename):
     return member, None
 
 
-def process_file(path: Path, var_name: str, exp: str):
+def process_file(path: Path, var_name: str, exp: str) -> xr.DataArray | None:
     """
     Loads a file, slices time, converts units, and applies masks.
     Returns the processed DataArray or None if error.
@@ -153,7 +177,10 @@ def process_file(path: Path, var_name: str, exp: str):
         return None
 
 
-def pair_precc_precl_files(data_dir, prect_member2paths):
+def pair_precc_precl_files(
+    data_dir: Path,
+    prect_member2paths: dict[str, list[tuple[Path, Path]]],
+) -> dict[str, list[tuple[Path, Path]]]:
     """
     Pairs PRECC and PRECL files from data_dir and populates prect_member2paths.
     
@@ -212,7 +239,11 @@ def pair_precc_precl_files(data_dir, prect_member2paths):
     return prect_member2paths
 
 
-def process_and_export_prect_per_file(prect_member2paths, output_dir, overwrite=False):
+def process_and_export_prect_per_file(
+    prect_member2paths: dict[str, list[tuple[Path, Path]]],
+    output_dir: str | Path,
+    overwrite: bool = False,
+) -> None:
     """
     Reads pairs of PRECC/PRECL files, sums them to PRECT,
     and exports a SEPARATE file for each pair immediately.
@@ -274,7 +305,11 @@ def process_and_export_prect_per_file(prect_member2paths, output_dir, overwrite=
     print("\nAll individual file exports complete.")
 
 
-def get_yearly_aggregate(ds, var_name, esm_var):
+def get_yearly_aggregate(
+    ds: xr.Dataset | xr.DataArray,
+    var_name: str,
+    esm_var: str,
+) -> xr.Dataset | xr.DataArray:
     """
     Resamples data to yearly, applies the correct aggregation, 
     and REPLACES years that do not have full 12-month coverage with NaN.
@@ -354,7 +389,7 @@ def get_yearly_aggregate(ds, var_name, esm_var):
     return filtered_agg
 
 
-def validate_continuity(ds):
+def validate_continuity(ds: xr.Dataset | xr.DataArray) -> None:
     """Asserts that monthly data is continuous (diff is exactly 1 month)."""
     time_diffs = np.diff(ds.time.values.astype("datetime64[M]"))
     one_month = np.timedelta64(1, 'M')
@@ -377,7 +412,9 @@ def _combined_monthly_to_dataarray(
     return combined
 
 
-def merge_historical_and_baseline(exp2member2data_combined):
+def merge_historical_and_baseline(
+    exp2member2data_combined: dict[str, dict[str, xr.Dataset | xr.DataArray]],
+) -> None:
     """
     Merges 'historical' and 'baseline' into a single superset of members.
 
@@ -465,7 +502,10 @@ def merge_historical_and_baseline(exp2member2data_combined):
     print("-" * 40)
 
 
-def get_robust_regridder(ds_sample, target_grid):
+def get_robust_regridder(
+    ds_sample: xr.Dataset | xr.DataArray,
+    target_grid: xr.Dataset | xr.DataArray,
+) -> "xe.Regridder":
     """
     Initializes an xesmf regridder. 
     Includes fallback logic for datasets with malformed lat/lon coordinates.
@@ -483,7 +523,12 @@ def get_robust_regridder(ds_sample, target_grid):
         return xe.Regridder(ds_fix, target_grid, 'bilinear', periodic=True, ignore_degenerate=True)
 
 
-def compute_and_save_variability(exp2member2data_combined, var_name, output_dir, overwrite=False):
+def compute_and_save_variability(
+    exp2member2data_combined: dict[str, dict[str, xr.Dataset | xr.DataArray]],
+    var_name: str,
+    output_dir: str | Path,
+    overwrite: bool = False,
+) -> tuple[float, xr.DataArray] | None:
     """
     Calculates and saves the model internal variability based on the 'baseline' experiment.
     
@@ -634,7 +679,12 @@ def compute_and_save_grid_variability(
 
 
 # --- Main Function --- #
-def process_monthly(var, data_dir, output_dir, overwrite=False):
+def process_monthly(
+    var: str,
+    data_dir: str | Path,
+    output_dir: str | Path,
+    overwrite: bool = False,
+) -> None:
     """
     Process monthly Simulator data and calculate model internal variability for each variable.
     (it does not calculate model internal variability for sea ice. It is done in variability.py)

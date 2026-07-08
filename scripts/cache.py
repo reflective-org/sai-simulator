@@ -1,3 +1,12 @@
+"""Precompute the on-disk cache files consumed by the SAI dashboard at request time.
+
+For each SSP scenario this script generates the no-SAI regional map and p-values, the SO2
+injection-by-latitude lookup table (keyed by ``start_year``), and the per-temperature-target
+SAI regional delta + p-values. Cache files are reused by :mod:`backend.get_outputs` so
+dashboard requests don't have to re-run FaIR + the FaIR→SMIP emulator.
+
+CLI entry: ``python scripts/cache.py <data_dir> <model_dir> <output_dir> [--scenario ...]``.
+"""
 import sys
 import fire
 import numpy as np
@@ -17,7 +26,7 @@ from backend.utils import get_interpolator
 from fair_wrap.fair_utils import REVERSE_FANCY_SSP_TITLES, CANVAS_START_YEAR, SIM_END_YEAR
 from backend.icefrac import predict_icefrac
 
-def cache_historical(data_dir, output_dir):
+def cache_historical(data_dir: str | Path, output_dir: str | Path) -> None:
     """Pre-generate shared historical_*.nc files (safe to call before parallel runs)."""
     data_dir = Path(data_dir)
     output_dir = Path(output_dir)
@@ -31,7 +40,13 @@ def cache_historical(data_dir, output_dir):
     print("Historical cache complete.")
 
 
-def cache(data_dir, model_dir, output_dir, scenario=None, historical_only=False):
+def cache(
+    data_dir: str | Path,
+    model_dir: str | Path,
+    output_dir: str | Path,
+    scenario: str | None = None,
+    historical_only: bool = False,
+) -> None:
     """Generate cache files for all (or a single) SSP scenario.
 
     Args:
