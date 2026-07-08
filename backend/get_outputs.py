@@ -11,6 +11,7 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature 
 import matplotlib.pyplot as plt
 import struct
+import logging
 from datetime import datetime
 
 from fair_wrap.fair_utils import REVERSE_FANCY_SSP_TITLES, SIM_END_YEAR
@@ -25,6 +26,8 @@ from .variable import get_variable_regional_delta
 from .utils import get_interpolator, create_mask, regional_aggregation, apply_constraints, clip_to_land, apply_ramp_up_factor
 from .icefrac import get_area, predict_icefrac
 
+
+logger = logging.getLogger(__name__)
 
 @lru_cache(maxsize=32)  # Caches the last 32 unique calls
 def get_temp_diff(data_dir, model_dir, cache_dir, ssp_scenario, temp_target):
@@ -163,7 +166,7 @@ def get_outputs(
             else:
                 regional_p_cache_path_exists = False
             if regional_p_cache_path_exists:
-                print(f"Found {regional_p_cache_path}")
+                logger.info("Found %s", regional_p_cache_path)
                 with xr.open_dataarray(regional_p_cache_path) as da:
                     regional_sai_p_values = da.load()
             else:
@@ -202,9 +205,37 @@ def get_outputs(
 
         ### Create GeoTIFF files ###
         if output_config.get("create_geotiffs", False):
-            output_data["geotiff_paths"] = create_geotiff_files(**locals())
+            output_data["geotiff_paths"] = create_geotiff_files(
+                var=var,
+                regional_mean=regional_mean,
+                regional_delta_mean=regional_delta_mean,
+                regional_no_sai_p_values=regional_no_sai_p_values,
+                regional_sai_p_values=regional_sai_p_values,
+                ssp_scenario=ssp_scenario,
+                temp_target=temp_target,
+                decade_start_year=decade_start_year,
+                decade_end_year=decade_end_year,
+                start_year=start_year,
+                ramp_up=ramp_up,
+                variable_injection=variable_injection,
+                output_config=output_config,
+            )
         if output_config.get("create_pngs", False) or output_config.get("create_svgs", False):
-            output_data["image_paths"] = create_vectorized_files(**locals())
+            output_data["image_paths"] = create_vectorized_files(
+                var=var,
+                regional_mean=regional_mean,
+                regional_delta_mean=regional_delta_mean,
+                regional_no_sai_p_values=regional_no_sai_p_values,
+                regional_sai_p_values=regional_sai_p_values,
+                ssp_scenario=ssp_scenario,
+                temp_target=temp_target,
+                decade_start_year=decade_start_year,
+                decade_end_year=decade_end_year,
+                start_year=start_year,
+                ramp_up=ramp_up,
+                variable_injection=variable_injection,
+                output_config=output_config,
+            )
 
         # Validation-only: GeoTIFFs (and core regional fields above) are enough; skip
         # mean-over-time, PDFs, NetCDF export, and per-variable plotting work.
@@ -594,40 +625,27 @@ def create_geotiff_files(var, regional_mean, regional_delta_mean,
                         ssp_scenario, temp_target=None,
                         decade_start_year=None, decade_end_year=None,
                         start_year=None, ramp_up=None, variable_injection=None,
-                        output_config={}, **kwargs):
+                        output_config={}):
     """
     Create GeoTIFF files for a given variable with both no_sai and with_sai scenarios.
-    
+
     Returns:
         dict: Dictionary mapping scenario keys to file paths
     """
     geotiff_paths = {}
-    
+
     output_dir = Path(output_config.get("output_dir", "output")) / "geotiffs"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create a hash of the input parameters for GeoTIFF filenames
-    if variable_injection is None:
-        geotiff_params = [
-            ssp_scenario,
-            temp_target,
-            decade_start_year,
-            decade_end_year,
-            start_year,
-            ramp_up,
-        ]
-    else:
-        # Hash the variable_injection array to include in the cache key
-        variable_hash = _hash_variable_injection(variable_injection)
-        geotiff_params = [
-            ssp_scenario,
-            decade_start_year,
-            decade_end_year,
-            f"vinj_{variable_hash}"
-        ]
-    
-    geotiff_params_str = "_".join(map(str, geotiff_params))
-    geotiff_params_hash = hashlib.md5(geotiff_params_str.encode()).hexdigest()[:10]
+    geotiff_params_hash = _compute_params_hash(
+        ssp_scenario, temp_target, decade_start_year, decade_end_year,
+        start_year, ramp_up, variable_injection,
+    )
+
+    pvals_by_suffix = {
+        "no_sai": regional_no_sai_p_values,
+        "with_sai": regional_sai_p_values,
+    }
 
     for data, suffix in [(regional_mean, "no_sai"), (regional_mean + regional_delta_mean, "with_sai")]:
         output_filename = f"{var}_{suffix}_{geotiff_params_hash}.tif"
@@ -637,48 +655,18 @@ def create_geotiff_files(var, regional_mean, regional_delta_mean,
         if output_path.exists():
             geotiff_paths[f"{var}_{suffix}"] = str(output_path)
             continue
-        
-        # Adjust longitude values from 0-360 to -180-180
-        data_adjusted = data.assign_coords(lon=(((data.lon + 180) % 360) - 180))
-        data_adjusted = data_adjusted.sortby('lon')
-        
-        # Flip the data vertically and reverse the latitude coordinates
-        data_adjusted = data_adjusted.isel(lat=slice(None, None, -1))
-        
+
+        # Shift lon to [-180, 180), sort, and flip latitude (north-up)
+        data_adjusted = _adjust_polar_lonlat(data)
+
         # Prepare the data for GeoTIFF
         data_array = data_adjusted.values
-        
-        # Get the appropriate significance mask
-        if suffix == "no_sai" and regional_no_sai_p_values is not None:
-            # For no_sai map, adjust p-values the same way we adjusted the data
-            p_values_adjusted = regional_no_sai_p_values.assign_coords(lon=(((regional_no_sai_p_values.lon + 180) % 360) - 180))
-            p_values_adjusted = p_values_adjusted.sortby('lon')
-            p_values_adjusted = p_values_adjusted.isel(lat=slice(None, None, -1))
-            
-            # 1 = not significant, NaN = either significant or not included
-            significance_mask = np.where(
-                (~np.isnan(p_values_adjusted.values)) & (p_values_adjusted.values >= 0.05),
-                1,
-                np.nan
-            ).astype(np.float32)
-            
-        elif suffix == "with_sai" and regional_sai_p_values is not None:
-            # For with_sai map, adjust p-values the same way we adjusted the data
-            p_values_adjusted = regional_sai_p_values.assign_coords(lon=(((regional_sai_p_values.lon + 180) % 360) - 180))
-            p_values_adjusted = p_values_adjusted.sortby('lon')
-            p_values_adjusted = p_values_adjusted.isel(lat=slice(None, None, -1))
 
-            # 1 = not significant, NaN = either significant or not included
-            significance_mask = np.where(
-                (~np.isnan(p_values_adjusted.values)) & (p_values_adjusted.values >= 0.05),
-                1,
-                np.nan
-            ).astype(np.float32)
-            
-        else:
-            # Default to all NaN (no hatching) if p-values not available
+        # Get the appropriate significance mask
+        significance_mask = _significance_mask(pvals_by_suffix[suffix])
+        if significance_mask is None:
             significance_mask = np.full_like(data_array, np.nan, dtype=np.float32)
-        
+
         # Convert to float32 if it's not already
         if data_array.dtype != np.float32:
             data_array = data_array.astype(np.float32)
@@ -755,6 +743,61 @@ def _hash_variable_injection(variable_injection: np.ndarray) -> str:
     payload = struct.pack('<II', rows, cols) + arr.astype('<f8', copy=False).tobytes()
     return hashlib.md5(payload).hexdigest()[:8]
 
+
+def _compute_params_hash(
+    ssp_scenario: str,
+    temp_target: float | None,
+    decade_start_year: int | None,
+    decade_end_year: int | None,
+    start_year: int | None,
+    ramp_up: int | None,
+    variable_injection: np.ndarray | None,
+) -> str:
+    """Stable 10-char MD5 cache-key shared by GeoTIFF / vectorized / NetCDF outputs.
+
+    When ``variable_injection`` is ``None`` the key encodes the analytic SAI parameters
+    (``ssp_scenario``, ``temp_target``, decade range, ``start_year``, ``ramp_up``).
+    Otherwise the injection array is hashed via :func:`_hash_variable_injection` and
+    used in place of the analytic params, so two cases that differ only in injection
+    produce different keys.
+    """
+    if variable_injection is None:
+        params = [
+            ssp_scenario,
+            temp_target,
+            decade_start_year,
+            decade_end_year,
+            start_year,
+            ramp_up,
+        ]
+    else:
+        variable_hash = _hash_variable_injection(variable_injection)
+        params = [
+            ssp_scenario,
+            decade_start_year,
+            decade_end_year,
+            f"vinj_{variable_hash}",
+        ]
+    params_str = "_".join(map(str, params))
+    return hashlib.md5(params_str.encode()).hexdigest()[:10]
+
+
+def _significance_mask(p_values_da: xr.DataArray | None) -> np.ndarray | None:
+    """Build a float32 mask from a p-values DataArray for hatching non-significant regions.
+
+    The input is reprojected with :func:`_adjust_polar_lonlat` so the mask aligns with
+    polar-stereographic data fields. Returns ``1.0`` where ``p >= 0.05`` (not significant)
+    and ``NaN`` elsewhere, or ``None`` when ``p_values_da`` is ``None``.
+    """
+    if p_values_da is None:
+        return None
+    pv = _adjust_polar_lonlat(p_values_da).values
+    return np.where(
+        (~np.isnan(pv)) & (pv >= 0.05),
+        1.0,
+        np.nan,
+    ).astype(np.float32)
+
 def create_vectorized_files(
     var,
     regional_mean,
@@ -769,7 +812,6 @@ def create_vectorized_files(
     ramp_up=None,
     variable_injection=None,
     output_config=None,
-    **kwargs,
 ):
     """
     Create image files (PNG or SVG) for visualizing variables over arctic (e.g. sea-ice extent) data.
@@ -820,28 +862,10 @@ def create_vectorized_files(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- cache key (stable + cheap) ----
-
-    if variable_injection is None:
-        plot_params = [
-            ssp_scenario,
-            temp_target,
-            decade_start_year,
-            decade_end_year,
-            start_year,
-            ramp_up,
-        ]
-    else:
-        # Hash the variable_injection array to include in the cache key
-        variable_hash = _hash_variable_injection(variable_injection)
-        plot_params = [
-            ssp_scenario,
-            decade_start_year,
-            decade_end_year,
-            f"vinj_{variable_hash}",
-        ]
-
-    plot_params_str = "_".join(map(str, plot_params))
-    plot_params_hash = hashlib.md5(plot_params_str.encode()).hexdigest()[:10]
+    plot_params_hash = _compute_params_hash(
+        ssp_scenario, temp_target, decade_start_year, decade_end_year,
+        start_year, ramp_up, variable_injection,
+    )
 
     # ---- prepare base fields once (avoid extra copies) ----
     # keep in float32 to halve memory bandwidth
@@ -851,16 +875,8 @@ def create_vectorized_files(
     lon = base.lon.values
     lat = base.lat.values
 
-    def prep_sig_mask(pvals_da: xr.DataArray | None):
-        if pvals_da is None:
-            return None
-        pv = _adjust_polar_lonlat(pvals_da).values  # materialize as needed
-        # 1 = not significant; NaN elsewhere (keeps hatch minimal)
-        mask = np.where((~np.isnan(pv)) & (pv >= 0.05), 1.0, np.nan).astype(np.float32)
-        return mask
-
-    no_sai_mask = prep_sig_mask(regional_no_sai_p_values)
-    with_sai_mask = prep_sig_mask(regional_sai_p_values)
+    no_sai_mask = _significance_mask(regional_no_sai_p_values)
+    with_sai_mask = _significance_mask(regional_sai_p_values)
 
     # ---- color normalization (reuse) ----
     cmap_blues = plt.cm.Blues_r
@@ -971,28 +987,10 @@ def generate_sai_netcdf(
 
     # Compose output file name if not provided
     if output_path is None:
-        # Use the same hashing approach as GeoTIFF for consistency
-        if variable_injection is None:
-            netcdf_params = [
-                ssp_scenario,
-                temp_target,
-                decade_start_year,
-                decade_end_year,
-                start_year,
-                ramp_up,
-            ]
-        else:
-            # Hash the variable_injection array to include in the cache key
-            variable_hash = _hash_variable_injection(variable_injection)
-            netcdf_params = [
-                ssp_scenario,
-                decade_start_year,
-                decade_end_year,
-                f"vinj_{variable_hash}"
-            ]
-
-        netcdf_params_str = "_".join(map(str, netcdf_params))
-        netcdf_params_hash = hashlib.md5(netcdf_params_str.encode()).hexdigest()[:10]
+        netcdf_params_hash = _compute_params_hash(
+            ssp_scenario, temp_target, decade_start_year, decade_end_year,
+            start_year, ramp_up, variable_injection,
+        )
         output_filename = f"{var}_{netcdf_params_hash}.nc"
         output_path = output_dir / output_filename
     else:
@@ -1129,5 +1127,5 @@ def generate_sai_netcdf(
         }
 
     ds.to_netcdf(str(output_path), engine='netcdf4', encoding=encoding)
-    print(f"File saved successfully to {output_path}")
+    logger.info("File saved successfully to %s", output_path)
     return ds
