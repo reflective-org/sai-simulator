@@ -18,6 +18,7 @@ from scripts.data_sanity_checks import (
     find_duplicate_basenames,
     list_netcdf_paths_relative,
     parse_aws_s3_ls_recursive_output,
+    parse_exclude_dirs,
     parse_required_variables,
     parse_s3_uri,
     run_download_sanity_checks,
@@ -55,7 +56,10 @@ def test_duplicate_check_uses_only_netcdf_paths(tmp_path, monkeypatch) -> None:
     (tmp_path / "a" / "note.txt").write_text("n", encoding="utf-8")
     (tmp_path / "b" / "note.txt").write_text("n", encoding="utf-8")
 
-    monkeypatch.setattr("scripts.data_sanity_checks.find_corrupted_netcdf_files", lambda _d: [])
+    monkeypatch.setattr(
+        "scripts.data_sanity_checks.find_corrupted_netcdf_files",
+        lambda _d, exclude_top_level_dirs=frozenset(): [],
+    )
 
     with pytest.raises(ValueError, match="Duplicate NetCDF basenames"):
         run_download_sanity_checks(tmp_path)
@@ -150,7 +154,10 @@ def test_run_download_sanity_checks_passes_when_expected_present(
     (root / "a" / "x.001.cam.h0.TREFHT.185001-201412.nc").write_text("x", encoding="utf-8")
     (root / "a" / "x.002.cam.h0.TREFHT.185001-201412.nc").write_text("x", encoding="utf-8")
     (root / "a" / "x.003.cam.h0.TREFHT.185001-201412.nc").write_text("x", encoding="utf-8")
-    monkeypatch.setattr("scripts.data_sanity_checks.find_corrupted_netcdf_files", lambda _d: [])
+    monkeypatch.setattr(
+        "scripts.data_sanity_checks.find_corrupted_netcdf_files",
+        lambda _d, exclude_top_level_dirs=frozenset(): [],
+    )
 
     # Should not raise.
     run_download_sanity_checks(
@@ -169,6 +176,77 @@ def test_run_download_sanity_checks_fails_on_duplicate_basenames(tmp_path: Path)
 
     with pytest.raises(ValueError, match="Duplicate NetCDF basenames"):
         run_download_sanity_checks(root)
+
+
+def test_parse_exclude_dirs() -> None:
+    assert parse_exclude_dirs(None) == frozenset()
+    assert parse_exclude_dirs("") == frozenset()
+    assert parse_exclude_dirs("TREFHT, PRECT ,TREFHT_above_40") == frozenset(
+        {"TREFHT", "PRECT", "TREFHT_above_40"}
+    )
+
+
+def test_list_netcdf_paths_relative_honors_exclude_top_level_dirs(tmp_path: Path) -> None:
+    (tmp_path / "raw.nc").write_text("x", encoding="utf-8")
+    (tmp_path / "TREFHT_above_40").mkdir()
+    (tmp_path / "TREFHT_above_40" / "processed.nc").write_text("x", encoding="utf-8")
+
+    assert list_netcdf_paths_relative(tmp_path) == [
+        "TREFHT_above_40/processed.nc",
+        "raw.nc",
+    ]
+    assert list_netcdf_paths_relative(
+        tmp_path, exclude_top_level_dirs=frozenset({"TREFHT_above_40"})
+    ) == ["raw.nc"]
+
+
+def test_find_corrupted_netcdf_files_honors_exclude_top_level_dirs(tmp_path: Path) -> None:
+    (tmp_path / "bad.nc").write_text("bad", encoding="utf-8")
+    (tmp_path / "TREFHT_above_40").mkdir()
+    (tmp_path / "TREFHT_above_40" / "also_bad.nc").write_text("bad", encoding="utf-8")
+
+    def fake_validator(_path: Path) -> None:
+        raise ValueError("corrupt")
+
+    corrupted = find_corrupted_netcdf_files(
+        tmp_path,
+        validator=fake_validator,
+        exclude_top_level_dirs=frozenset({"TREFHT_above_40"}),
+    )
+    assert corrupted == ["bad.nc"]
+
+
+def test_run_download_sanity_checks_ignores_duplicates_under_excluded_dir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Duplicates that live only under an excluded downstream-output dir must not fail the check."""
+    root = tmp_path
+    (root / "x.001.cam.h0.TREFHT.185001-201412.nc").write_text("x", encoding="utf-8")
+    (root / "x.002.cam.h0.TREFHT.185001-201412.nc").write_text("x", encoding="utf-8")
+    (root / "x.003.cam.h0.TREFHT.185001-201412.nc").write_text("x", encoding="utf-8")
+    processed = root / "TREFHT_above_40"
+    processed.mkdir()
+    # Same basename as a top-level raw file; would trip the duplicate check without the exclude.
+    (processed / "x.001.cam.h0.TREFHT.185001-201412.nc").write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "scripts.data_sanity_checks.find_corrupted_netcdf_files",
+        lambda _d, exclude_top_level_dirs=frozenset(): [],
+    )
+
+    # Without the exclude → duplicate error.
+    with pytest.raises(ValueError, match="Duplicate NetCDF basenames"):
+        run_download_sanity_checks(
+            root, required_variables=["TREFHT"], min_ensemble_members=3
+        )
+
+    # With the exclude → clean pass.
+    run_download_sanity_checks(
+        root,
+        required_variables=["TREFHT"],
+        min_ensemble_members=3,
+        exclude_top_level_dirs=frozenset({"TREFHT_above_40"}),
+    )
 
 
 def test_run_download_sanity_checks_fails_when_required_var_has_too_few_members(
@@ -209,7 +287,9 @@ def test_run_download_sanity_checks_fails_on_corrupted_netcdf(tmp_path: Path, mo
 
     monkeypatch.setattr(
         "scripts.data_sanity_checks.find_corrupted_netcdf_files",
-        lambda _data_dir: ["x.001.cam.h0.TREFHT.185001-201412.nc"],
+        lambda _data_dir, exclude_top_level_dirs=frozenset(): [
+            "x.001.cam.h0.TREFHT.185001-201412.nc"
+        ],
     )
 
     with pytest.raises(ValueError, match="corrupted/unreadable NetCDF files"):

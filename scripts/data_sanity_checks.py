@@ -25,22 +25,59 @@ def print_cli_error(message: str) -> None:
     print(f"{RED}ERROR:{RESET} {message}", file=sys.stderr)
 
 
-def list_relative_files(root_dir: Path) -> list[str]:
-    """Return all file paths under root as sorted, POSIX-style relative paths."""
+def _is_under_excluded_dir(relative_path: str, exclude_top_level_dirs: frozenset[str]) -> bool:
+    """Return True if a POSIX-style relative path lives under one of the excluded top-level dirs."""
+    if not exclude_top_level_dirs:
+        return False
+    first_component = relative_path.split("/", 1)[0]
+    return first_component in exclude_top_level_dirs
+
+
+def parse_exclude_dirs(raw: str | None) -> frozenset[str]:
+    """Parse a comma-separated top-level subdirectory list into a frozenset."""
+    if not raw:
+        return frozenset()
+    return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+
+def list_relative_files(
+    root_dir: Path,
+    exclude_top_level_dirs: frozenset[str] = frozenset(),
+) -> list[str]:
+    """Return all file paths under root as sorted, POSIX-style relative paths.
+
+    Paths whose first component matches ``exclude_top_level_dirs`` are skipped so
+    downstream-processing subdirectories (e.g. daily-processing outputs written
+    under ``<data_dir>/TREFHT_above_40/``) don't pollute the raw-download scan.
+    """
     return sorted(
-        str(path.relative_to(root_dir)).replace("\\", "/")
-        for path in root_dir.rglob("*")
-        if path.is_file()
+        rel
+        for rel in (
+            str(path.relative_to(root_dir)).replace("\\", "/")
+            for path in root_dir.rglob("*")
+            if path.is_file()
+        )
+        if not _is_under_excluded_dir(rel, exclude_top_level_dirs)
     )
 
 
-def list_netcdf_paths_relative(root_dir: Path) -> list[str]:
-    """Return relative paths of all ``*.nc`` files under ``root_dir`` (download / sanity scope)."""
+def list_netcdf_paths_relative(
+    root_dir: Path,
+    exclude_top_level_dirs: frozenset[str] = frozenset(),
+) -> list[str]:
+    """Return relative paths of all ``*.nc`` files under ``root_dir`` (download / sanity scope).
+
+    See :func:`list_relative_files` for the ``exclude_top_level_dirs`` semantics.
+    """
     root_dir = root_dir.resolve()
     return sorted(
-        str(path.relative_to(root_dir)).replace("\\", "/")
-        for path in root_dir.rglob("*.nc")
-        if path.is_file()
+        rel
+        for rel in (
+            str(path.relative_to(root_dir)).replace("\\", "/")
+            for path in root_dir.rglob("*.nc")
+            if path.is_file()
+        )
+        if not _is_under_excluded_dir(rel, exclude_top_level_dirs)
     )
 
 
@@ -231,14 +268,21 @@ def validate_netcdf_file_integrity(file_path: Path) -> None:
 def find_corrupted_netcdf_files(
     data_dir: Path,
     validator: Callable[[Path], None] = validate_netcdf_file_integrity,
+    exclude_top_level_dirs: frozenset[str] = frozenset(),
 ) -> list[str]:
-    """Return relative paths of unreadable/corrupted NetCDF files."""
+    """Return relative paths of unreadable/corrupted NetCDF files.
+
+    See :func:`list_relative_files` for the ``exclude_top_level_dirs`` semantics.
+    """
     corrupted: list[str] = []
     for file_path in sorted(data_dir.rglob("*.nc")):
+        relative = str(file_path.relative_to(data_dir)).replace("\\", "/")
+        if _is_under_excluded_dir(relative, exclude_top_level_dirs):
+            continue
         try:
             validator(file_path)
         except Exception:
-            corrupted.append(str(file_path.relative_to(data_dir)).replace("\\", "/"))
+            corrupted.append(relative)
     return corrupted
 
 
@@ -248,14 +292,21 @@ def run_download_sanity_checks(
     include_lens_files: bool = False,
     required_variables: list[str] | None = None,
     min_ensemble_members: int = 3,
+    exclude_top_level_dirs: frozenset[str] = frozenset(),
 ) -> None:
-    """Run all download-time sanity checks and raise on any violations."""
+    """Run all download-time sanity checks and raise on any violations.
+
+    ``exclude_top_level_dirs`` names top-level subdirectories under ``data_dir`` to skip
+    (e.g. downstream-processing outputs like ``TREFHT_above_40`` written by
+    ``process_daily_gauss.py``). Without this, rerunning setup after processing would
+    surface those files as duplicate NetCDF basenames.
+    """
     data_dir = Path(data_dir).expanduser().resolve()
     if not data_dir.exists():
         raise FileNotFoundError(f"Data directory does not exist: {data_dir}")
 
-    actual_files = list_relative_files(data_dir)
-    netcdf_paths = list_netcdf_paths_relative(data_dir)
+    actual_files = list_relative_files(data_dir, exclude_top_level_dirs)
+    netcdf_paths = list_netcdf_paths_relative(data_dir, exclude_top_level_dirs)
     duplicates = find_duplicate_basenames(netcdf_paths)
     if duplicates:
         duplicate_summary = ", ".join(
@@ -288,7 +339,9 @@ def run_download_sanity_checks(
         min_ensemble_members=min_ensemble_members,
     )
 
-    corrupted_files = find_corrupted_netcdf_files(data_dir)
+    corrupted_files = find_corrupted_netcdf_files(
+        data_dir, exclude_top_level_dirs=exclude_top_level_dirs
+    )
     if corrupted_files:
         sample = ", ".join(corrupted_files[:10])
         more = "" if len(corrupted_files) <= 10 else f" ... (+{len(corrupted_files) - 10} more)"
@@ -328,6 +381,14 @@ def main() -> None:
         default=3,
         help="Minimum number of ensemble members required per required variable.",
     )
+    parser.add_argument(
+        "--exclude_dirs",
+        default=None,
+        help=(
+            "Comma-separated top-level subdirectory names under --data_dir to skip "
+            "(e.g. downstream-processing outputs like TREFHT_above_40)."
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -337,6 +398,7 @@ def main() -> None:
             include_lens_files=args.include_lens_files,
             required_variables=parse_required_variables(args.required_variables),
             min_ensemble_members=args.min_ensemble_members,
+            exclude_top_level_dirs=parse_exclude_dirs(args.exclude_dirs),
         )
         print("Download sanity checks passed.")
     except (ValueError, FileNotFoundError) as exc:
