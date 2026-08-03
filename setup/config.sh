@@ -20,9 +20,6 @@ USER_OVERWRITE_LENS=""     # "yes" or "no"
 USER_OVERWRITE_DAILY=""    # "yes" or "no"
 USER_OVERWRITE_MONTHLY=""  # "yes" or "no"
 
-# Single source of truth for hosted dataset version.
-DATA_BUCKET_URI=$(python -c 'from version import DATA_BUCKET_URI; print(DATA_BUCKET_URI)')
-
 # Optional automation hook for API cache pregeneration on EC2.
 # Enable by exporting RUN_API_PREGENERATION_DOCKER=yes before running this script.
 RUN_API_PREGENERATION_DOCKER="${RUN_API_PREGENERATION_DOCKER:-no}"

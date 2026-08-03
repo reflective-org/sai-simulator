@@ -1,4 +1,10 @@
 """Project-wide version constants."""
 
 SIMULATOR_VERSION = "v1.3.0"
-DATA_BUCKET_URI = f"s3://reflective-simulator-bucket/{SIMULATOR_VERSION}/"
+
+# Public Cloudflare R2 location of the per-experiment Zarr training-data
+# stores consumed by scripts/process_monthly_gauss.py and verified by
+# scripts/data_sanity_checks.py. Served via the bucket's r2.dev subdomain,
+# which is fully anonymous — no credentials or storage_options needed
+# anywhere in the consumer path.
+ZARR_STORES_URI = "https://pub-d127229e707d485c80965ab41706e316.r2.dev/simulator-inputs"

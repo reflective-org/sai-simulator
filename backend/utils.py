@@ -15,7 +15,7 @@ import geopandas as gpd
 from functools import lru_cache
 from scipy.signal import butter, filtfilt
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 from fair_wrap.fair_utils import SIM_END_YEAR
 
@@ -203,48 +203,83 @@ def load_spatial_aggregation_gdfs(data_dir: Union[str, Path]) -> dict[str, gpd.G
 
 
 def open_xarray_datasets(
-    dataset_path: Union[str, Path], 
-    decode_times: bool = True
-    ) -> xr.Dataset:
-    dataset_path = Path(dataset_path)
-    """
-    Opens a NetCDF file, loads it into memory, and safely closes the file handle.
+    dataset_path: Union[str, Path],
+    decode_times: bool = True,
+    *,
+    group: Optional[str] = None,
+    consolidated: Optional[bool] = None,
+    storage_options: Optional[dict] = None,
+) -> xr.Dataset:
+    """Open a NetCDF file or Zarr store and eagerly load it into memory.
 
-    This function ensures that the underlying file handler is closed immediately 
-    after loading the data into memory (.load()), preventing 'Too many open files' 
-    errors in workflows processing many files.
+    Dispatches on ``dataset_path``: Zarr when the path ends in ``.zarr`` (with
+    or without a trailing slash), contains ``.zarr/``, or starts with a remote
+    URL scheme (``s3://``, ``gs://``, ``http://``, ``https://``); NetCDF
+    otherwise. Both branches call :meth:`xarray.Dataset.load` so the returned
+    Dataset owns no open file handles or HTTP connections — important for
+    workflows that open many sources in sequence.
 
     Args:
-        dataset_path (Union[str, Path]): Path to the NetCDF dataset file.
-        decode_times (bool, optional): If True, forces the use of cftime for 
-            date decoding (useful for non-standard calendars). If False, time 
-            coordinates remain as numerical values. Defaults to True.
+        dataset_path: Path to a local NetCDF file, or a path / URL to a Zarr
+            store.
+        decode_times: If True, force cftime decoding (handles non-standard
+            calendars like ``noleap``). If False, leave time coords as raw
+            numerical values.
+        group: Zarr only — subgroup path inside the store (e.g.
+            ``"Mon/atmos_2d"`` for the CESM2-WACCM SAI stores whose root group
+            holds no data variables). Ignored for NetCDF.
+        consolidated: Zarr only — whether to read consolidated metadata.
+            ``None`` (the default) lets xarray auto-detect and fall back if
+            absent. Ignored for NetCDF.
+        storage_options: Zarr only — fsspec kwargs (e.g. R2 ``endpoint_url``,
+            ``anon``). Ignored for NetCDF.
 
     Returns:
-        xr.Dataset: The fully loaded xarray Dataset.
+        The fully loaded xarray Dataset.
 
     Raises:
-        FileNotFoundError: If the specified file does not exist.
-        ValueError: If the file is corrupt or cannot be read by xarray.
+        FileNotFoundError: NetCDF only — raised when the file is not on disk.
+        ValueError: If the file or store is corrupt or unreadable.
     """
-    dataset_path = Path(dataset_path)
-    time_coder = xr.coders.CFDatetimeCoder(use_cftime=True)
+    path_str = str(dataset_path)
+    is_zarr = (
+        path_str.endswith(".zarr")
+        or path_str.endswith(".zarr/")
+        or ".zarr/" in path_str
+        or path_str.startswith(("s3://", "gs://", "http://", "https://"))
+    )
 
+    time_coder = xr.coders.CFDatetimeCoder(use_cftime=True)
+    decode_kwargs = {"decode_times": time_coder} if decode_times else {"decode_times": False}
+
+    if is_zarr:
+        open_kwargs = {**decode_kwargs}
+        if group is not None:
+            open_kwargs["group"] = group
+        if consolidated is not None:
+            open_kwargs["consolidated"] = consolidated
+        if storage_options is not None:
+            open_kwargs["storage_options"] = storage_options
+        try:
+            with xr.open_zarr(path_str, **open_kwargs) as ds:
+                ds.load()
+                return ds
+        except Exception as e:
+            error_msg = f"\033[91mFailed to open zarr store: {path_str}\nError: {e}\033[0m"
+            print(error_msg)
+            raise ValueError(error_msg) from e
+
+    # NetCDF path — existing behavior unchanged.
+    dataset_path = Path(dataset_path)
     if not dataset_path.exists():
-        # ANSI Red for error visibility
         error_msg = f"\033[91mDataset file not found: {dataset_path}\033[0m"
         print(error_msg)
         raise FileNotFoundError(error_msg)
 
-    # Configure arguments: Force cftime if decoding, otherwise disable decoding entirely
-    open_kwargs = {"decode_times": time_coder} if decode_times else {"decode_times": False}
-
     try:
-        # Use a context manager to ensure the file is closed automatically
-        with xr.open_dataset(dataset_path, **open_kwargs) as ds:
-            ds.load()  # Persist data in RAM
-            return ds  # Exiting the block closes the file handle
-            
+        with xr.open_dataset(dataset_path, **decode_kwargs) as ds:
+            ds.load()
+            return ds
     except Exception as e:
         error_msg = f"\033[91mFailed to open dataset: {dataset_path}\nError: {e}\033[0m"
         print(error_msg)

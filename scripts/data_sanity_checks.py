@@ -1,409 +1,150 @@
-"""Download-time sanity checks for the simulator's raw data directory.
+"""Sanity-check the Zarr training-data stores at :data:`version.ZARR_STORES_URI`
+before any fitting or dashboard work runs.
 
-Verifies that the locally downloaded data tree matches an expected S3 manifest, contains the
-required ensemble members for each variable, has no duplicate basenames, and that every
-``*.nc`` file is at least header-readable. Designed to be invoked from ``setup.sh`` (or
-manually as ``python scripts/data_sanity_checks.py --data_dir ...``) before any of the
-processing/fitting scripts run, so missing or corrupted files are caught up front.
+For every ``(store, group, variable)`` triple the consumer pipeline
+(:mod:`scripts.process_monthly_gauss`) reads, verify:
+
+- the store opens via :func:`xarray.open_zarr` (consolidated metadata),
+- the group exists,
+- the expected variable is present,
+- the variable carries the canonical ``(member, time, lat, lon)`` dims and
+  neither ``member`` nor ``time`` is empty.
+
+This is a few-second metadata-only smoke test — no chunk reads — designed
+to surface bucket / credential / schema issues up front rather than several
+minutes into a processing run.
+
+Exits with status ``2`` on any failure so callers (e.g. ``setup/steps.sh``)
+can distinguish "checks failed" from generic Python errors.
 """
 import argparse
-import re
-import subprocess
 import sys
-from collections.abc import Callable
-from collections import Counter
 from pathlib import Path
 
 import xarray as xr
 
+# Allow running as a top-level script (``python scripts/data_sanity_checks.py``)
+# without installing the project.
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from version import ZARR_STORES_URI
+
 RED = "\033[91m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
 RESET = "\033[0m"
 
 
-def print_cli_error(message: str) -> None:
-    """Print colored error text for interactive CLI use."""
-    print(f"{RED}ERROR:{RESET} {message}", file=sys.stderr)
+STORE_NAMES = [
+    "CESM2-WACCM-MA_baseline.zarr",
+    "CESM2-WACCM-MA_historical.zarr",
+    "CESM2-WACCM-MA_1.5K-SAI.zarr",
+    "CESM2-WACCM-MA_1.0K-SAI.zarr",
+    "CESM2-WACCM-MA_0.5K-SAI.zarr",
+]
+
+# Per-group required variables. Mirrors the routing logic in
+# :func:`scripts.process_monthly_gauss._group_for_var` so the consumer-side
+# expectations stay in sync.
+REQUIRED_GROUPS: dict[str, list[str]] = {
+    "Mon/atmos_2d": ["TREFHT", "PRECT", "QFLX", "ICEFRAC"],
+    "Mon/atmos_2d_tasminmax": ["TREFHTMN", "TREFHTMX"],
+    "Mon/atmos_2d_derived": [
+        "TREFHT_above_35",
+        "TREFHT_above_40",
+        "TREFHT_below_0",
+        "PRECT_above_10",
+        "PRECT_above_20",
+    ],
+}
+
+# Canonical dims the consumer pipeline aligns on.
+EXPECTED_DIMS = {"member", "time", "lat", "lon"}
 
 
-def _is_under_excluded_dir(relative_path: str, exclude_top_level_dirs: frozenset[str]) -> bool:
-    """Return True if a POSIX-style relative path lives under one of the excluded top-level dirs."""
-    if not exclude_top_level_dirs:
-        return False
-    first_component = relative_path.split("/", 1)[0]
-    return first_component in exclude_top_level_dirs
-
-
-def parse_exclude_dirs(raw: str | None) -> frozenset[str]:
-    """Parse a comma-separated top-level subdirectory list into a frozenset."""
-    if not raw:
-        return frozenset()
-    return frozenset(item.strip() for item in raw.split(",") if item.strip())
-
-
-def list_relative_files(
-    root_dir: Path,
-    exclude_top_level_dirs: frozenset[str] = frozenset(),
-) -> list[str]:
-    """Return all file paths under root as sorted, POSIX-style relative paths.
-
-    Paths whose first component matches ``exclude_top_level_dirs`` are skipped so
-    downstream-processing subdirectories (e.g. daily-processing outputs written
-    under ``<data_dir>/TREFHT_above_40/``) don't pollute the raw-download scan.
-    """
-    return sorted(
-        rel
-        for rel in (
-            str(path.relative_to(root_dir)).replace("\\", "/")
-            for path in root_dir.rglob("*")
-            if path.is_file()
-        )
-        if not _is_under_excluded_dir(rel, exclude_top_level_dirs)
-    )
-
-
-def list_netcdf_paths_relative(
-    root_dir: Path,
-    exclude_top_level_dirs: frozenset[str] = frozenset(),
-) -> list[str]:
-    """Return relative paths of all ``*.nc`` files under ``root_dir`` (download / sanity scope).
-
-    See :func:`list_relative_files` for the ``exclude_top_level_dirs`` semantics.
-    """
-    root_dir = root_dir.resolve()
-    return sorted(
-        rel
-        for rel in (
-            str(path.relative_to(root_dir)).replace("\\", "/")
-            for path in root_dir.rglob("*.nc")
-            if path.is_file()
-        )
-        if not _is_under_excluded_dir(rel, exclude_top_level_dirs)
-    )
-
-
-def build_lens_expected_filenames() -> list[str]:
-    """Build expected CESM-LENS filenames downloaded by setup."""
-    members = ("001", "002", "003")
-    variables = ("TREFHTMN", "TREFHTMX")
-    time_ranges = ("185001-201412",)
-    frequency_prefix = "h0"
-
-    expected = []
-    for member in members:
-        for variable in variables:
-            for time_range in time_ranges:
-                expected.append(
-                    f"cesm2LE-historical-cmip6.{member}.{frequency_prefix}.{variable}.{time_range}.nc"
-                )
-    return sorted(expected)
-
-
-def parse_aws_s3_ls_recursive_output(output: str) -> list[str]:
-    """Parse `aws s3 ls --recursive` output into relative object paths."""
-    files = []
-    for line in output.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split(maxsplit=3)
-        if len(parts) == 4:
-            files.append(parts[3].replace("\\", "/"))
-    return sorted(files)
-
-
-def parse_s3_uri(uri: str) -> tuple[str, str]:
-    """
-    Parse an ``s3://`` URI into bucket name and object key prefix.
-
-    The prefix is normalized (no leading/trailing slashes). For
-    ``s3://my-bucket/{SIMULATOR_VERSION}/`` the prefix is ``{SIMULATOR_VERSION}``.
-    """
-    raw = uri.strip()
-    match = re.match(r"s3://([^/]+)/?(.*)", raw, flags=re.IGNORECASE)
-    if not match:
-        raise ValueError(f"Invalid S3 URI (expected s3://bucket/prefix): {uri!r}")
-    bucket = match.group(1)
-    prefix = match.group(2).strip("/")
-    return bucket, prefix
-
-
-def strip_s3_key_prefix_for_local_compare(key: str, object_prefix: str) -> str | None:
-    """
-    Strip the S3 URI prefix from a listing key so it matches local layout after ``aws s3 sync``.
-
-    ``aws s3 sync s3://bucket/{SIMULATOR_VERSION}/ dest/`` stores objects as
-    ``dest/<key without {SIMULATOR_VERSION}/>``.
-    Listing returns full keys like ``{SIMULATOR_VERSION}/path/file.nc``; this returns
-    ``path/file.nc``.
-
-    Returns ``None`` for pure prefix / directory-marker objects with no file path left.
-    """
-    normalized = key.replace("\\", "/").lstrip("/")
-    if not object_prefix:
-        return normalized or None
-    prefix = object_prefix.strip("/")
-    if not normalized:
-        return None
-    if normalized == prefix:
-        return None
-    if normalized.startswith(prefix + "/"):
-        stripped = normalized[len(prefix) + 1 :].lstrip("/")
-        return stripped or None
-    # Key outside listed prefix (should not happen for recursive ls under URI)
-    return normalized
-
-
-def list_bucket_files(bucket_uri: str) -> list[str]:
-    """List all object keys under an S3 URI using AWS CLI, paths relative to sync destination root."""
-    _, object_prefix = parse_s3_uri(bucket_uri)
-    result = subprocess.run(
-        ["aws", "s3", "ls", "--recursive", bucket_uri, "--no-sign-request"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    keys = parse_aws_s3_ls_recursive_output(result.stdout)
-    relative: list[str] = []
-    for key in keys:
-        stripped = strip_s3_key_prefix_for_local_compare(key, object_prefix)
-        if stripped:
-            relative.append(stripped)
-    return sorted(relative)
-
-
-def find_duplicate_basenames(relative_paths: list[str]) -> dict[str, int]:
-    """
-    Return basename -> count for basenames appearing more than once.
-
-    Intended for NetCDF download trees: pass only paths you care about (e.g.
-    from :func:`list_netcdf_paths_relative`) so unrelated files under the same
-    root are not counted.
-    """
-    counts = Counter(Path(path).name for path in relative_paths)
-    return {name: count for name, count in counts.items() if count > 1}
-
-
-def validate_expected_files(expected_paths: list[str], actual_paths: list[str]) -> list[str]:
-    """Return expected file paths that are missing from the local download."""
-    actual_set = set(actual_paths)
-    return sorted(path for path in expected_paths if path not in actual_set)
-
-
-def parse_required_variables(raw: str | None) -> list[str]:
-    """Parse a comma-separated variable list into normalized entries."""
-    if not raw:
-        return []
-    return [item.strip() for item in raw.split(",") if item.strip()]
-
-
-def extract_member_and_variable(filename: str) -> tuple[str, str] | None:
-    """Extract ensemble member and variable token from a simulator filename."""
-    member_match = re.search(r"\.(\d{3})\.", filename)
-    variable_match = re.search(r"\.h[01]\.([A-Za-z0-9_]+)\.", filename)
-    if not member_match or not variable_match:
-        return None
-    return member_match.group(1), variable_match.group(1)
-
-
-def build_variable_to_members_map(relative_paths: list[str]) -> dict[str, set[str]]:
-    """Build variable -> set(member_id) from downloaded filenames."""
-    var_to_members: dict[str, set[str]] = {}
-    for path in relative_paths:
-        parsed = extract_member_and_variable(Path(path).name)
-        if not parsed:
-            continue
-        member, variable = parsed
-        var_to_members.setdefault(variable, set()).add(member)
-    return var_to_members
-
-
-def validate_required_variables_and_members(
-    relative_paths: list[str], required_variables: list[str], min_ensemble_members: int
-) -> None:
-    """Validate required variables exist and each has minimum ensemble coverage."""
-    if not required_variables:
-        return
-
-    var_to_members = build_variable_to_members_map(relative_paths)
-    missing_variables = sorted(variable for variable in required_variables if variable not in var_to_members)
-    if missing_variables:
-        raise ValueError(
-            "Missing required variables in downloaded data: " + ", ".join(missing_variables)
-        )
-
-    insufficient = sorted(
-        (
-            variable,
-            len(var_to_members[variable]),
-            sorted(var_to_members[variable]),
-        )
-        for variable in required_variables
-        if len(var_to_members[variable]) < min_ensemble_members
-    )
-    if insufficient:
-        details = "; ".join(
-            f"{variable} has {count} member(s): {', '.join(members)}"
-            for variable, count, members in insufficient
-        )
-        raise ValueError(
-            f"Variables with fewer than {min_ensemble_members} ensemble members: {details}"
-        )
-
-
-def validate_netcdf_file_integrity(file_path: Path) -> None:
-    """
-    Validate that a NetCDF file is readable and not obviously corrupted.
-
-    This intentionally performs a lightweight integrity check: open the dataset
-    and access metadata (dims/data_vars) without loading full payload arrays.
-    It catches missing/unreadable/truncated headers and many obvious failures,
-    but may not detect payload-level corruption when headers remain intact.
-    That tradeoff keeps download-time sanity checks fast for large datasets.
-    """
-    with xr.open_dataset(file_path, decode_times=False) as ds:
-        _ = tuple(ds.dims.items())
-        _ = tuple(ds.data_vars.keys())
-
-
-def find_corrupted_netcdf_files(
-    data_dir: Path,
-    validator: Callable[[Path], None] = validate_netcdf_file_integrity,
-    exclude_top_level_dirs: frozenset[str] = frozenset(),
-) -> list[str]:
-    """Return relative paths of unreadable/corrupted NetCDF files.
-
-    See :func:`list_relative_files` for the ``exclude_top_level_dirs`` semantics.
-    """
-    corrupted: list[str] = []
-    for file_path in sorted(data_dir.rglob("*.nc")):
-        relative = str(file_path.relative_to(data_dir)).replace("\\", "/")
-        if _is_under_excluded_dir(relative, exclude_top_level_dirs):
-            continue
+def check_store(store_uri: str) -> list[str]:
+    """Return failure messages for one store. Empty list ⇒ all checks passed."""
+    failures: list[str] = []
+    for group, expected_vars in REQUIRED_GROUPS.items():
         try:
-            validator(file_path)
-        except Exception:
-            corrupted.append(relative)
-    return corrupted
-
-
-def run_download_sanity_checks(
-    data_dir: Path,
-    expected_bucket_uri: str | None = None,
-    include_lens_files: bool = False,
-    required_variables: list[str] | None = None,
-    min_ensemble_members: int = 3,
-    exclude_top_level_dirs: frozenset[str] = frozenset(),
-) -> None:
-    """Run all download-time sanity checks and raise on any violations.
-
-    ``exclude_top_level_dirs`` names top-level subdirectories under ``data_dir`` to skip
-    (e.g. downstream-processing outputs like ``TREFHT_above_40`` written by
-    ``process_daily_gauss.py``). Without this, rerunning setup after processing would
-    surface those files as duplicate NetCDF basenames.
-    """
-    data_dir = Path(data_dir).expanduser().resolve()
-    if not data_dir.exists():
-        raise FileNotFoundError(f"Data directory does not exist: {data_dir}")
-
-    actual_files = list_relative_files(data_dir, exclude_top_level_dirs)
-    netcdf_paths = list_netcdf_paths_relative(data_dir, exclude_top_level_dirs)
-    duplicates = find_duplicate_basenames(netcdf_paths)
-    if duplicates:
-        duplicate_summary = ", ".join(
-            f"{name} ({count} copies)" for name, count in sorted(duplicates.items())
-        )
-        raise ValueError(
-            f"Duplicate NetCDF basenames under {data_dir}: {duplicate_summary}"
-        )
-
-    expected_files: list[str] = []
-
-    if expected_bucket_uri:
-        expected_files.extend(list_bucket_files(expected_bucket_uri))
-
-    if include_lens_files:
-        expected_files.extend(build_lens_expected_filenames())
-
-    if expected_files:
-        missing_files = validate_expected_files(sorted(set(expected_files)), actual_files)
-        if missing_files:
-            sample = ", ".join(missing_files[:10])
-            more = "" if len(missing_files) <= 10 else f" ... (+{len(missing_files) - 10} more)"
-            raise ValueError(
-                f"Missing {len(missing_files)} expected files in {data_dir}: {sample}{more}"
+            ds = xr.open_zarr(store_uri, group=group, consolidated=True)
+        except Exception as exc:
+            failures.append(
+                f"  [{group}] open failed — {type(exc).__name__}: {exc}"
             )
+            continue
+        for var in expected_vars:
+            if var not in ds.data_vars:
+                failures.append(f"  [{group}] missing variable: {var}")
+                continue
+            da = ds[var]
+            missing_dims = EXPECTED_DIMS - set(da.dims)
+            if missing_dims:
+                failures.append(
+                    f"  [{group}/{var}] dims {da.dims} missing "
+                    f"{sorted(missing_dims)}"
+                )
+                continue
+            if da.sizes["member"] == 0:
+                failures.append(f"  [{group}/{var}] empty member dim")
+            if da.sizes["time"] == 0:
+                failures.append(f"  [{group}/{var}] empty time dim")
+    return failures
 
-    validate_required_variables_and_members(
-        netcdf_paths,
-        required_variables=required_variables or [],
-        min_ensemble_members=min_ensemble_members,
-    )
 
-    corrupted_files = find_corrupted_netcdf_files(
-        data_dir, exclude_top_level_dirs=exclude_top_level_dirs
-    )
-    if corrupted_files:
-        sample = ", ".join(corrupted_files[:10])
-        more = "" if len(corrupted_files) <= 10 else f" ... (+{len(corrupted_files) - 10} more)"
-        raise ValueError(
-            f"Detected {len(corrupted_files)} corrupted/unreadable NetCDF files in {data_dir}: "
-            f"{sample}{more}"
-        )
+def run_checks(zarr_uri: str = ZARR_STORES_URI) -> int:
+    """Iterate the 5 stores and check each. Returns the count of failing stores."""
+    print(f"Zarr root: {zarr_uri}\n")
+    failed_stores = 0
+    for store_name in STORE_NAMES:
+        store_uri = f"{zarr_uri}/{store_name}"
+        print(f"{store_name}:")
+        failures = check_store(store_uri)
+        if failures:
+            failed_stores += 1
+            for msg in failures:
+                print(f"{RED}{msg}{RESET}")
+        else:
+            print(f"  {GREEN}OK{RESET}")
+        print()
+    return failed_stores
 
 
 def main() -> None:
-    """CLI entry point: parse args, run :func:`run_download_sanity_checks`, exit non-zero on failure.
-
-    On a sanity-check failure (``ValueError`` or ``FileNotFoundError``) the error is rendered
-    in red via :func:`print_cli_error` and the process exits with status ``2`` so callers
-    (e.g. ``setup.sh``) can distinguish "checks failed" from generic Python errors.
-    """
-    parser = argparse.ArgumentParser(description="Sanity checks for downloaded raw data files.")
-    parser.add_argument("--data_dir", required=True, help="Local raw data directory.")
-    parser.add_argument(
-        "--expected_bucket_uri",
-        default=None,
-        help="Optional S3 URI to verify expected files against.",
+    parser = argparse.ArgumentParser(
+        description="Sanity-check the Zarr training-data stores."
     )
     parser.add_argument(
-        "--include_lens_files",
-        action="store_true",
-        help="Include expected CESM LENS files in expected set.",
+        "--zarr_uri",
+        default=ZARR_STORES_URI,
+        help=f"Override the Zarr store root (default: {ZARR_STORES_URI}).",
+    )
+    # Legacy CLI flags from the pre-Zarr file-tree world. Accepted but ignored
+    # so an older ``setup/steps.sh`` invocation doesn't crash with
+    # ``unrecognized arguments``.
+    parser.add_argument("--data_dir", default=None, help="Ignored (legacy).")
+    parser.add_argument(
+        "--expected_bucket_uri", default=None, help="Ignored (legacy)."
     )
     parser.add_argument(
-        "--required_variables",
-        default=None,
-        help="Comma-separated list of required variable names (e.g. TREFHT,PRECT,ICEFRAC).",
+        "--include_lens_files", action="store_true", help="Ignored (legacy)."
     )
     parser.add_argument(
-        "--min_ensemble_members",
-        type=int,
-        default=3,
-        help="Minimum number of ensemble members required per required variable.",
+        "--required_variables", default=None, help="Ignored (legacy)."
     )
     parser.add_argument(
-        "--exclude_dirs",
-        default=None,
-        help=(
-            "Comma-separated top-level subdirectory names under --data_dir to skip "
-            "(e.g. downstream-processing outputs like TREFHT_above_40)."
-        ),
+        "--min_ensemble_members", type=int, default=3, help="Ignored (legacy)."
     )
     args = parser.parse_args()
 
-    try:
-        run_download_sanity_checks(
-            data_dir=Path(args.data_dir),
-            expected_bucket_uri=args.expected_bucket_uri,
-            include_lens_files=args.include_lens_files,
-            required_variables=parse_required_variables(args.required_variables),
-            min_ensemble_members=args.min_ensemble_members,
-            exclude_top_level_dirs=parse_exclude_dirs(args.exclude_dirs),
+    failed = run_checks(args.zarr_uri)
+    if failed:
+        print(
+            f"{RED}Sanity checks failed for {failed} store(s).{RESET}",
+            file=sys.stderr,
         )
-        print("Download sanity checks passed.")
-    except (ValueError, FileNotFoundError) as exc:
-        print_cli_error(str(exc))
-        raise SystemExit(2) from exc
+        raise SystemExit(2)
+    print(f"{GREEN}All sanity checks passed.{RESET}")
 
 
 if __name__ == "__main__":

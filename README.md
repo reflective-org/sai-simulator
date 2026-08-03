@@ -161,39 +161,31 @@ The SAI Simulator requires the ESMF (Earth System Modeling Framework) library to
    python -m pip install .
    ```
 
-### B. Data Download
+### B. Verify Data Access
 
-Download the necessary data from AWS S3 bucket (requires around 140GB of disk space):
+The training data lives in per-experiment Zarr stores hosted on a public
+Cloudflare R2 bucket (`reflective-data-store/simulator-inputs/`), exposed
+anonymously over HTTPS via the bucket's `r2.dev` subdomain — see
+`version.ZARR_STORES_URI`. The processing pipeline reads them lazily, so
+there is nothing to pre-download and no `data/raw/` directory to populate.
 
-1. Create a data repository:
-   ```bash
-   mkdir -p data/raw
-   ```
-2. Download the data (takes about 30 minutes to 2 hours based on your internet speed):
-   ```bash
-   aws s3 sync s3://reflective-simulator-bucket/v1.3.0/ ./data/raw/ --no-sign-request
-   ```
-3. Download the LENS NCAR data for minimum and maximum temperature (please note that the `--overwrite` flag is optional):
-   ```bash
-   sh scripts/run_download_CESM_LENS.sh TREFHTMX monthly data/raw 001 002 003 --overwrite
-   sh scripts/run_download_CESM_LENS.sh TREFHTMN monthly data/raw 001 002 003 --overwrite
-   ```
+Verify the stores are reachable and have the expected schema before
+processing:
+
+```bash
+python scripts/data_sanity_checks.py
+```
+
+A few-second metadata-only smoke test; exits non-zero if any store is
+unreachable or missing an expected variable.
 
 ### C. Data Processing
 
-1. Process the daily data to create monthly values. You can process all the daily data (both `tas` and `pr`) using:
-
-   ```bash
-   sh scripts/process_all_daily.sh data/raw
-   ```
-
-   Or you can process the daily data for a specific variable (e.g. `tas`) using:
-
-   ```bash
-   python scripts/process_daily_gauss.py --var tas --data_dir data/raw
-   ```
-
-2. Process the monthly data to create annual values ready for model fitting. You can process all the monthly data using:
+Process the monthly Zarr stores into per-experiment annual NetCDF files ready
+for model fitting. The Zarr stores already carry the precomputed
+exposure-count fields (`TREFHT_above_*`, `PRECT_above_*`) under
+`Mon/atmos_2d_derived`, so there is no separate daily-processing step on the
+consumer side. Run all variables with:
 
    ```bash
    sh scripts/process_all_monthly.sh data/raw data/processed
@@ -205,7 +197,7 @@ Download the necessary data from AWS S3 bucket (requires around 140GB of disk sp
    python scripts/process_monthly_gauss.py  --var tas --data_dir data/raw --output_dir data/processed
    ```
 
-3. Calculate model internal variability for sea ice by running the following command:
+   Then calculate model internal variability for sea ice:
 
    ```bash
    python scripts/variability.py icefrac ./data/processed ./data/models

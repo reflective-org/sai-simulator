@@ -20,12 +20,12 @@ import pandas as pd
 from tqdm import tqdm
 from pathlib import Path
 from collections import defaultdict
-import re
 
 import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from backend.utils import open_xarray_datasets, save_processed_data
+from version import ZARR_STORES_URI
 from scripts.preprocessing_sanity import (
     SanityCheckError,
     build_monthly_cell_bounds,
@@ -41,15 +41,6 @@ from scripts.variability import process_geojson_variability
 
 
 # --- Configuration --- #
-# Define patterns once for efficiency
-PATTERNS = {
-    # Regex : Experiment Name
-    r"hist": "historical",
-    r"SSP.*DEFAULT": "1.5",
-    r"SSP.*LOWER-0.5": "1.0",
-    r"SSP.*LOWER-1.0": "0.5",
-    r"SSP": "baseline" # Catch-all for SSP if other tags missing
-}
 
 # Define unit conversion factors here for easy maintenance
 UNIT_SCALERS = {
@@ -85,6 +76,30 @@ var2esm_var = {
         "icefrac": "ICEFRAC",
     }
 
+# Per-experiment Zarr stores produced by zarrification_mkii.ipynb. Each tuple
+# is (store URL, experiment label). Labels match what the downstream pipeline
+# expects in validators, output filenames, and merge_historical_and_baseline.
+EXPERIMENTS = [
+    (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_baseline.zarr",   "baseline"),
+    (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_historical.zarr", "historical"),
+    (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_1.5K-SAI.zarr",   "1.5"),
+    (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_1.0K-SAI.zarr",   "1.0"),
+    (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_0.5K-SAI.zarr",   "0.5"),
+]
+
+# Zarr group per variable family: cumulative exposure counts live under
+# atmos_2d_derived; daily extremes under atmos_2d_tasminmax; everything else
+# in the main atmos_2d group.
+_VAR_TO_GROUP = {
+    "tasmin":       "Mon/atmos_2d_tasminmax",
+    "tasmax":       "Mon/atmos_2d_tasminmax",
+    "tas_above_35": "Mon/atmos_2d_derived",
+    "tas_above_40": "Mon/atmos_2d_derived",
+    "tas_below_0":  "Mon/atmos_2d_derived",
+    "pr_above_10":  "Mon/atmos_2d_derived",
+    "pr_above_20":  "Mon/atmos_2d_derived",
+}
+
 # --- Helper Functions --- #
 
 
@@ -117,192 +132,62 @@ def is_cumulative(var_name: str) -> bool:
     """
     return "above" in var_name or "below" in var_name
 
-def identify_file(filename: str) -> tuple[str | None, str | None]:
-    """Parses a filename to find member ID and experiment type."""
-    
-    # Extract Member ID
-    member_match = re.search(r'\.(\d{3})\.', filename)
-    if not member_match:
-        return None, None
-    member = member_match.group(1)
+def _group_for_var(var: str) -> str:
+    """Return the Zarr group path for ``var``.
 
-    # Identify Experiment
-    # Iterate through patterns; return the first one that matches
-    for pattern, exp_name in PATTERNS.items():
-        if re.search(pattern, filename, re.IGNORECASE):
-            return member, exp_name
-            
-    return member, None
-
-
-def process_file(path: Path, var_name: str, exp: str) -> xr.DataArray | None:
+    Variable families live in different subgroups of each store: cumulative
+    exposure counts (``tas_above_*``, ``pr_above_*``, ``tas_below_*``) in
+    ``Mon/atmos_2d_derived``; sub-daily extremes (``tasmin``/``tasmax``) in
+    ``Mon/atmos_2d_tasminmax``; the main monthly fields in ``Mon/atmos_2d``.
     """
-    Loads a file, slices time, converts units, and applies masks.
-    Returns the processed DataArray or None if error.
+    return _VAR_TO_GROUP.get(var, "Mon/atmos_2d")
+
+
+# Attrs that the Zarr stores carry (xarray reads them straight into .attrs)
+# but that NetCDF treats as reserved or as a zarr-only convention. Leaving
+# them in place causes ``to_netcdf`` to fail with
+# ``NetCDF: String match to name in use`` because ``_FillValue`` collides
+# with xarray's own encoding-driven handling.
+_NETCDF_RESERVED_ATTRS = frozenset({"_FillValue", "_ARRAY_DIMENSIONS"})
+
+
+def _process_member_data(
+    x: xr.DataArray, esm_var: str, exp: str
+) -> xr.DataArray:
+    """Apply per-member processing — time slice, ICEFRAC NH-September mask,
+    unit scaling, ``height`` drop, cftime→datetime64, NetCDF-reserved-attr
+    strip — to one DataArray.
+
+    Used by the Zarr-loading path in :func:`process_monthly`; callers slice
+    ``ds[esm_var].sel(member=...)`` and pass the resulting DataArray here.
+    Mirrors the per-file branch of :func:`process_file` so downstream
+    aggregation and validation see the same shape regardless of source.
     """
-    try:
-        # Load Data
-        ds = open_xarray_datasets(path, decode_times=True)
-        x = ds[var_name]
+    time_range = slice("1850", "2014") if "historical" in exp else slice("2015", "2099")
+    x = x.sel(time=time_range)
 
-        # Time Slicing
-        # Select date range based on experiment type
-        time_range = slice("1850", "2014") if "historical" in exp else slice("2015", "2099")
-        x = x.sel(time=time_range)
+    if esm_var == "ICEFRAC":
+        is_sept_north = (x.lat > 0) & (x.time.dt.month == 9)
+        x = x.where(is_sept_north, np.nan)
 
-        # Special Logic: ICEFRAC (Northern Hemisphere September)
-        if var_name == "ICEFRAC":
-            # Mask data: Keep North & Sept, set others to NaN
-            # Note: drop=False maintains the original time index shape
-            is_sept_north = (x.lat > 0) & (x.time.dt.month == 9)
-            x = x.where(is_sept_north, np.nan)
+    if esm_var in UNIT_SCALERS:
+        x = x * UNIT_SCALERS[esm_var]
 
-        # Unit Conversion
-        if var_name in UNIT_SCALERS:
-            x = x * UNIT_SCALERS[var_name]
+    if "height" in x.coords:
+        x = x.drop_vars("height")
 
-        # Cleanup
-        if 'height' in x.coords:
-            x = x.drop_vars('height')
-            
-        # Standardize Time Format (cftime -> datetime64)
-        # Using a safe cast that handles the 'noleap' calendar within pandas range
-        if x.indexes['time'].dtype == 'O': # Check if object/cftime
-            x['time'] = x['time'].values.astype("datetime64[s]").astype("datetime64[ns]")
-             
-        return x
+    if x.indexes["time"].dtype == "O":
+        x["time"] = x["time"].values.astype("datetime64[s]").astype("datetime64[ns]")
 
-    except Exception as e:
-        print(f"\n\033[91mError processing {path.name}: {e}\033[0m")
-        return None
+    x.attrs = {k: v for k, v in x.attrs.items() if k not in _NETCDF_RESERVED_ATTRS}
+    for coord_name in x.coords:
+        x[coord_name].attrs = {
+            k: v
+            for k, v in x[coord_name].attrs.items()
+            if k not in _NETCDF_RESERVED_ATTRS
+        }
 
-
-def pair_precc_precl_files(
-    data_dir: Path,
-    prect_member2paths: dict[str, list[tuple[Path, Path]]],
-) -> dict[str, list[tuple[Path, Path]]]:
-    """
-    Pairs PRECC and PRECL files from data_dir and populates prect_member2paths.
-    
-    Args:
-        data_dir (Path): The directory containing the NetCDF files.
-        prect_member2paths (dict): A dictionary (preferably defaultdict(list)) to store the pairs.
-                                   Structure: {member_id: [(path_c, path_l), ...]}
-    """
-    print(f"Scanning {data_dir} for file pairs...")
-
-    # 1. Gather files and create "Canonical Keys"
-    # The key is the filename with the variable removed, e.g., 'case.h0..2000-01.nc'
-    files_c = {f.name.replace('PRECC', ''): f for f in data_dir.glob("*.h0.PRECC*.nc")}
-    files_l = {f.name.replace('PRECL', ''): f for f in data_dir.glob("*.h0.PRECL*.nc")}
-
-    # 2. Use Sets to find matches and orphans
-    keys_c = set(files_c.keys())
-    keys_l = set(files_l.keys())
-
-    valid_keys = sorted(list(keys_c & keys_l)) # Intersection (Both exist)
-    missing_l = keys_c - keys_l                # In C but not L
-    missing_c = keys_l - keys_c                # In L but not C
-
-    # 3. Process the Valid Pairs
-    pattern_member = re.compile(r'\.(\d{3})\.')
-    
-    for key in valid_keys:
-        file_c = files_c[key]
-        file_l = files_l[key]
-        
-        # Extract member ID
-        match = pattern_member.search(file_c.name)
-        if match:
-            member = match.group(1)
-            # Append tuple pair
-            prect_member2paths[member].append((file_c, file_l))
-        else:
-            print(f"Skipping {file_c.name}: Could not extract member ID.")
-
-    # 4. Report Results
-    print("-" * 40)
-    print("Processing Complete.")
-    print(f"  Valid Pairs Found: {len(valid_keys)}")
-    
-    if missing_l:
-        print(f"\n  [WARNING] {len(missing_l)} files have PRECC but are MISSING PRECL:")
-        for key in sorted(list(missing_l)):
-            print(f"    - {files_c[key].name}")
-
-    if missing_c:
-        print(f"\n  [WARNING] {len(missing_c)} files have PRECL but are MISSING PRECC:")
-        for key in sorted(list(missing_c)):
-            print(f"    - {files_l[key].name}")
-    print("-" * 40)
-
-    return prect_member2paths
-
-
-def process_and_export_prect_per_file(
-    prect_member2paths: dict[str, list[tuple[Path, Path]]],
-    output_dir: str | Path,
-    overwrite: bool = False,
-) -> None:
-    """
-    Reads pairs of PRECC/PRECL files, sums them to PRECT,
-    and exports a SEPARATE file for each pair immediately.
-    If overwrite is False, skip export if file already exists.
-    """
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    
-    for member, file_pairs in prect_member2paths.items():
-        print(f"Processing Member: {member} ({len(file_pairs)} pairs)")
-        
-        for file_c, file_l in file_pairs:
-            try:
-                # Generate Filename before processing, so we can check for existence
-                new_name = file_c.name.replace('PRECC', 'PRECT')
-                final_out_path = output_path / new_name
-
-                if final_out_path.exists() and not overwrite:
-                    print(f"  Skipping: {final_out_path.name} (already exists, use overwrite=True to replace)")
-                    continue
-
-                # Open individual datasets
-                ds_c = open_xarray_datasets(file_c)
-                ds_l = open_xarray_datasets(file_l)
-                
-                # Calculate PRECT
-                prect_sum = ds_c['PRECC'] + ds_l['PRECL']
-
-                # Float32 Optimization
-                if prect_sum.dtype == 'float64':
-                    prect_sum = prect_sum.astype('float32')
-
-                # Construct Output Dataset
-                ds_total = ds_c.copy()
-                ds_total['PRECT'] = prect_sum
-                
-                # Update attributes
-                ds_total['PRECT'].attrs = ds_c['PRECC'].attrs
-                ds_total['PRECT'].attrs['long_name'] = 'Total Precipitation (PRECC + PRECL)'
-                
-                # Drop original variables
-                ds_total = ds_total.drop_vars(['PRECC', 'PRECL'], errors='ignore')
-
-                # Export
-                print(f"  Exporting: {final_out_path.name}")
-                
-                encoding = {var: {'zlib': True, 'complevel': 5} for var in ds_total.data_vars}
-                ds_total.to_netcdf(final_out_path, encoding=encoding)
-                
-                # Cleanup immediate memory
-                ds_total.close()
-                ds_c.close()
-                ds_l.close()
-                
-            except Exception as e:
-                print(f"  Error processing pair {file_c.name}: {e}")
-                continue
-
-    print("\nAll individual file exports complete.")
+    return x
 
 
 def get_yearly_aggregate(
@@ -681,8 +566,8 @@ def compute_and_save_grid_variability(
 # --- Main Function --- #
 def process_monthly(
     var: str,
-    data_dir: str | Path,
-    output_dir: str | Path,
+    data_dir: str | Path = "",
+    output_dir: str | Path = "data/processed",
     overwrite: bool = False,
 ) -> None:
     """
@@ -690,10 +575,13 @@ def process_monthly(
     (it does not calculate model internal variability for sea ice. It is done in variability.py)
 
     Args:
-        var: Variable to process
-        data_dir: Directory containing Simulator data
-        output_dir: Directory to save processed data
-        overwrite: Whether to overwrite existing files
+        var: Variable to process.
+        data_dir: Unused. Inputs come from the Zarr stores at
+            :data:`version.ZARR_STORES_URI`. The parameter is kept so the
+            existing ``scripts/process_all_monthly.sh`` invocation keeps
+            working unchanged.
+        output_dir: Directory to save processed data.
+        overwrite: Whether to overwrite existing files.
     """
     print(f"var: {var}")
     print("="*100)
@@ -702,67 +590,49 @@ def process_monthly(
     if var not in var2esm_var:
         raise ValueError(f"\033[91mvar must be one of {list(var2esm_var.keys())}\033[0m")
 
-    data_dir = Path(data_dir)
-    if not data_dir.exists():
-        raise FileNotFoundError(f"\033[91mData directory does not exist: {data_dir}\033[0m")
-
     output_dir = Path(output_dir) / var
     output_dir.mkdir(exist_ok=True, parents=True)
 
     esm_var = var2esm_var[var]
     print(f"--- Processing {var} (Variable: {esm_var}) ---")
 
-    # Special Pre-processing (PRECT)
-    # If PRECT, we must generate the files first so they can be "found" in the next step.
-    if esm_var == "PRECT":
-        prect_out_dir = data_dir / "PRECT"
-        # Check if we actually need to generate them (skip if exists and not overwrite)
-        # For now, assuming we always run the pairing check as it's fast
-        print(">> Pairing PRECC and PRECL files...")
-        prect_member2paths = defaultdict(list)
-        pair_precc_precl_files(data_dir, prect_member2paths)
-        # for member, file_pairs in prect_member2paths.items():
-        #     for file_c, file_l in file_pairs:
-        #         print(f" >>> file_c: {file_c},\n <<< file_l: {file_l}")
-        
-        print(f">> Exporting unified PRECT files to {prect_out_dir}...")
-        process_and_export_prect_per_file(prect_member2paths, prect_out_dir, overwrite)
-        print(">> PRECT generation complete.")
+    # Loading from Zarr stores. Replaces the prior PRECT PRECC+PRECL pairing
+    # step (PRECT is precomputed in the stores) and the per-file glob / regex
+    # loop. Each store carries all three members for one experiment under
+    # the appropriate Mon/atmos_2d* subgroup; one DataArray lands per
+    # (experiment, member) in exp2member2data.
+    print(">> Loading Zarr stores …")
+    group = _group_for_var(var)
+    exp2member2data: dict[str, dict[str, list[xr.DataArray]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for zarr_url, exp_label in EXPERIMENTS:
+        print(f"   {zarr_url} (group={group})")
+        try:
+            ds = open_xarray_datasets(zarr_url, group=group)
+        except Exception as e:
+            print(f"\033[91m   failed to open: {e}\033[0m")
+            continue
 
-    # Path Gathering
-    print(">> Scanning for files...")
-    search_pattern = f"*.h0.{esm_var}.*.nc"
-    # Search in main dir AND subdirectory (common for PRECT or organized data)
-    cdf_paths = sorted(data_dir.glob(search_pattern)) + \
-                sorted((data_dir / esm_var).glob(search_pattern))
-    
-    if not cdf_paths:
-        print(f"\033[93mWarning: No files found for {esm_var}\033[0m")
+        if esm_var not in ds.data_vars:
+            print(f"\033[93m   {esm_var} not present in this store/group — skipping\033[0m")
+            continue
+
+        for m_value in ds["member"].values:
+            m = str(m_value)
+            member_da = ds[esm_var].sel(member=m_value).drop_vars(
+                "member", errors="ignore"
+            )
+            try:
+                processed = _process_member_data(member_da, esm_var, exp_label)
+            except Exception as e:
+                print(f"\033[91m   error processing {exp_label}/{m}: {e}\033[0m")
+                continue
+            exp2member2data[exp_label][m].append(processed)
+
+    if not exp2member2data:
+        print(f"\033[91mNo data loaded for {var} — nothing to process.\033[0m")
         return
-    
-    print(f"   Found {len(cdf_paths)} files.")
-
-    # Loading & Parsing (Member/Exp Organization)
-    exp2member2data = defaultdict(lambda: defaultdict(list))
-    exp2member2paths = defaultdict(lambda: defaultdict(list))
-    
-    for cdf_path in tqdm(cdf_paths, desc="Loading Files"):
-        member, exp = identify_file(cdf_path.name)
-        
-        if not member:
-            print(f"\033[91mSkipping {cdf_path.name}: No member ID found.\033[0m")
-            continue
-        if not exp:
-            print(f"\033[91mSkipping {cdf_path.name}: Unknown experiment.\033[0m")
-            continue
-
-        # Use the cleaner process_file helper from previous steps
-        x_processed = process_file(cdf_path, esm_var, exp)
-        
-        if x_processed is not None:
-            exp2member2data[exp][member].append(x_processed)
-            exp2member2paths[exp][member].append(cdf_path)
-            
 
     # Combination & Aggregation
     print(">> Combining & Aggregating...")
