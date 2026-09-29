@@ -112,3 +112,25 @@ def get_grid_level_p_values(
         grid_level_p_values = clip_to_land(data_dir, decadal_grid_level_p_values)
 
     return grid_level_p_values
+
+
+def _significance_reference_tag() -> str:
+    """Filename tag naming the period p-values are tested against (the display baseline)."""
+    return f"ref{DISPLAY_BASELINE_START}_{DISPLAY_BASELINE_END}"
+
+
+def no_sai_p_values_cache_path(cache_dir: Path, simple_ssp: str, var: str) -> Path:
+    """Cache path for the no-SAI grid-level p-values of ``var`` under ``simple_ssp``.
+
+    The significance reference period is part of the filename, so p-values computed against a
+    different baseline are never served from (or overwrite) a stale file.
+    """
+    return cache_dir / f"{simple_ssp}_regional_no_sai_p_values_{var}_{_significance_reference_tag()}.nc"
+
+
+def sai_p_values_cache_path(cache_dir: Path, simple_ssp: str, temp_target: float, var: str) -> Path:
+    """Cache path for the with-SAI grid-level p-values; see :func:`no_sai_p_values_cache_path`."""
+    return (
+        cache_dir
+        / f"{simple_ssp}_{temp_target:.1f}_regional_sai_p_values_{var}_{_significance_reference_tag()}.nc"
+    )

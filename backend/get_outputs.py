@@ -37,7 +37,7 @@ from .constants import *
 from .historical import get_historical_model, get_historical_obs_global_mean_temp, get_historical_obs_sea_ice_extent
 from .baseline import get_regional_map, validate_cache_dir
 from .delta import get_regional_delta
-from .p_values import get_grid_level_p_values
+from .p_values import get_grid_level_p_values, sai_p_values_cache_path
 from .population import get_population_data
 from .variable import get_variable_regional_delta
 from .utils import get_interpolator, create_mask, regional_aggregation, apply_constraints, clip_to_land, apply_ramp_up_factor
@@ -98,7 +98,9 @@ class _VariableFields:
     regional_map: xr.DataArray
     regional_no_sai_p_values: xr.DataArray | None
     historical_model: xr.DataArray | None
-    historical_rebase: xr.DataArray | None
+    historical_rebase: xr.DataArray | None  # 1850-1900 mean (pre-industrial frame; used to undo the rebase)
+    significance_reference: xr.DataArray | None  # current-climate mean used as the t-test reference
+    display_offset: xr.DataArray | None  # current-climate mean expressed vs 1850-1900; shifts displayed anomalies
     area: xr.DataArray | None  # Cell areas, only populated when var == "icefrac"
     # Per-climate-model sigmoid predictions (model, time, lat, lon), only
     # populated when var == "icefrac"; regional_map is their across-model mean.
@@ -150,6 +152,14 @@ def _load_variable_fields(
 
     The historical model is rebased to the 1850–1900 mean for ``tas/tasmin/tasmax/pr/p-e`` so
     downstream code can reason in anomalies; for other variables it is returned as-is.
+
+    Two extra references are derived from the (un-rebased) historical model when present:
+    ``significance_reference`` (the current-climate ``DISPLAY_BASELINE`` mean, used as the
+    t-test reference so hatching means "different from today's climate") and ``display_offset``
+    (that same current-climate mean expressed vs 1850-1900, i.e. ``significance_reference -
+    historical_rebase``), which the caller subtracts from the pre-industrial-framed anomalies to
+    present the map against the current-climate baseline. Only the map moves; the time-series and
+    distribution outputs stay in the pre-industrial frame.
     """
     is_icefrac = var == "icefrac"
     area = get_area(data_dir) if is_icefrac else None
@@ -171,8 +181,16 @@ def _load_variable_fields(
 
     historical_model = get_historical_model(var, data_dir, cache_dir)
     historical_rebase = None
+    significance_reference = None
+    display_offset = None
     if historical_model is not None:
-        historical_rebase = historical_model.sel(time=slice(1850, 1900)).mean('time')
+        historical_rebase = historical_model.sel(
+            time=slice(PREINDUSTRIAL_START, PREINDUSTRIAL_END)
+        ).mean('time')
+        significance_reference = historical_model.sel(
+            time=slice(DISPLAY_BASELINE_START, DISPLAY_BASELINE_END)
+        ).mean('time')
+        display_offset = significance_reference - historical_rebase
         if var in ["tas", "tasmin", "tasmax", "pr", "p-e"]:
             historical_model = historical_model - historical_rebase
 
@@ -181,6 +199,8 @@ def _load_variable_fields(
         regional_no_sai_p_values=regional_no_sai_p_values,
         historical_model=historical_model,
         historical_rebase=historical_rebase,
+        significance_reference=significance_reference,
+        display_offset=display_offset,
         area=area,
         icefrac_per_model=icefrac_per_model,
     )
@@ -232,7 +252,7 @@ def _compute_regional_delta(
         icefrac_with_sai = icefrac_with_sai_per_model.mean(dim='model')
         regional_delta = icefrac_with_sai - fields.regional_map
         regional_no_sai_p_values = get_grid_level_p_values(
-            var, data_dir, fields.historical_rebase, fields.regional_map
+            var, data_dir, fields.significance_reference, fields.regional_map
         )
     else:
         if variable_injection is None:
@@ -282,16 +302,16 @@ def _compute_sai_p_values(
 
     For temperature/precipitation variables the regional map is rebased before comparison
     (``map + delta + rebase``); for icefrac the absolute ``icefrac_with_sai`` is used directly;
-    other variables compare ``map + delta`` against ``historical_rebase``.
+    other variables compare ``map + delta`` against the reference. In every case the t-test
+    reference is the current-climate ``significance_reference`` (1995-2014 mean), so significance
+    is judged against today's climate rather than pre-industrial.
     """
     if fields.historical_model is None:
         return None
 
     if variable_injection is None:
         validate_cache_dir(cache_dir)
-        regional_p_cache_path = (
-            cache_dir / f"{simple_ssp}_{temp_target:.1f}_regional_sai_p_values_{var}.nc"
-        )
+        regional_p_cache_path = sai_p_values_cache_path(cache_dir, simple_ssp, temp_target, var)
         regional_p_cache_path_exists = regional_p_cache_path.exists()
     else:
         regional_p_cache_path = None
@@ -302,18 +322,19 @@ def _compute_sai_p_values(
         with xr.open_dataarray(regional_p_cache_path) as da:
             regional_sai_p_values = da.load()
     elif var in ["tas", "tasmin", "tasmax", "pr", "p-e"]:
-        # The regional map is already rebased; add the historical rebase back before comparing.
+        # The regional map is already rebased; add the historical rebase back to recover the
+        # absolute field, then compare against the current-climate reference.
         regional_sai_p_values = get_grid_level_p_values(
-            var, data_dir, fields.historical_rebase,
+            var, data_dir, fields.significance_reference,
             fields.regional_map + regional_delta + fields.historical_rebase,
         )
     elif var == "icefrac":
         regional_sai_p_values = get_grid_level_p_values(
-            var, data_dir, fields.historical_rebase, icefrac_with_sai
+            var, data_dir, fields.significance_reference, icefrac_with_sai
         )
     else:
         regional_sai_p_values = get_grid_level_p_values(
-            var, data_dir, fields.historical_rebase,
+            var, data_dir, fields.significance_reference,
             fields.regional_map + regional_delta,
         )
 
@@ -802,9 +823,19 @@ def get_outputs(
             decade_end_year=decade_end_year,
         )
 
+        # tas/tasmin/tasmax/pr/p-e maps are pre-industrial anomalies; re-express them against the
+        # current-climate baseline for display by subtracting display_offset (recent mean vs
+        # 1850-1900). Only the map moves: the time-series and distribution outputs below stay
+        # relative to pre-industrial. The SAI delta is a change, so it is left untouched and both the no-SAI map
+        # (regional_mean) and the with-SAI map (regional_mean + regional_delta_mean) shift together.
+        is_display_anomaly = var in ["tas", "tasmin", "tasmax", "pr", "p-e"]
+        display_offset = fields.display_offset if is_display_anomaly else None
+
         regional_mean = fields.regional_map.sel(
             time=slice(decade_start_year, decade_end_year)
         ).mean('time')
+        if display_offset is not None:
+            regional_mean = regional_mean - display_offset
         regional_delta_mean = regional_delta.sel(
             time=slice(decade_start_year, decade_end_year)
         ).mean('time')
@@ -1257,7 +1288,11 @@ def _compute_params_hash(
     Otherwise the injection array is hashed via :func:`_hash_variable_injection` and
     used in place of the analytic params, so two cases that differ only in injection
     produce different keys.
+
+    The display baseline period is folded into the key for both paths so cached map tiles are
+    not reused across deployments that present anomalies against a different baseline.
     """
+    display_baseline = f"base_{DISPLAY_BASELINE_START}_{DISPLAY_BASELINE_END}"
     if variable_injection is None:
         params = [
             ssp_scenario,
@@ -1266,6 +1301,7 @@ def _compute_params_hash(
             decade_end_year,
             start_year,
             ramp_up,
+            display_baseline,
         ]
     else:
         variable_hash = _hash_variable_injection(variable_injection)
@@ -1274,6 +1310,7 @@ def _compute_params_hash(
             decade_start_year,
             decade_end_year,
             f"vinj_{variable_hash}",
+            display_baseline,
         ]
     params_str = "_".join(map(str, params))
     return hashlib.md5(params_str.encode()).hexdigest()[:10]

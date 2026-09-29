@@ -77,7 +77,11 @@ def generate_gradio_plots(
     for var in vars:
 
         var_plots = {}
+        # Only the maps are shown against the current-climate baseline (1995-2014); the time-series
+        # and PDF stay relative to pre-industrial. Count/fraction variables stay absolute.
+        baseline_label = f"Δ from {DISPLAY_BASELINE_START}–{DISPLAY_BASELINE_END}"
         title, simple_title, cmap, boundary_color = VAR2INFO[var]
+        is_anomaly_var = var in ["tas", "tasmin", "tasmax", "pr", "p-e"]
         if var in ["tasmin", "tasmax"]:
             title += " (Delta from PI)"
 
@@ -168,13 +172,13 @@ def generate_gradio_plots(
                     transform=ccrs.PlateCarree()
                 )
 
-        regional_axs_title = f'No SAI {simple_title} Delta from PI ({ssp_scenario}) from {decade_start_year} to {decade_end_year}'
-        delta_axs_title = f'SAI {simple_title} Delta from PI from {decade_start_year} to {decade_end_year}'
-        sai_axs_title = f'SAI {simple_title} Delta from PI ({ssp_scenario}) from {decade_start_year} to {decade_end_year}'
-        if var not in ["tas", "tasmin", "tasmax", "pr", "p-e"]:
-            regional_axs_title = regional_axs_title.replace(" Delta from PI", "")
-            delta_axs_title = delta_axs_title.replace(" Delta from PI", "")
-            sai_axs_title = sai_axs_title.replace(" Delta from PI", "")
+        regional_axs_title = f'No SAI {simple_title} {baseline_label} ({ssp_scenario}) from {decade_start_year} to {decade_end_year}'
+        # The middle panel is the SAI-induced change (with-SAI − no-SAI), not an anomaly vs a baseline.
+        delta_axs_title = f'SAI {simple_title} change from {decade_start_year} to {decade_end_year}'
+        sai_axs_title = f'SAI {simple_title} {baseline_label} ({ssp_scenario}) from {decade_start_year} to {decade_end_year}'
+        if not is_anomaly_var:
+            regional_axs_title = regional_axs_title.replace(f" {baseline_label}", "")
+            sai_axs_title = sai_axs_title.replace(f" {baseline_label}", "")
         regional_axs.set_title(regional_axs_title, fontsize=FONTSIZE)
         delta_axs.set_title(delta_axs_title, fontsize=FONTSIZE)
         sai_axs.set_title(sai_axs_title, fontsize=FONTSIZE)

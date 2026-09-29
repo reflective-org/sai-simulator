@@ -19,7 +19,7 @@ from .constants import *
 from .historical import get_historical_model
 from .utils import clip_to_land
 from .population import get_population_exposure
-from .p_values import get_grid_level_p_values
+from .p_values import get_grid_level_p_values, no_sai_p_values_cache_path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from version import SIMULATOR_VERSION  # noqa: E402  (needs the repo-root path above)
@@ -128,10 +128,10 @@ def get_global_temp(
     )
 
     runner.run(progress=False)
-    preindustrial_temp = runner.temperature.sel(layer=0, timebounds=slice(1850, 1900)).mean('timebounds')
+    preindustrial_temp = runner.temperature.sel(layer=0, timebounds=slice(PREINDUSTRIAL_START, PREINDUSTRIAL_END)).mean('timebounds')
 
     if initial_dir is not None and not initial_dir.exists():
-        preindustrial_temp = runner.temperature.sel(layer=0, timebounds=slice(1850, 1900)).mean('timebounds')
+        preindustrial_temp = runner.temperature.sel(layer=0, timebounds=slice(PREINDUSTRIAL_START, PREINDUSTRIAL_END)).mean('timebounds')
 
     global_temp = (runner.temperature.sel(layer=0) - preindustrial_temp).mean('config')
 
@@ -232,12 +232,18 @@ def get_regional_map_from_global_temp(
     historical_map = get_historical_model(var, data_dir, cache_dir)
     # Get regional p values
     if historical_map is not None:
-        historical_rebase = historical_map.sel(time=slice(1850, 1900)).mean('time')
-        regional_p_values = get_grid_level_p_values(var, data_dir, historical_rebase, regional_map)
+        historical_rebase = historical_map.sel(time=slice(PREINDUSTRIAL_START, PREINDUSTRIAL_END)).mean('time')
+        # Significance is judged against the current-climate baseline (1995-2014), so the map's
+        # hatching means "significantly different from today's climate" rather than from 1850-1900.
+        significance_reference = historical_map.sel(time=slice(DISPLAY_BASELINE_START, DISPLAY_BASELINE_END)).mean('time')
+        regional_p_values = get_grid_level_p_values(var, data_dir, significance_reference, regional_map)
     else:
         regional_p_values = None
 
     ### Rebase the regional map ###
+    # The projection stays in the pre-industrial frame here: the SAI temp_target, the icefrac
+    # model, and get_temp_diff all assume anomalies vs 1850-1900. The dashboard re-expresses the
+    # map against the current-climate baseline at display time (see get_outputs._load_variable_fields).
     if var in ["tas", "tasmin", "tasmax", "pr", "p-e"]:
         regional_map = regional_map - historical_rebase
 
@@ -257,7 +263,7 @@ def get_regional_map(
     simple_ssp = REVERSE_FANCY_SSP_TITLES[ssp_scenario]
 
     regional_cache_path = cache_dir / f"{simple_ssp}_regional_{var}.nc"
-    regional_p_cache_path = cache_dir / f"{simple_ssp}_regional_no_sai_p_values_{var}.nc"
+    regional_p_cache_path = no_sai_p_values_cache_path(cache_dir, simple_ssp, var)
 
     if regional_cache_path.exists() and regional_p_cache_path.exists():
         print(f"Found {regional_cache_path} and {regional_p_cache_path}")

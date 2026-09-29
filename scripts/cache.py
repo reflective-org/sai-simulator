@@ -20,7 +20,7 @@ from backend.get_outputs import get_temp_diff, get_so2_by_latitude
 from backend.baseline import get_global_temp, get_regional_models, get_regional_map_from_global_temp, get_regional_map, validate_cache_dir
 from backend.delta import get_regional_delta
 from backend.historical import get_historical_model
-from backend.p_values import get_grid_level_p_values
+from backend.p_values import get_grid_level_p_values, no_sai_p_values_cache_path, sai_p_values_cache_path
 from backend.constants import *
 from backend.utils import get_interpolator
 from fair_wrap.fair_utils import REVERSE_FANCY_SSP_TITLES, CANVAS_START_YEAR, SIM_END_YEAR
@@ -93,14 +93,17 @@ def cache(
             historical_model = get_historical_model(var, data_dir, output_dir)
             if historical_model is None:
                 continue
-            historical_rebase = historical_model.sel(time=slice(1850, 1900)).mean('time')
+            historical_rebase = historical_model.sel(time=slice(PREINDUSTRIAL_START, PREINDUSTRIAL_END)).mean('time')
+            # Significance is judged against the current-climate baseline, matching the request-time
+            # path in backend.get_outputs; historical_rebase is only used to recover absolute fields.
+            significance_reference = historical_model.sel(time=slice(DISPLAY_BASELINE_START, DISPLAY_BASELINE_END)).mean('time')
             # Bound only on the icefrac no-SAI path; the SAI branch below must
             # not rely on it having been set (resumed runs skip that branch).
             regional_temp = None
 
             # cache no sai regional map and p values
             no_sai_cache_paths = [output_dir / f"{simple_ssp}_regional_{var}.nc",
-                                  output_dir / f"{simple_ssp}_regional_no_sai_p_values_{var}.nc"]
+                                  no_sai_p_values_cache_path(output_dir, simple_ssp, var)]
             if all(cache_path.exists() for cache_path in no_sai_cache_paths):
                 print("Found no sai cache for", var)
                 for cache_path in no_sai_cache_paths:
@@ -118,7 +121,7 @@ def cache(
                     )
                     regional_map = predict_icefrac(regional_temp, model_dir)
                     regional_p_values = get_grid_level_p_values(
-                        var, data_dir, historical_rebase, regional_map
+                        var, data_dir, significance_reference, regional_map
                     )
                 else:
                     if not is_exposure:
@@ -161,7 +164,7 @@ def cache(
                     so2_by_latitude.to_netcdf(so2_cache_path)
 
                 sai_cache_paths = [output_dir / f"{simple_ssp}_{temp_target:.1f}_regional_delta_{var}.nc",
-                                   output_dir / f"{simple_ssp}_{temp_target:.1f}_regional_sai_p_values_{var}.nc"]
+                                   sai_p_values_cache_path(output_dir, simple_ssp, temp_target, var)]
 
                 if all(cache_path.exists() for cache_path in sai_cache_paths) and so2_cache_path.exists():
                     print("Found sai cache for", var)
@@ -190,7 +193,7 @@ def cache(
                     icefrac_with_sai = predict_icefrac(temp_with_sai, model_dir)
                     regional_delta = icefrac_with_sai - regional_map
                     regional_sai_p_values = get_grid_level_p_values(
-                        var, data_dir, historical_rebase, icefrac_with_sai
+                        var, data_dir, significance_reference, icefrac_with_sai
                     )
 
                 else:
@@ -200,7 +203,7 @@ def cache(
                     regional_delta = get_regional_delta(var, data_dir, model_dir, output_dir, ssp_scenario, temp_target, 0, temp_diff, CANVAS_START_YEAR)
 
                     # Save the p_values
-                    regional_sai_p_values = get_grid_level_p_values(var, data_dir, historical_rebase, regional_map + regional_delta + historical_rebase)
+                    regional_sai_p_values = get_grid_level_p_values(var, data_dir, significance_reference, regional_map + regional_delta + historical_rebase)
                 
                 regional_delta.to_netcdf(sai_cache_paths[0])
                 regional_sai_p_values.to_netcdf(sai_cache_paths[1])

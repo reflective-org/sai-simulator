@@ -90,10 +90,29 @@ def test_compute_params_hash_is_deterministic() -> None:
     h2 = _compute_params_hash("SSP1-2.6", 1.5, 2091, 2100, 2050, 10, None)
     assert h1 == h2
     assert len(h1) == 10
-    # Matches an MD5 prefix of the joined params (encodes the contract at
-    # tests/verification/validate_outputs.py:67-85 which depends on it).
-    expected = hashlib.md5("SSP1-2.6_1.5_2091_2100_2050_10".encode()).hexdigest()[:10]
+    # Matches an MD5 prefix of the joined params, including the display baseline
+    # period (encodes the contract at tests/verification/validate_outputs.py
+    # geotiff_params_hash which depends on it).
+    expected = hashlib.md5(
+        "SSP1-2.6_1.5_2091_2100_2050_10_base_1995_2014".encode()
+    ).hexdigest()[:10]
     assert h1 == expected
+
+
+def test_p_value_cache_paths_carry_significance_reference(monkeypatch) -> None:
+    # The p-value caches are not covered by _compute_params_hash, so the reference
+    # period must be in the filename or a baseline change would serve stale files.
+    from backend import p_values
+
+    no_sai = p_values.no_sai_p_values_cache_path(Path("c"), "ssp245", "tas")
+    sai = p_values.sai_p_values_cache_path(Path("c"), "ssp245", 1.5, "tas")
+    assert no_sai == Path("c/ssp245_regional_no_sai_p_values_tas_ref1995_2014.nc")
+    assert sai == Path("c/ssp245_1.5_regional_sai_p_values_tas_ref1995_2014.nc")
+
+    monkeypatch.setattr(p_values, "DISPLAY_BASELINE_START", 1991)
+    monkeypatch.setattr(p_values, "DISPLAY_BASELINE_END", 2020)
+    assert p_values.no_sai_p_values_cache_path(Path("c"), "ssp245", "tas") != no_sai
+    assert p_values.sai_p_values_cache_path(Path("c"), "ssp245", 1.5, "tas") != sai
 
 
 @pytest.mark.parametrize(

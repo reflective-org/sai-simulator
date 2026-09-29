@@ -57,6 +57,18 @@ NUM_LAT = 192
 NUM_LON = 288
 MIN_SAI_START = 2035
 
+# Reference periods for temperature/precipitation anomalies.
+# PREINDUSTRIAL_* is the frame the *projections* and the SAI ``temp_target`` live in (the
+# FaIR global temperature, the FaIR->SMIP emulator inputs, and the icefrac model all assume
+# anomalies vs 1850-1900). Do not change it without retraining/recaching the models.
+# DISPLAY_BASELINE_* is the "current climate" period the dashboard *presents* anomalies and
+# significance against; it shifts what the user sees, not the underlying physics. The window
+# ends at 2014 because the historical model data stops there (see get_historical_model).
+PREINDUSTRIAL_START = 1850
+PREINDUSTRIAL_END = 1900
+DISPLAY_BASELINE_START = 1995
+DISPLAY_BASELINE_END = 2014
+
 MIN_TARGET = 0.5
 MAX_TARGET = 2.5
 STEP_TARGET = 0.1

@@ -4,7 +4,8 @@ Run ``get_outputs`` for each verification case and compare GeoTIFFs to S3 refere
 Reference objects in S3 must use the same filenames as ``create_geotiff_files`` in ``backend/get_outputs.py``
 (``{var}_{no_sai|with_sai}_{hash}.tif``) and the same 10-character MD5 hash of the parameter tuple:
 
-``ssp_scenario``, ``temp_target``, ``decade_start_year``, ``decade_end_year``, ``start_year``, ``ramp_up``.
+``ssp_scenario``, ``temp_target``, ``decade_start_year``, ``decade_end_year``, ``start_year``, ``ramp_up``,
+and the display baseline period (``base_{DISPLAY_BASELINE_START}_{DISPLAY_BASELINE_END}``).
 
 Default S3 object key layout (bucket is separate; this is the key inside the bucket)::
 
@@ -31,6 +32,7 @@ import numpy as np  # noqa: E402
 from botocore.exceptions import ClientError  # noqa: E402
 
 from .relative_error import compute_relative_error, load_dataset  # noqa: E402
+from backend.constants import DISPLAY_BASELINE_START, DISPLAY_BASELINE_END  # noqa: E402
 
 
 class S3KeyFn(Protocol):
@@ -80,6 +82,7 @@ def geotiff_params_hash(
         decade_end_year,
         start_year,
         ramp_up,
+        f"base_{DISPLAY_BASELINE_START}_{DISPLAY_BASELINE_END}",
     ]
     geotiff_params_str = "_".join(map(str, geotiff_params))
     return hashlib.md5(geotiff_params_str.encode()).hexdigest()[:10]
