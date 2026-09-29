@@ -1,6 +1,6 @@
 """FaIR setup, calibration, and runner helpers for the SAI simulator.
 
-Builds a :class:`fair_wrap.custom_fair.FAIR` instance pre-loaded with RCMIP emissions,
+Builds a :class:`fair.FAIR` instance pre-loaded with RCMIP emissions,
 the chris-roadmap calibrated parameter ensemble (100 members, sampled with a fixed seed),
 solar / volcanic forcing time series, and optionally a CESM-tuned override of the climate
 configs. The runner is pickled per scenario under ``fair_wrap/f_no_sai/<ssp>.pkl`` so
@@ -17,9 +17,9 @@ import pandas as pd
 import pickle as pkl
 import os
 from pathlib import Path
-from fair_wrap.custom_fair import FAIR
-from fair_wrap.custom_fair.io import read_properties
-from fair_wrap.custom_fair.interface import fill, initialise
+from fair import FAIR
+from fair.io import read_properties
+from fair.interface import fill, initialise
 
 
 # SIM_START_YEAR = 1950
@@ -54,6 +54,43 @@ headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 }
 
+# The RCMIP v5.1.0 datasets that stock ``FAIR.fill_from_rcmip`` downloads from Zenodo
+# (URLs and hashes must match fair 2.1.3's exactly so the pooch cache entries line up).
+RCMIP_FILES = {
+    "emissions": (
+        "https://zenodo.org/records/4589756/files/rcmip-emissions-annual-means-v5-1-0.csv",
+        "md5:4044106f55ca65b094670e7577eaf9b3",
+    ),
+    "concentrations": (
+        "https://zenodo.org/records/4589756/files/rcmip-concentrations-annual-means-v5-1-0.csv",
+        "md5:0d82c3c3cdd4dd632b2bb9449a5c315f",
+    ),
+    "forcing": (
+        "https://zenodo.org/records/4589756/files/rcmip-radiative-forcing-annual-means-v5-1-0.csv",
+        "md5:87ef6cd4e12ae0b331f516ea7f82ccba",
+    ),
+}
+
+
+def warm_rcmip_cache() -> dict[str, str]:
+    """Pre-download the RCMIP CSVs that ``FAIR.fill_from_rcmip`` needs, working around Zenodo.
+
+    Zenodo rejects pooch's default :mod:`urllib` ``User-Agent``, so stock FaIR's own
+    ``pooch.retrieve`` calls would fail with an HTTP error. Retrieving the same URLs here
+    with a browser ``User-Agent`` warms the shared pooch cache (keyed on URL, verified by
+    hash), so FaIR's subsequent calls are served from disk and never touch the network.
+    Returns the local file path for each dataset.
+    """
+    return {
+        name: pooch.retrieve(
+            url=url,
+            known_hash=known_hash,
+            downloader=pooch.HTTPDownloader(headers=headers),
+        )
+        for name, (url, known_hash) in RCMIP_FILES.items()
+    }
+
+
 def get_df_emis() -> pd.DataFrame:
     """Download (and cache) the RCMIP v5.1.0 annual-mean emissions CSV and return it as a DataFrame.
 
@@ -61,10 +98,11 @@ def get_df_emis() -> pd.DataFrame:
     download is refused. A spoofed ``User-Agent`` is passed because Zenodo rejects the
     default :mod:`urllib` UA.
     """
+    url, known_hash = RCMIP_FILES["emissions"]
     rcmip_emissions_file = pooch.retrieve(
-        url="https://zenodo.org/records/4589756/files/rcmip-emissions-annual-means-v5-1-0.csv",
+        url=url,
         # original url: "doi:10.5281/zenodo.4589756/rcmip-emissions-annual-means-v5-1-0.csv",
-        known_hash="md5:4044106f55ca65b094670e7577eaf9b3",
+        known_hash=known_hash,
         downloader=pooch.HTTPDownloader(headers=headers),
     )
     df_emis = pd.read_csv(rcmip_emissions_file)
@@ -143,6 +181,9 @@ def set_up_fair(
 
     ## 8. Fill in data
     ### 8a. emissions, solar forcing, and volcanic forcing
+    # Stock FaIR's Zenodo downloads fail without a browser User-Agent; serve them from
+    # the pooch cache instead (see warm_rcmip_cache).
+    warm_rcmip_cache()
     f.fill_from_rcmip()
 
     gfed_sectors = [
@@ -539,7 +580,15 @@ def get_runner(
     """
     ssp_scenario = REVERSE_FANCY_SSP_TITLES[ssp_scenario]
     f_init_path = F_INIT_DIR / f"{ssp_scenario}.pkl"
-    if not f_init_path.exists():
+    f_init = None
+    if f_init_path.exists():
+        try:
+            with open(f_init_path, "rb") as f:
+                f_init = pkl.load(f)
+        except Exception:
+            # e.g. a cache pickled by an older checkout (fair_wrap.custom_fair) — rebuild it
+            f_init_path.unlink()
+    if f_init is None:
         f_init = set_up_fair(
             df_emis,
             df_configs,
@@ -549,9 +598,6 @@ def get_runner(
         )
         with open(f_init_path, "wb") as f:
             pkl.dump(f_init, f)
-    else:
-        with open(f_init_path, "rb") as f:
-            f_init = pkl.load(f)
 
     f = fill_aerosols(
         f_init,
