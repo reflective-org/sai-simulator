@@ -35,7 +35,7 @@ from fair_wrap.fair_utils import REVERSE_FANCY_SSP_TITLES, SIM_END_YEAR
 
 from .constants import *
 from .historical import get_historical_model, get_historical_obs_global_mean_temp, get_historical_obs_sea_ice_extent
-from .baseline import get_regional_map
+from .baseline import get_regional_map, validate_cache_dir
 from .delta import get_regional_delta
 from .p_values import get_grid_level_p_values
 from .population import get_population_data
@@ -100,6 +100,9 @@ class _VariableFields:
     historical_model: xr.DataArray | None
     historical_rebase: xr.DataArray | None
     area: xr.DataArray | None  # Cell areas, only populated when var == "icefrac"
+    # Per-climate-model sigmoid predictions (model, time, lat, lon), only
+    # populated when var == "icefrac"; regional_map is their across-model mean.
+    icefrac_per_model: xr.DataArray | None = None
 
 
 @dataclass
@@ -108,6 +111,8 @@ class _DeltaResult:
     regional_delta: xr.DataArray
     icefrac_with_sai: xr.DataArray | None  # Only populated when var == "icefrac"
     regional_no_sai_p_values: xr.DataArray | None  # Recomputed for icefrac, otherwise unchanged
+    # Per-climate-model with-SAI predictions; icefrac_with_sai is their mean.
+    icefrac_with_sai_per_model: xr.DataArray | None = None
 
 
 @dataclass
@@ -120,6 +125,10 @@ class _MeanOverTimeResult:
     masked_regional_map: xr.DataArray | None
     masked_regional_delta: xr.DataArray | None
     masked_historical_model: xr.DataArray | None
+    # icefrac only, global mode only: ±2σ across-climate-model half-widths of
+    # the aggregated extent series, aligned to mean_no_sai / mean_with_sai:
+    model_spread_2sigma_no_sai: xr.DataArray | None = None
+    model_spread_2sigma_with_sai: xr.DataArray | None = None
 
 
 def _load_variable_fields(
@@ -144,12 +153,16 @@ def _load_variable_fields(
     """
     is_icefrac = var == "icefrac"
     area = get_area(data_dir) if is_icefrac else None
+    icefrac_per_model = None
 
     if var == "tas":
         regional_map = regional_temp
         regional_no_sai_p_values = regional_temp_no_sai_p_values
     elif is_icefrac:
-        regional_map = predict_icefrac(regional_temp, model_dir)
+        # One sigmoid prediction per climate model; everything downstream uses
+        # their mean, and the per-model fields feed the uncertainty band.
+        icefrac_per_model = predict_icefrac(regional_temp, model_dir, per_model=True)
+        regional_map = icefrac_per_model.mean(dim='model')
         regional_no_sai_p_values = None
     else:
         regional_map, regional_no_sai_p_values = get_regional_map(
@@ -169,6 +182,7 @@ def _load_variable_fields(
         historical_model=historical_model,
         historical_rebase=historical_rebase,
         area=area,
+        icefrac_per_model=icefrac_per_model,
     )
 
 
@@ -198,6 +212,7 @@ def _compute_regional_delta(
     """
     is_icefrac = var == "icefrac"
     icefrac_with_sai = None
+    icefrac_with_sai_per_model = None
     regional_no_sai_p_values = fields.regional_no_sai_p_values
 
     if is_icefrac:
@@ -211,7 +226,10 @@ def _compute_regional_delta(
                 "tas", data_dir, cache_dir, variable_injection
             )
         temp_with_sai = regional_temp + temp_regional_delta
-        icefrac_with_sai = predict_icefrac(temp_with_sai, model_dir)
+        icefrac_with_sai_per_model = predict_icefrac(
+            temp_with_sai, model_dir, per_model=True
+        )
+        icefrac_with_sai = icefrac_with_sai_per_model.mean(dim='model')
         regional_delta = icefrac_with_sai - fields.regional_map
         regional_no_sai_p_values = get_grid_level_p_values(
             var, data_dir, fields.historical_rebase, fields.regional_map
@@ -239,6 +257,7 @@ def _compute_regional_delta(
         regional_delta=regional_delta,
         icefrac_with_sai=icefrac_with_sai,
         regional_no_sai_p_values=regional_no_sai_p_values,
+        icefrac_with_sai_per_model=icefrac_with_sai_per_model,
     )
 
 
@@ -269,6 +288,7 @@ def _compute_sai_p_values(
         return None
 
     if variable_injection is None:
+        validate_cache_dir(cache_dir)
         regional_p_cache_path = (
             cache_dir / f"{simple_ssp}_{temp_target:.1f}_regional_sai_p_values_{var}.nc"
         )
@@ -313,6 +333,8 @@ def _compute_mean_over_time(
     start_year: int,
     variable_injection: np.ndarray | None,
     data_dir: Path,
+    icefrac_per_model: xr.DataArray | None = None,
+    icefrac_with_sai_per_model: xr.DataArray | None = None,
 ) -> _MeanOverTimeResult:
     """Aggregate regional fields into the historical / no-SAI / with-SAI time series shown on the dashboard.
 
@@ -330,6 +352,11 @@ def _compute_mean_over_time(
     to give a continuous historical→projection boundary, and ``mean_with_sai`` is anchored
     to ``mean_no_sai`` for years before SAI (or before the first nonzero ``variable_injection``
     year) so the curves split exactly at the SAI start.
+
+    For icefrac in global mode, ``icefrac_per_model`` / ``icefrac_with_sai_per_model``
+    (per-climate-model sigmoid predictions) additionally yield the ±2σ across-model
+    half-width series of the aggregated extent — the uncertainty band around the
+    multi-model-mean curves.
     """
     is_exposure = "exposure" in var
     is_above_below = "above" in var or "below" in var
@@ -439,6 +466,36 @@ def _compute_mean_over_time(
         mean_with_sai.loc[dict(time=slice(None, start_year - 1))] = \
             mean_no_sai.loc[dict(time=slice(None, start_year - 1))]
 
+    # Across-climate-model uncertainty band for icefrac (global mode): 2σ of
+    # the per-model aggregated extent series, i.e. "2 sigmas of the mean" the
+    # dashboard shades around the multi-model-mean curves.
+    model_spread_2sigma_no_sai = None
+    model_spread_2sigma_with_sai = None
+    if (
+        is_icefrac
+        and (spatial_gdf is None or spatial_item is None)
+        and icefrac_per_model is not None
+        and icefrac_per_model.sizes.get('model', 1) >= 2
+    ):
+        no_sai_series = regional_aggregation(
+            icefrac_per_model * area.broadcast_like(icefrac_per_model), weights, op
+        )
+        model_spread_2sigma_no_sai = (
+            2 * no_sai_series.std(dim='model', ddof=1)
+        ).sel(time=mean_no_sai.time)
+        if icefrac_with_sai_per_model is not None:
+            with_sai_series = regional_aggregation(
+                icefrac_with_sai_per_model
+                * area.broadcast_like(icefrac_with_sai_per_model),
+                weights,
+                op,
+            )
+            # The with-SAI curve is anchored to no-SAI before the SAI split, so
+            # anchor its band the same way where the with-SAI series has no data.
+            model_spread_2sigma_with_sai = (
+                2 * with_sai_series.std(dim='model', ddof=1)
+            ).reindex(time=mean_with_sai.time).fillna(model_spread_2sigma_no_sai)
+
     return _MeanOverTimeResult(
         mean_no_sai=mean_no_sai,
         mean_with_sai=mean_with_sai,
@@ -446,6 +503,8 @@ def _compute_mean_over_time(
         masked_regional_map=masked_regional_map,
         masked_regional_delta=masked_regional_delta,
         masked_historical_model=masked_historical_model,
+        model_spread_2sigma_no_sai=model_spread_2sigma_no_sai,
+        model_spread_2sigma_with_sai=model_spread_2sigma_with_sai,
     )
 
 
@@ -828,6 +887,8 @@ def get_outputs(
             start_year=start_year,
             variable_injection=variable_injection,
             data_dir=data_dir,
+            icefrac_per_model=fields.icefrac_per_model,
+            icefrac_with_sai_per_model=delta_result.icefrac_with_sai_per_model,
         )
 
         output_data[var]["mean_over_time"] = {
@@ -839,6 +900,15 @@ def get_outputs(
             output_data[var]["mean_over_time"]["historical_obs"] = historical_obs_data
         elif var == 'icefrac':
             output_data[var]["mean_over_time"]["historical_obs"] = historical_obs_sea_ice
+        if mot_result.model_spread_2sigma_no_sai is not None:
+            # icefrac, global mode: ±2σ across-model band half-widths, one value
+            # per year of the corresponding mean-over-time series.
+            output_data[var]["mean_over_time"]["model_spread_2sigma_no_sai"] = (
+                mot_result.model_spread_2sigma_no_sai
+            )
+            output_data[var]["mean_over_time"]["model_spread_2sigma_with_sai"] = (
+                mot_result.model_spread_2sigma_with_sai
+            )
 
         output_data[var]["mean_over_time"]["model_internal_variability"] = (
             _compute_internal_variability(
@@ -900,6 +970,7 @@ def get_outputs(
         temp_diff = temp_diff.sel(time=slice(start_year, SIM_END_YEAR))
         # Note: ``var`` here is the last loop-variable, intentionally preserved from the
         # original implementation — the SO2 cache filename is keyed by that incidental name.
+        validate_cache_dir(cache_dir)
         so2_cache_path = cache_dir / f"{simple_ssp}_{temp_target:.1f}_so2_{var}.nc"
         if so2_cache_path.exists():
             with xr.open_dataarray(so2_cache_path) as da:
@@ -908,7 +979,9 @@ def get_outputs(
         else:
             interpolator = get_interpolator(model_dir / "so2" / "interpolator.nc")
             so2_by_latitude = get_so2_by_latitude(interpolator, temp_diff, ramp_up)["so2"]
-            so2_by_latitude = so2_by_latitude.drop_vars('model')
+            # The multi-model-mean temp_diff no longer carries a leftover
+            # 'model' coord (the old single-model .sel did) — drop if present.
+            so2_by_latitude = so2_by_latitude.drop_vars('model', errors='ignore')
         global_so2 = so2_by_latitude.sum(('lat'))
     else:
         temp_diff = None
@@ -1392,7 +1465,7 @@ def generate_sai_netcdf(
     start_year: int | None,
     ramp_up: int | None,
     variable_injection: np.ndarray | None,
-    model_name: str = "CESM2-WACCM",
+    model_name: str = "CESM2-WACCM + MIROC-ES2H (equal-weight mean)",
     output_path: str | Path | None = None,
     output_config: dict | None = None,
 ) -> xr.Dataset:

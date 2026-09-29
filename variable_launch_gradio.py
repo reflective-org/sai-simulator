@@ -231,12 +231,28 @@ def generate_gradio_plots(
             global_mean_ax.plot(mean_with_sai.time.values, mean_with_sai.values, label='With SAI', color='tab:blue', linestyle='--')
             global_mean_ax.plot(historical_model_global_mean.time.values, historical_model_global_mean.values, label='Historical CESM2-WACCM', color='tab:red')
 
-            if "model_internal_variability" in output_data[var]["mean_over_time"]:
+            # Sea-ice extent cannot be negative; clip the shaded band's lower
+            # edge at 0 whichever band source is in play (the internal-
+            # variability fallback in particular can cross zero late-century).
+            def _band_floor(values):
+                return np.maximum(values, 0.0) if var == 'icefrac' else values
+
+            if "model_spread_2sigma_no_sai" in output_data[var]["mean_over_time"]:
+                # icefrac: across-climate-model ±2σ band around the multi-model-mean
+                # projection curves (per-year half-widths, already ×2).
+                band_no_sai = output_data[var]["mean_over_time"]["model_spread_2sigma_no_sai"].sel(time=mean_no_sai.time).values
+                band_with_sai = output_data[var]["mean_over_time"]["model_spread_2sigma_with_sai"].sel(time=mean_with_sai.time).values
+                global_mean_ax.fill_between(mean_no_sai.time.values, _band_floor(mean_no_sai.values - band_no_sai), mean_no_sai.values + band_no_sai, color='tab:red', alpha=0.3)
+                global_mean_ax.fill_between(mean_with_sai.time.values, _band_floor(mean_with_sai.values - band_with_sai), mean_with_sai.values + band_with_sai, color='tab:blue', alpha=0.3)
+                if "model_internal_variability" in output_data[var]["mean_over_time"]:
+                    model_internal_variability = output_data[var]["mean_over_time"]["model_internal_variability"]
+                    global_mean_ax.fill_between(historical_model_global_mean.time.values, _band_floor(historical_model_global_mean.values - model_internal_variability*2), historical_model_global_mean.values + model_internal_variability*2, color='tab:red', alpha=0.3)
+            elif "model_internal_variability" in output_data[var]["mean_over_time"]:
                 # Add shading of model_internal variability around each of the above 3 lines
                 model_internal_variability = output_data[var]["mean_over_time"]["model_internal_variability"]
-                global_mean_ax.fill_between(mean_no_sai.time.values, mean_no_sai.values - model_internal_variability*2, mean_no_sai.values + model_internal_variability*2, color='tab:red', alpha=0.3)
-                global_mean_ax.fill_between(mean_with_sai.time.values, mean_with_sai.values - model_internal_variability*2, mean_with_sai.values + model_internal_variability*2, color='tab:blue', alpha=0.3)
-                global_mean_ax.fill_between(historical_model_global_mean.time.values, historical_model_global_mean.values - model_internal_variability*2, historical_model_global_mean.values + model_internal_variability*2, color='tab:red', alpha=0.3)
+                global_mean_ax.fill_between(mean_no_sai.time.values, _band_floor(mean_no_sai.values - model_internal_variability*2), mean_no_sai.values + model_internal_variability*2, color='tab:red', alpha=0.3)
+                global_mean_ax.fill_between(mean_with_sai.time.values, _band_floor(mean_with_sai.values - model_internal_variability*2), mean_with_sai.values + model_internal_variability*2, color='tab:blue', alpha=0.3)
+                global_mean_ax.fill_between(historical_model_global_mean.time.values, _band_floor(historical_model_global_mean.values - model_internal_variability*2), historical_model_global_mean.values + model_internal_variability*2, color='tab:red', alpha=0.3)
 
             if var == 'tas':
                 historical_obs_data = output_data[var]["mean_over_time"]["historical_obs"]

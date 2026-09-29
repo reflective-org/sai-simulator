@@ -5,6 +5,8 @@ fitted ``FaIR → SMIP`` linear emulator to produce regional projections for eac
 clips, rebases, and computes the no-SAI grid-level p-values. Outputs are cached on disk
 under ``cache_dir`` so subsequent calls for the same ``(ssp, var)`` reuse the same maps.
 """
+import json
+import sys
 import joblib
 import numpy as np
 import xarray as xr
@@ -19,6 +21,72 @@ from .utils import clip_to_land
 from .population import get_population_exposure
 from .p_values import get_grid_level_p_values
 
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from version import SIMULATOR_VERSION  # noqa: E402  (needs the repo-root path above)
+
+
+# Climate-response calibration handed to FaIR (see fair_wrap.fair_utils.CLIMATE_CALIBRATIONS).
+# "constrained" runs the calibrated-constrained ensemble and averages across its members, so
+# the global magnitude reflects the ensemble-mean response rather than one model's
+# sensitivity (the member spread itself is collapsed by that mean and is not propagated).
+# Set to "cesm" to restore the pre-2026-08 FaIR driver — note that only reverts the global
+# warming magnitude; the multi-model regional emulators and multi-model historical rebase
+# remain in effect either way. Deployment-fixed: change requires a process restart (the
+# lru caches below key on this only via the cache-dir fingerprint).
+FAIR_CALIBRATION = DEFAULT_CALIBRATION
+
+# Every FaIR-dependent artifact in a cache dir is only valid for the (simulator version,
+# FaIR climate calibration) pair that produced it, and neither is recoverable from the
+# files themselves. The pair is therefore recorded in this file when a cache dir is first
+# populated and checked before any cached file is trusted (see validate_cache_dir).
+CACHE_META_FILENAME = "cache_meta.json"
+
+
+def stamp_cache_dir(cache_dir: Path) -> None:
+    """Record this process's (simulator version, FaIR calibration) fingerprint in ``cache_dir``."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    meta = {"simulator_version": SIMULATOR_VERSION, "fair_calibration": FAIR_CALIBRATION}
+    # Write-then-rename so a concurrent reader never sees a truncated stamp
+    # (parallel cache.py --scenario runs stamp the same dir with identical bytes).
+    tmp_path = cache_dir / (CACHE_META_FILENAME + ".tmp")
+    tmp_path.write_text(json.dumps(meta, indent=2) + "\n")
+    tmp_path.replace(cache_dir / CACHE_META_FILENAME)
+
+
+def validate_cache_dir(cache_dir: Path) -> None:
+    """Refuse a cache dir whose artifacts were produced under a different version or calibration.
+
+    A matching ``cache_meta.json`` passes; an empty (or artifact-free) dir is stamped for the
+    current process and passes; anything else raises. In particular a populated dir *without*
+    a stamp predates the fingerprint mechanism — and therefore the AR6-constrained FaIR
+    default — so serving its files would silently mix climate calibrations.
+    """
+    expected = {"simulator_version": SIMULATOR_VERSION, "fair_calibration": FAIR_CALIBRATION}
+    meta_path = cache_dir / CACHE_META_FILENAME
+    if meta_path.exists():
+        try:
+            found = json.loads(meta_path.read_text())
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Unreadable {CACHE_META_FILENAME} in {cache_dir} ({e}). Delete the file "
+                "and regenerate the cache with scripts/cache.py."
+            ) from e
+        if found != expected:
+            raise ValueError(
+                f"Cache dir {cache_dir} was generated under {found}, but this process "
+                f"expects {expected}. Regenerate it with scripts/cache.py or point at a "
+                "matching cache dir."
+            )
+        return
+    if any(cache_dir.glob("*.nc")):
+        raise ValueError(
+            f"Cache dir {cache_dir} contains .nc artifacts but no {CACHE_META_FILENAME} — "
+            "it predates the cache fingerprint (pre-AR6-constrained FaIR default), so its "
+            "files may not match the current calibration. Regenerate it with "
+            "scripts/cache.py or delete the stale files."
+        )
+    stamp_cache_dir(cache_dir)
+
 
 def get_global_temp(
     ssp_scenario: str,
@@ -29,8 +97,9 @@ def get_global_temp(
     Loads the standard FaIR input dataframes and, optionally, NetCDF initial-conditions plus a
     precomputed pre-industrial temperature from ``initial_dir`` (each ``initial_conditions``
     DataArray has its ``scenario`` coord re-pointed at ``ssp_scenario`` so cached conditions
-    work across scenarios). The configured FaIR ``runner`` is calibrated to ``"cesm"``, run
-    without a progress bar, and the layer-0 temperature is rebased to the 1850-1900 mean and
+    work across scenarios). The FaIR ``runner`` is calibrated per :data:`FAIR_CALIBRATION`
+    (default: the AR6 calibrated-constrained ensemble's own per-member configs), run without
+    a progress bar, and the layer-0 temperature is rebased to the 1850-1900 mean and
     averaged across configs before being returned.
     """
     # Get global temperature from FaIR
@@ -55,7 +124,7 @@ def get_global_temp(
         df_solar, df_volcanic,
         co2_input=None, ssp_scenario=ssp_scenario,
         initial_conditions=initial_conditions,
-        calibrate_to="cesm"
+        calibrate_to=FAIR_CALIBRATION,
     )
 
     runner.run(progress=False)
@@ -123,7 +192,7 @@ def get_regional_map_from_global_temp(
 
     Runs :func:`get_smip` to get the raw emulator output, wraps it as an :class:`xr.DataArray`
     with the canonical ``time / model / emulator / lat / lon`` coords (loading ``correct_lat.npy``
-    for the latitude axis), selects ``CESM2-WACCM`` and averages over emulators, then applies the
+    for the latitude axis), takes the equal-weight mean over models and emulators, then applies the
     variable-specific post-processing: floors at zero for ``"above"``/``"below"`` count variables,
     clips to land for precipitation/water-availability variables, and converts to population
     exposure for exposure variables.
@@ -142,7 +211,9 @@ def get_regional_map_from_global_temp(
     regional_map.coords['lat'] = correct_lat
     regional_map.coords['lon'] = np.linspace(0, 360, NUM_LON, endpoint=False)
     regional_map = xr.Dataset({var: regional_map})
-    regional_map = regional_map.sel(model="CESM2-WACCM").mean(dim='emulator')[var]
+    # Equal-weight multi-model mean: every model has NUM_EMULATORS members, so
+    # averaging over both dims gives each model identical weight.
+    regional_map = regional_map.mean(dim=['model', 'emulator'])[var]
 
     is_above_below = "above" in var or "below" in var
     is_exposure = "exposure" in var
@@ -182,6 +253,7 @@ def get_regional_map(
     ssp_scenario: str,
 ) -> tuple[xr.DataArray, xr.DataArray | None]:
     """Returns the regional map for the given variable, SSP scenario, and temperature target."""
+    validate_cache_dir(cache_dir)
     simple_ssp = REVERSE_FANCY_SSP_TITLES[ssp_scenario]
 
     regional_cache_path = cache_dir / f"{simple_ssp}_regional_{var}.nc"

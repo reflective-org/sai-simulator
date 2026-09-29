@@ -212,3 +212,8 @@ dmypy.json
 .pytest_cache/
 
 validation_celery_report.json
+
+# data dirs
+data/raw/
+data/cache/
+data/processed_new/

@@ -12,14 +12,27 @@ merged into the canonical ``output_gauss-*.nc`` files and the model internal var
 
 CLI entry: ``python scripts/process_monthly_gauss.py <var> <data_dir> <output_dir> [--overwrite]``.
 """
-import fire
 import numpy as np
-import xesmf as xe
 import xarray as xr
 import pandas as pd
+# NOTE: ``xesmf`` (and its compiled ESMF/ESMPy backend) is imported lazily
+# inside the two regridding functions below, not at module top. This keeps the
+# module importable — for its ``MODELS`` table, ``var2esm_var`` map, and the
+# ``_group_for_var`` helper — in environments without a compiled ESMF library
+# (e.g. CI unit tests), since regridding is only needed for an actual run.
+# ``fire`` is similarly imported lazily inside the ``__main__`` block below so
+# that unit tests of ``MODELS`` / ``var2esm_var`` / ``_group_for_var`` don't
+# require ``fire`` in the CI environment.
 from tqdm import tqdm
 from pathlib import Path
 from collections import defaultdict
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Only seen by type checkers, never executed at runtime — keeps the
+    # ``xe.Regridder`` return annotation on ``get_robust_regridder`` valid
+    # without forcing the heavy compiled ESMF dependency at import time.
+    import xesmf as xe
 
 import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -76,16 +89,103 @@ var2esm_var = {
         "icefrac": "ICEFRAC",
     }
 
-# Per-experiment Zarr stores produced by zarrification_mkii.ipynb. Each tuple
-# is (store URL, experiment label). Labels match what the downstream pipeline
-# expects in validators, output filenames, and merge_historical_and_baseline.
-EXPERIMENTS = [
-    (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_baseline.zarr",   "baseline"),
-    (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_historical.zarr", "historical"),
-    (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_1.5K-SAI.zarr",   "1.5"),
-    (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_1.0K-SAI.zarr",   "1.0"),
-    (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_0.5K-SAI.zarr",   "0.5"),
-]
+# Per-model processing config. Each model is processed independently (see
+# process_monthly / _process_model) so its quirks stay isolated.
+#
+# Per model:
+#   experiments       (store URL, internal label) tuples. Internal labels stay
+#                     model-agnostic ("baseline", "historical", "1.5", ...) so
+#                     the baseline-keyed variability/merge logic and the
+#                     experiment-aware validators work the same for every model.
+#                     SAI labels that aren't in EXPECTED_YEARS_BY_EXPERIMENT
+#                     (e.g. "g6-1.5") simply skip the year-count check.
+#   model_coord       value written to the output `model` coord.
+#   output_suffix     appended to output filenames so models don't collide
+#                     (empty for CESM so its filenames are unchanged).
+#   has_historical    whether a historical experiment exists — gates the
+#                     hist+baseline merge and the historical-derived cell bounds.
+#   no_sai_experiments  the model's no-SAI reference experiment label(s). The
+#                     historical run is stitched into each of them, and each
+#                     supplies the upper cell bound. A model can publish two:
+#                     MIROC's GeoMIP ``baseline`` is the run its G6 experiments
+#                     branched from (the SAI-delta rebase reference, pinned in
+#                     fit_delta.ANCHORS), while ``ssp245`` is the ScenarioMIP run
+#                     the climate-change-only emulator trains on (pinned in
+#                     backend.constants.REGIONAL_MODEL2PROJECTION_BASELINE_FILES).
+#   experiment_missing_vars  per-experiment variables the store does not publish,
+#                     skipped up front rather than failing member-by-member. MIROC's
+#                     ScenarioMIP store ships all-NaN QFLX/ICEFRAC placeholders
+#                     (hfls and siconc for that run are only on an offline ESGF
+#                     node), so p-e and icefrac produce no ssp245 output and their
+#                     consumers fall back to the branch-point baseline.
+#   compute_variability  whether to emit the dashboard variability artifacts
+#                     (single set, from the primary model only).
+MODELS = {
+    "CESM2-WACCM-MA": {
+        "experiments": [
+            (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_baseline.zarr",   "baseline"),
+            (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_historical.zarr", "historical"),
+            (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_1.5K-SAI.zarr",   "1.5"),
+            (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_1.0K-SAI.zarr",   "1.0"),
+            (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_0.5K-SAI.zarr",   "0.5"),
+        ],
+        "model_coord": "CESM2-WACCM",
+        "output_suffix": "",
+        "has_historical": True,
+        # CESM's single baseline run is both the GAUSS branch point and the
+        # ScenarioMIP SSP2-4.5 projection baseline.
+        "no_sai_experiments": ("baseline",),
+        "experiment_missing_vars": {},
+        "compute_variability": True,
+    },
+    "MIROC-ES2H": {
+        "experiments": [
+            (f"{ZARR_STORES_URI}/MIROC-ES2H_baseline.zarr",    "baseline"),
+            (f"{ZARR_STORES_URI}/MIROC-ES2H_ssp245.zarr",      "ssp245"),
+            (f"{ZARR_STORES_URI}/MIROC-ES2H_historical.zarr",  "historical"),
+            (f"{ZARR_STORES_URI}/MIROC-ES2H_G6-1.5K-SAI.zarr", "g6-1.5"),
+            (f"{ZARR_STORES_URI}/MIROC-ES2H_G6-0.5K-SAI.zarr", "g6-0.5"),
+        ],
+        "model_coord": "MIROC-ES2H",
+        "output_suffix": "-miroc",
+        "has_historical": True,
+        # Two distinct SSP2-4.5 realizations: the GeoMIP ``baseline`` the G6 runs
+        # branched from (SAI-delta rebase reference) and the ScenarioMIP ``ssp245``
+        # run (projection baseline; 2015-2100, continuous with historical). The
+        # ssp245 store's QFLX is filled from the G6 baseline run's hfls over
+        # 2020-2084 only (NaN elsewhere — see the array's note attr), so ssp245
+        # p-e covers 65 years; its ICEFRAC is regridded from the run's own CMOR
+        # siconc (full 2015-2100 — see that array's note attr).
+        "no_sai_experiments": ("baseline", "ssp245"),
+        "experiment_missing_vars": {},
+        "compute_variability": False,
+    },
+    # --- UKESM (stub; uncomment + fill in once the public stores land) ---
+    # Mirror the MIROC entry: the G6 branch-point baseline + the G6 SAI run(s),
+    # CESM-style variable names, all available members, no variability. Confirm the
+    # real store filenames and the SAI cooling label(s) — if UKESM ships more than
+    # one G6 cooling target, add one (store, label) pair each, and add a matching
+    # Anchor per label in scripts/fit_delta.py. If a separate ScenarioMIP ssp245 run
+    # is published, add it as a second no_sai_experiments entry (as MIROC does) and
+    # list it first in REGIONAL_MODEL2PROJECTION_BASELINE_FILES in
+    # backend/constants.py; declare any placeholder variables it ships in
+    # experiment_missing_vars so they fall back to the branch-point baseline. If
+    # UKESM has no evaporative-flux source at all (MIROC ships QFLX derived from
+    # hfls), add it to ALLOWED_MISSING in scripts/data_sanity_checks.py so p-e
+    # auto-drops.
+    # "UKESM1-1-LL": {
+    #     "experiments": [
+    #         (f"{ZARR_STORES_URI}/UKESM1-1-LL_baseline.zarr",    "baseline"),
+    #         (f"{ZARR_STORES_URI}/UKESM1-1-LL_G6-1.5K-SAI.zarr", "g6-1.5"),
+    #     ],
+    #     "model_coord": "UKESM1-1-LL",
+    #     "output_suffix": "-ukesm",
+    #     "has_historical": False,
+    #     "no_sai_experiments": ("baseline",),
+    #     "experiment_missing_vars": {},
+    #     "compute_variability": False,
+    # },
+}
 
 # Zarr group per variable family: cumulative exposure counts live under
 # atmos_2d_derived; daily extremes under atmos_2d_tasminmax; everything else
@@ -297,28 +397,47 @@ def _combined_monthly_to_dataarray(
     return combined
 
 
-def merge_historical_and_baseline(
+def merge_historical_into(
     exp2member2data_combined: dict[str, dict[str, xr.Dataset | xr.DataArray]],
+    no_sai_experiments: tuple[str, ...] = ("baseline",),
 ) -> None:
     """
-    Merges 'historical' and 'baseline' into a single superset of members.
+    Merges 'historical' into each no-SAI reference experiment, as a superset of members.
+
+    A model can publish more than one no-SAI run — MIROC ships both the GeoMIP
+    ``baseline`` its G6 experiments branched from and the ScenarioMIP ``ssp245`` run —
+    and each needs the full 1850-onwards series its consumer expects (the delta fit
+    rebases against ``baseline``; the projection emulator and the dashboard's historical
+    series read ``ssp245``). The same historical members are therefore stitched into
+    every entry of ``no_sai_experiments``. 'historical' is removed once all are merged.
+    """
+    print("Merging Historical into no-SAI experiments (Superset Mode)...")
+
+    historical_data = exp2member2data_combined.pop('historical', {})
+    if not historical_data:
+        print("  Note: No historical data found. Keeping no-SAI experiments as is.")
+        return
+
+    for exp in no_sai_experiments:
+        if exp not in exp2member2data_combined:
+            # e.g. MIROC p-e/icefrac have no ScenarioMIP output to merge into.
+            print(f"  Note: no {exp} data for this variable — nothing to merge into.")
+            continue
+        print(f"  -> {exp}")
+        _merge_historical_into_one(historical_data, exp2member2data_combined[exp])
+
+
+def _merge_historical_into_one(
+    historical_data: dict[str, xr.Dataset | xr.DataArray],
+    baseline_data: dict[str, xr.Dataset | xr.DataArray],
+) -> None:
+    """Stitch ``historical_data`` into one no-SAI experiment's member dict, in place.
 
     Logic:
     1. Overlapping Members (e.g. Hist 1 & Base 1): Stitched together (1850-2100).
     2. Historical-Only (e.g. Hist 2): kept as is (1850-2014).
     3. Baseline-Only (e.g. Base 7): kept as is (2015-2100).
-
-    The result is stored in 'baseline', and 'historical' is removed.
     """
-    print("Merging Historical and Baseline data (Superset Mode)...")
-
-    historical_data = exp2member2data_combined.pop('historical', {})
-    baseline_data = exp2member2data_combined.setdefault('baseline', {})
-
-    if not historical_data:
-        print("  Note: No historical data found. Keeping baseline as is.")
-        return
-
     # Identify all unique member IDs involved
     hist_ids = set(historical_data.keys())
     base_ids = set(baseline_data.keys())
@@ -392,9 +511,10 @@ def get_robust_regridder(
     target_grid: xr.Dataset | xr.DataArray,
 ) -> "xe.Regridder":
     """
-    Initializes an xesmf regridder. 
+    Initializes an xesmf regridder.
     Includes fallback logic for datasets with malformed lat/lon coordinates.
     """
+    import xesmf as xe  # lazy: see module-top note on the ESMF dependency
     try:
         # Standard initialization
         return xe.Regridder(ds_sample, target_grid, 'bilinear', periodic=True)
@@ -569,44 +689,91 @@ def process_monthly(
     data_dir: str | Path = "",
     output_dir: str | Path = "data/processed",
     overwrite: bool = False,
+    model: str = "all",
 ) -> None:
     """
-    Process monthly Simulator data and calculate model internal variability for each variable.
-    (it does not calculate model internal variability for sea ice. It is done in variability.py)
+    Process monthly Simulator data for one variable, per climate model.
+
+    Each model in :data:`MODELS` is processed independently — its own
+    experiment set, baseline, output-filename suffix and ``model`` metadata
+    coord — so model-specific quirks (MIROC's baseline starts in 2020 leaving
+    a 2015-2019 seam after the historical merge, it runs on a different native
+    grid, etc.) stay isolated. Every model's outputs land in the same
+    ``output_dir/<var>/`` so the fit step can pick them all up.
 
     Args:
         var: Variable to process.
         data_dir: Unused. Inputs come from the Zarr stores at
-            :data:`version.ZARR_STORES_URI`. The parameter is kept so the
-            existing ``scripts/process_all_monthly.sh`` invocation keeps
-            working unchanged.
+            :data:`version.ZARR_STORES_URI`. Kept so the existing
+            ``scripts/process_all_monthly.sh`` invocation works unchanged.
         output_dir: Directory to save processed data.
         overwrite: Whether to overwrite existing files.
+        model: Which model to process — a key of :data:`MODELS`, or ``"all"``
+            (default) to process every model in turn.
     """
     print(f"var: {var}")
-    print("="*100)
+    print("=" * 100)
 
-    # Validation & Setup
     if var not in var2esm_var:
         raise ValueError(f"\033[91mvar must be one of {list(var2esm_var.keys())}\033[0m")
 
+    if model == "all":
+        model_names = list(MODELS.keys())
+    elif model in MODELS:
+        model_names = [model]
+    else:
+        raise ValueError(
+            f"\033[91mmodel must be 'all' or one of {list(MODELS.keys())}\033[0m"
+        )
+
     output_dir = Path(output_dir) / var
     output_dir.mkdir(exist_ok=True, parents=True)
-
     esm_var = var2esm_var[var]
-    print(f"--- Processing {var} (Variable: {esm_var}) ---")
 
-    # Loading from Zarr stores. Replaces the prior PRECT PRECC+PRECL pairing
-    # step (PRECT is precomputed in the stores) and the per-file glob / regex
-    # loop. Each store carries all three members for one experiment under
-    # the appropriate Mon/atmos_2d* subgroup; one DataArray lands per
-    # (experiment, member) in exp2member2data.
+    for model_name in model_names:
+        print(f"\n--- Processing {var} ({esm_var}) for model {model_name} ---")
+        _process_model(var, esm_var, model_name, MODELS[model_name], output_dir, overwrite)
+
+    print(f"--- Processing {var} Complete ---")
+
+
+def _process_model(
+    var: str,
+    esm_var: str,
+    model_name: str,
+    model_cfg: dict,
+    output_dir: Path,
+    overwrite: bool,
+) -> None:
+    """Process one model's experiment set into per-experiment output files.
+
+    Extracted from the original single-model body; the ``model_cfg`` fields
+    parametrise the model-specific points (which stores + labels to load, the
+    ``model`` coord, the output-filename suffix, whether a historical
+    experiment exists, and whether to emit dashboard variability artifacts).
+    """
+    experiments = model_cfg["experiments"]
+    model_coord = model_cfg["model_coord"]
+    output_suffix = model_cfg["output_suffix"]
+    has_historical = model_cfg["has_historical"]
+    no_sai_experiments = tuple(model_cfg.get("no_sai_experiments", ("baseline",)))
+    experiment_missing_vars = model_cfg.get("experiment_missing_vars", {})
+    compute_variability = model_cfg["compute_variability"]
+
+    # Loading from Zarr stores. Each store carries all members for one
+    # experiment under the appropriate Mon/atmos_2d* subgroup; one DataArray
+    # lands per (experiment, member) in exp2member2data.
     print(">> Loading Zarr stores …")
     group = _group_for_var(var)
     exp2member2data: dict[str, dict[str, list[xr.DataArray]]] = defaultdict(
         lambda: defaultdict(list)
     )
-    for zarr_url, exp_label in EXPERIMENTS:
+    for zarr_url, exp_label in experiments:
+        if var in experiment_missing_vars.get(exp_label, ()):
+            # Declared absent up front (the store ships an all-NaN placeholder), so
+            # skip it rather than letting every member fail the NaN check.
+            print(f"\033[93m   {exp_label}: {var} not published for this experiment — skipping\033[0m")
+            continue
         print(f"   {zarr_url} (group={group})")
         try:
             ds = open_xarray_datasets(zarr_url, group=group)
@@ -631,15 +798,21 @@ def process_monthly(
             exp2member2data[exp_label][m].append(processed)
 
     if not exp2member2data:
-        print(f"\033[91mNo data loaded for {var} — nothing to process.\033[0m")
+        print(f"\033[93mNo data loaded for {var} / {model_name} — skipping this model.\033[0m")
         return
 
     # Combination & Aggregation
     print(">> Combining & Aggregating...")
-    monthly_cell_bounds = build_monthly_cell_bounds(var, exp2member2data)
+    # Cell bounds need a historical experiment for the temperature min bound;
+    # models without one skip the check (None == no-op in the validator).
+    monthly_cell_bounds = (
+        build_monthly_cell_bounds(var, exp2member2data, no_sai_experiments)
+        if has_historical
+        else None
+    )
 
-    # Create grid for output (lat/lon)
-    # Get correct latitudes from CESM2-WACCM (center of bounds)
+    # Create grid for output (lat/lon) — the CESM2-WACCM target grid that all
+    # models are regridded onto.
     correct_lat = np.load(output_dir.parent / "correct_lat.npy")
     common_grid = {
         'lon': np.linspace(0, 358.75, 288),
@@ -652,18 +825,13 @@ def process_monthly(
     failed_processing: list[tuple[str, str, str]] = []
     for exp, member2data in tqdm(exp2member2data.items(), desc="Experiments"):
         for member, data_list in member2data.items():
-            # print(f"exp: {exp}")
-            # print(f"member: {member}")
-            # for data in data_list:
-            #     print(f"data.time: {data.time}")
-            # print(f"datalist size: {len(data_list)}")
             try:
                 # A. Combine time steps
                 ds_combined = _combined_monthly_to_dataarray(
                     xr.combine_by_coords(data_list, combine_attrs="drop_conflicts"),
                     esm_var,
                 )
-                
+
                 # B. Validation
                 validate_continuity(ds_combined)
                 validate_monthly_cell_bounds(
@@ -672,14 +840,13 @@ def process_monthly(
                     exp=exp,
                     member=member,
                     bounds=monthly_cell_bounds,
+                    no_sai_experiments=no_sai_experiments,
                 )
 
                 # C. Yearly Aggregation
-                # print(f"  Getting yearly aggregate for {var} experiment: {exp} member: {member} ...")
                 ds_yearly = get_yearly_aggregate(ds_combined, var, esm_var)
 
                 # D. Convert Time Index (Datetime -> Year Integer)
-                # Extract years safely from the datetime index
                 years = ds_yearly.time.dt.year.values
                 ds_yearly = ds_yearly.assign_coords(time=years)
                 year_count_summary[exp][member] = len(ds_yearly.time)
@@ -720,13 +887,9 @@ def process_monthly(
                     member=member,
                     stage="yearly aggregation",
                 )
-                
+
                 exp2member2data_combined[exp][member] = ds_yearly
 
-                # F. Save (Implementation depends on your specific save needs)
-                # final_path = output_dir / f"{exp}_{member}_{var}.nc"
-                # ds_yearly.to_netcdf(final_path)
-                
             except SanityCheckError as e:
                 print(f"\033[91mSanity check failed for {exp} member {member}: {e}\033[0m")
                 failed_sanity_checks.append((exp, member, str(e)))
@@ -736,7 +899,7 @@ def process_monthly(
 
     # Print a compact summary of yearly counts to aid debugging.
     if year_count_summary:
-        print(f"Year-count summary for {var}:")
+        print(f"Year-count summary for {var} / {model_name}:")
         for exp in sorted(year_count_summary.keys()):
             members = year_count_summary[exp]
             detail = ", ".join(
@@ -758,207 +921,164 @@ def process_monthly(
 
     if not exp2member2data_combined:
         raise ValueError(
-            f"No valid data remained for {var} after sanity checks. "
+            f"No valid data remained for {var} / {model_name} after sanity checks. "
             "See earlier per-member validation errors."
         )
 
     baseline_members = exp2member2data_combined.get("baseline", {})
     if not baseline_members:
         raise ValueError(
-            f"No valid baseline members remained for {var} after sanity checks. "
-            "Baseline is required for variability calculations."
+            f"No valid baseline members remained for {var} / {model_name} after sanity "
+            "checks. Baseline is required."
         )
 
-    # output_dir is passed from process_monthly
-    variability_result = compute_and_save_variability(
-        exp2member2data_combined, esm_var, output_dir, overwrite
-    )
-    if variability_result is None:
-        raise ValueError(
-            f"Could not compute model internal variability for {var}: baseline data unavailable."
+    # Dashboard variability artifacts — emitted by the primary model only
+    # (single set per variable; secondary models' baselines would overwrite).
+    if compute_variability:
+        variability_result = compute_and_save_variability(
+            exp2member2data_combined, esm_var, output_dir, overwrite
         )
-    std_value, weights = variability_result
-    
-    # Compute grid-level model internal variability
-    grid_level_variability = compute_and_save_grid_variability(exp2member2data_combined, var, esm_var, output_dir, overwrite)
-    if grid_level_variability is None:
-        raise ValueError(
-            f"Could not compute grid-level variability for {var}: baseline data unavailable."
+        if variability_result is None:
+            raise ValueError(
+                f"Could not compute model internal variability for {var}: baseline unavailable."
+            )
+        std_value, weights = variability_result
+
+        grid_level_variability = compute_and_save_grid_variability(
+            exp2member2data_combined, var, esm_var, output_dir, overwrite
         )
-
-    # Calcualting regional variability
-    process_geojson_variability(output_dir.parent / "geojsons/original", grid_level_variability, var, weights)
-
-    # Stitch Historical + Baseline
-    merge_historical_and_baseline(exp2member2data_combined)
-
-    # For merged data, gaps are allowed up to ``MERGED_HIST_BASELINE_MAX_YEAR_GAP``.
-    if "baseline" in exp2member2data_combined:
-        for member, ds in exp2member2data_combined["baseline"].items():
-            merged_years = ds.time.values
-            validate_year_continuity_with_max_gap(
-                years=merged_years,
-                var_name=var,
-                exp="baseline",
-                member=member,
-                stage="merged continuity",
-                max_gap_years=MERGED_HIST_BASELINE_MAX_YEAR_GAP,
+        if grid_level_variability is None:
+            raise ValueError(
+                f"Could not compute grid-level variability for {var}: baseline unavailable."
             )
 
-    if not exp2member2data_combined:
-        raise ValueError(f"No experiments available for regridding after merge for {var}.")
+        process_geojson_variability(
+            output_dir.parent / "geojsons/original", grid_level_variability, var, weights
+        )
+
+    # Stitch Historical + Baseline (only for models that have a historical run).
+    if has_historical:
+        merge_historical_into(exp2member2data_combined, no_sai_experiments)
+        for exp in no_sai_experiments:
+            for member, ds in exp2member2data_combined.get(exp, {}).items():
+                validate_year_continuity_with_max_gap(
+                    years=ds.time.values,
+                    var_name=var,
+                    exp=exp,
+                    member=member,
+                    stage="merged continuity",
+                    max_gap_years=MERGED_HIST_BASELINE_MAX_YEAR_GAP,
+                )
 
     print("Regridding and creating ensemble DataArrays...")
 
     # Initialize Regridder ONCE
+    import xesmf as xe  # lazy: see module-top note on the ESMF dependency
     first_exp = next(iter(exp2member2data_combined.values()))
     first_member_ds = next(iter(first_exp.values()))
-    
-    # We define standard coords just in case we need to force them on everyone
+
+    # Standard coords as a fallback if the native coords confuse xesmf.
     standard_lat = np.linspace(-90, 90, len(first_member_ds.lat))
     standard_lon = np.linspace(0, 360, len(first_member_ds.lon))
-    
-    # Try to build regridder; keep track if we used the fallback
+
     use_coord_fix = False
     try:
         regridder = xe.Regridder(first_member_ds, common_grid, 'bilinear', periodic=True)
     except Exception:
+        # CAUTION: this fallback *forces* a uniform -90..90 / 0..360 grid rather
+        # than repairing broken coordinate metadata. It is safe only when the
+        # source grid really is (near-)uniform with that extent — true for the
+        # CESM2-WACCM grid this was written for. For a model whose native grid
+        # is non-uniform or pole-excluding (e.g. a Gaussian latitude axis), the
+        # forced coords would not match the real cell centers, silently
+        # producing a spatially shifted field that still passes the NaN/range
+        # checks below. If a new model trips this path, verify its grid before
+        # trusting the output (MIROC's 128×256 atmos grid does NOT trip it — the
+        # standard regridder handles its native coords).
         print("\033[93m  Standard regridder failed. Switching to robust mode (forcing coords).\033[0m")
         use_coord_fix = True
-        # Create a temp copy just to build the weights
         ds_fix = first_member_ds.copy()
         ds_fix['lat'] = standard_lat
         ds_fix['lon'] = standard_lon
         regridder = xe.Regridder(ds_fix, common_grid, 'bilinear', periodic=True, ignore_degenerate=True)
 
-    # Process All Experiments
-    final_output_data = {} 
-
+    final_output_data = {}
     for exp, member2data in tqdm(exp2member2data_combined.items(), desc="Regridding Experiments"):
-        
         regridded_members = []
-
         for member, ds in member2data.items():
-            
-            # If we had to fix the regridder, we MUST fix the input data to match it
             if use_coord_fix:
-                ds = ds.copy() # Don't modify original data in the dict
+                ds = ds.copy()
                 ds['lat'] = standard_lat
                 ds['lon'] = standard_lon
 
-            # Apply regridder
             regridded = regridder(ds)
             validate_no_nans(
-                data=regridded,
-                var_name=var,
-                exp=exp,
-                member=member,
-                stage="regridding",
+                data=regridded, var_name=var, exp=exp, member=member, stage="regridding",
             )
             validate_no_negative_values(
-                data=regridded,
-                var_name=var,
-                exp=exp,
-                member=member,
-                stage="regridding",
+                data=regridded, var_name=var, exp=exp, member=member, stage="regridding",
             )
             validate_variable_specific_ranges(
-                data=regridded,
-                var_name=var,
-                exp=exp,
-                member=member,
-                stage="regridding",
+                data=regridded, var_name=var, exp=exp, member=member, stage="regridding",
             )
             regridded = regridded.assign_coords(member=member)
             regridded_members.append(regridded)
 
         if regridded_members:
-            # Concatenate
             ds_ensemble = xr.concat(regridded_members, dim="member", join="outer")
             ds_ensemble = _ensure_regridded_ensemble_dataset(ds_ensemble, esm_var)
             final_output_data[exp] = ds_ensemble
 
-    print("Regridding complete.")  
-
+    print("Regridding complete.")
     print("Finalizing and saving data...")
-    
-    # Common metadata to add
-    metadata_coords = {
-        "ssp": ["ssp245"],
-        "model": ["CESM2-WACCM"]
-    }
+
+    metadata_coords = {"ssp": ["ssp245"], "model": [model_coord]}
 
     for exp, ds_ensemble in final_output_data.items():
-        
-        # Save "All Members" (for specific variables)
-        # We do this BEFORE averaging so we keep the member dimension
+
+        # Save "All Members" for specific variables BEFORE averaging.
         if var in ["icefrac", "tas"]:
-            out_path_members = output_dir / f"output_gauss-{exp}-all-members.nc"
+            out_path_members = output_dir / f"output_gauss-{exp}{output_suffix}-all-members.nc"
             print(f"  Saving all-members data to {out_path_members.name}...")
-            
-            # Rename variable for consistency before saving
+
             ds_members_renamed = ds_ensemble.rename_vars({esm_var: var})
-            # ICEFRAC is masked to NH September only in ``process_file``; TAS all-members
-            # can also contain expected NaNs after member/time union with ``join='outer'``.
-            # Skip global NaN checks for these all-members exports.
-            if var not in {"icefrac", "tas"}:
-                validate_no_nans(
-                    data=ds_members_renamed[var],
-                    var_name=var,
-                    exp=exp,
-                    member="all-members",
-                    stage="all-members output",
-                )
+            # No NaN check here: this block only runs for icefrac and tas, and
+            # icefrac legitimately carries NaNs from the NH-September mask. (The
+            # negative-value and range guards below still apply.)
             validate_no_negative_values(
-                data=ds_members_renamed[var],
-                var_name=var,
-                exp=exp,
-                member="all-members",
-                stage="all-members output",
+                data=ds_members_renamed[var], var_name=var, exp=exp,
+                member="all-members", stage="all-members output",
             )
             validate_variable_specific_ranges(
-                data=ds_members_renamed[var],
-                var_name=var,
-                exp=exp,
-                member="all-members",
-                stage="all-members output",
+                data=ds_members_renamed[var], var_name=var, exp=exp,
+                member="all-members", stage="all-members output",
             )
-            
-            # Save
+
             if overwrite or not out_path_members.exists():
                 save_processed_data(ds_members_renamed, out_path_members, overwrite)
             else:
                 print(f"    Skipping (file exists): {out_path_members.name}")
 
         # Compute Ensemble Mean
-        # The user code had an if/else that did the same thing for both cases.
-        # We simplify it to just one operation.
         ds_mean = ds_ensemble.mean(dim="member")
         ds_mean = _ensure_regridded_ensemble_dataset(ds_mean, esm_var)
 
-        # Add Metadata Coordinates
         ds_mean = ds_mean.expand_dims({"ssp": 1, "model": 1})
         ds_mean = ds_mean.assign_coords(
             ssp=('ssp', metadata_coords["ssp"]),
             model=('model', metadata_coords["model"]),
-            lon=(ds_mean.lon % 360) # Ensure 0-360 longitude
+            lon=(ds_mean.lon % 360)  # Ensure 0-360 longitude
         )
 
-        # Rename Variable
         ds_mean = ds_mean.rename_vars({esm_var: var})
 
-        # Special Calculation: P-E
-        # This assumes 'var' is p-e and the current data is Evaporation (or similar),
-        # requiring subtraction from Precipitation (pr).
+        # P-E = pr - evap, using the matching pr output for this model/experiment.
         if var == "p-e":
-            pr_path = output_dir.parent / "pr" / f"output_gauss-{exp}.nc"
-            
+            pr_path = output_dir.parent / "pr" / f"output_gauss-{exp}{output_suffix}.nc"
             if pr_path.exists():
                 print(f"  Calculating P-E using {pr_path.name}...")
                 try:
                     ds_pr = xr.open_dataset(pr_path, decode_times=True)
-                    # Calculate: P - E
-                    # Note: Ensure units match (both should be mm/day based on earlier processing)
                     ds_mean[var] = ds_pr["pr"] - ds_mean[var]
                 except Exception as e:
                     print(f"\033[91m  [ERROR] Failed to calculate P-E: {e}\033[0m")
@@ -966,38 +1086,26 @@ def process_monthly(
                 print(f"\033[93m  [WARNING] Cannot calculate P-E. Missing 'pr' file: {pr_path}\033[0m")
 
         validate_no_nans(
-            data=ds_mean[var],
-            var_name=var,
-            exp=exp,
-            member="ensemble-mean",
+            data=ds_mean[var], var_name=var, exp=exp, member="ensemble-mean",
             stage="ensemble mean output",
         )
         validate_no_negative_values(
-            data=ds_mean[var],
-            var_name=var,
-            exp=exp,
-            member="ensemble-mean",
+            data=ds_mean[var], var_name=var, exp=exp, member="ensemble-mean",
             stage="ensemble mean output",
         )
         validate_variable_specific_ranges(
-            data=ds_mean[var],
-            var_name=var,
-            exp=exp,
-            member="ensemble-mean",
+            data=ds_mean[var], var_name=var, exp=exp, member="ensemble-mean",
             stage="ensemble mean output",
         )
 
-        # Save Final Averaged File
-        out_path_mean = output_dir / f"output_gauss-{exp}.nc"
+        out_path_mean = output_dir / f"output_gauss-{exp}{output_suffix}.nc"
         print(f"  Saving ensemble mean to {out_path_mean.name}")
-        
         if overwrite or not out_path_mean.exists():
             save_processed_data(ds_mean, out_path_mean, overwrite)
         else:
             print(f"    Skipping (file exists): {out_path_mean.name}")
 
-    print(f"--- Processing {var} Complete ---")
-
 
 if __name__ == "__main__":
+    import fire  # CLI-only; kept out of module-level imports (see top of file)
     fire.Fire(process_monthly)

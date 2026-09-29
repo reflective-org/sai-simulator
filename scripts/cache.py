@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from backend.get_outputs import get_temp_diff, get_so2_by_latitude
-from backend.baseline import get_global_temp, get_regional_models, get_regional_map_from_global_temp, get_regional_map
+from backend.baseline import get_global_temp, get_regional_models, get_regional_map_from_global_temp, get_regional_map, validate_cache_dir
 from backend.delta import get_regional_delta
 from backend.historical import get_historical_model
 from backend.p_values import get_grid_level_p_values
@@ -62,6 +62,10 @@ def cache(
     model_dir = Path(model_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
+    # Stamps a fresh dir with the (version, FaIR calibration) fingerprint, accepts a
+    # matching resume, and refuses a legacy or mismatched dir — a skip-existing resume
+    # over artifacts from another calibration would silently mix climates.
+    validate_cache_dir(output_dir)
 
     if historical_only:
         cache_historical(data_dir, output_dir)
@@ -90,6 +94,9 @@ def cache(
             if historical_model is None:
                 continue
             historical_rebase = historical_model.sel(time=slice(1850, 1900)).mean('time')
+            # Bound only on the icefrac no-SAI path; the SAI branch below must
+            # not rely on it having been set (resumed runs skip that branch).
+            regional_temp = None
 
             # cache no sai regional map and p values
             no_sai_cache_paths = [output_dir / f"{simple_ssp}_regional_{var}.nc",
@@ -143,7 +150,9 @@ def cache(
                         # Assumes ramp-up is always 10 years, and caches so2 based on this.
                         # This would need to be changed if we want to support other ramp-up periods.
                         so2_by_latitude = get_so2_by_latitude(interpolator, _temp_diff, ramp_up=10)["so2"]
-                        so2_by_latitude = so2_by_latitude.drop_vars('model')
+                        # The multi-model-mean temp_diff no longer carries a leftover
+                        # 'model' coord (the old single-model .sel did) — drop if present.
+                        so2_by_latitude = so2_by_latitude.drop_vars('model', errors='ignore')
 
                         so2_by_latitudes.append(so2_by_latitude)
 
@@ -161,11 +170,22 @@ def cache(
                     continue
                 
                 if var == "icefrac":
+                    # Historically this read the leftover `start_year` binding from the SO2
+                    # loop above (its final value, 2090), which is undefined when the SO2
+                    # caches already exist. Pin it so regeneration reproduces the incumbent
+                    # cache contents (icefrac deltas covering 2090-2100) either way.
                     temp_regional_delta = get_regional_delta(
-                        "tas", data_dir, model_dir, output_dir, ssp_scenario, 
-                        temp_target, 10, temp_diff, start_year
+                        "tas", data_dir, model_dir, output_dir, ssp_scenario,
+                        temp_target, 10, temp_diff, start_year=2090
                     )
-                    
+
+                    # On a resumed run the no-SAI branch above was skipped (its
+                    # caches exist), so regional_temp was never set — load it
+                    # here (get_regional_map serves it from its own cache).
+                    if regional_temp is None:
+                        regional_temp, _ = get_regional_map(
+                            "tas", data_dir, model_dir, output_dir, ssp_scenario
+                        )
                     temp_with_sai = regional_temp + temp_regional_delta
                     icefrac_with_sai = predict_icefrac(temp_with_sai, model_dir)
                     regional_delta = icefrac_with_sai - regional_map

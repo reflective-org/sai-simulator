@@ -14,10 +14,12 @@ recomputing the t-test at request time.
 
 CLI entry: ``python scripts/variability.py <var_name> <data_dir> <model_dir>``.
 """
-import fire
 import xarray as xr
 import numpy as np
 import sys
+# ``fire`` is imported lazily inside the ``__main__`` block below so that
+# importing this module (transitively pulled in by scripts.process_monthly_gauss
+# for ``process_geojson_variability``) does not require ``fire`` in CI.
 from typing import Union, Tuple
 from pathlib import Path
 import geopandas as gpd
@@ -332,7 +334,12 @@ def _calculate_icefrac_variability(data_dir: Path, model_dir: Path):
     # Load Data & Parameters
     # ------------------------------------------------------------------
     area_da = get_area(data_dir)  # Returns DataArray (lat, lon)
-    params_da = load_icefrac_params(model_dir) # Returns DataArray (features, lon_band, lat_band, lat, lon)
+    params_da = load_icefrac_params(model_dir) # (model, features, lon_band, lat_band, lat, lon)
+    # This hindcast reconstructs CESM ensemble members (the *-all-members
+    # training files are CESM's; variability is a CESM-only product), so use
+    # CESM's own sigmoid rather than the multi-model set. The numpy
+    # broadcasting below must not carry a model dim.
+    params_da = params_da.sel(model="CESM2-WACCM")
     
     # Matching Common Time Ranges
     common_time_ranges = matching_common_time_ranges(data_dir, VAR_TEMP, VAR_ICE)
@@ -562,4 +569,5 @@ def process_geojson_variability(
 
 
 if __name__ == "__main__":
+    import fire  # CLI-only; kept out of module-level imports (see top of file)
     fire.Fire(calculate_variability)

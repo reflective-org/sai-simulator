@@ -9,6 +9,7 @@ Official repository for [the SAI Simulator](https://simulator.reflective.org/), 
 ## Table of Contents
 
 - [Introduction](#introduction)
+- [Climate Model Data](#climate-model-data)
 - [Setup Options](#setup-options)
 - [Option 1: Automated Setup (Recommended)](#-option-1-automated-setup-recommended)
 - [Option 2: Manual Setup](#-option-2-manual-setup)
@@ -19,12 +20,88 @@ Official repository for [the SAI Simulator](https://simulator.reflective.org/), 
   - [Variability Calculation](#e-variability-calculation)
   - [Cache the Data](#f-cache-the-data)
   - [Launch Gradio](#g-launch-gradio)
+- [Adding a New Model](#-adding-a-new-model)
 - [License](#-license)
 - [Citation](#%EF%B8%8F-citation)
 
 ## Introduction
 
 The SAI Simulator is a web-based tool that runs in your browser at [simulator.reflective.org](https://simulator.reflective.org/). If you would like to reproduce the steps to prepare the data presented in the simulator, you can follow the instructions below.
+
+## Climate Model Data
+
+The simulator is trained on monthly output from two Earth system models, combined as an
+equal-weight multi-model mean of **patterns per kelvin**: each model's regional fields
+are regressed on **its own global-mean tas anomaly** (vs its own 1850–1900 mean), and at
+request time FaIR's global anomaly (AR6 calibrated-constrained ensemble mean by default;
+see `FAIR_CALIBRATION` in `backend/baseline.py`) is fed through every model's fitted
+line and the lines are averaged 50/50 — that average is the final mapping from global
+temperature to grid-cell values, so both patterns count equally even though the models'
+transient sensitivities differ. One Zarr store per (model, experiment) is served from
+the public bucket configured in `version.py` (`ZARR_STORES_URI`); the table lists what
+each store contains.
+
+| Model | Experiment | Members | Years | Data coverage | Native grid (lat × lon) |
+|-------|------------|---------|-------|---------------|--------------------------|
+| CESM2-WACCM-MA | historical | 3 (`001`–`003`) | 165 | 1850–2014 | 192 × 288 (~0.9° × 1.25°, fv09) |
+| CESM2-WACCM-MA | baseline (SSP2-4.5) | 3 | 85 | 2015–2099 | 192 × 288 |
+| CESM2-WACCM-MA | 1.5K-SAI (GAUSS) | 3 | 35 | 2035–2069 | 192 × 288 |
+| CESM2-WACCM-MA | 1.0K-SAI (GAUSS) | 3 | 35 | 2035–2069 | 192 × 288 |
+| CESM2-WACCM-MA | 0.5K-SAI (GAUSS) | 3 | 36 | 2035–2070 | 192 × 288 |
+| MIROC-ES2H | historical | 3 (`r01`–`r03`) | 165 | 1850–2014 | 128 × 256 (T85, ~1.4°) |
+| MIROC-ES2H | baseline (GeoMIP no-SAI reference, SSP2-4.5 forcing) | 3 | 65 | 2020–2084 | 128 × 256 |
+| MIROC-ES2H | ssp245 (ScenarioMIP SSP2-4.5) | 3 | 86 | 2015–2100 | 128 × 256 |
+| MIROC-ES2H | G6-1.5K-SAI (GeoMIP) | 3 | 50 | 2035–2084 | 128 × 256 |
+| MIROC-ES2H | G6-0.5K-SAI (GeoMIP) | 3 | 50 | 2035–2084 | 128 × 256 |
+
+Notes:
+
+- **Common grid.** All model output is regridded bilinearly onto the CESM2-WACCM
+  192 × 288 grid during processing (`scripts/process_monthly_gauss.py`), so every
+  downstream product shares one grid.
+- **Coverage vs. timestamps.** CESM stores stamp monthly means at the *end* of the
+  month (e.g. the January 1850 mean is stamped `1850-02-01`); the table states data
+  coverage, not raw stamp ranges. MIROC stamps are start-of-month.
+- **Historical merge.** Each model's historical run is stitched, per member, into every
+  no-SAI run it publishes, so each of those files carries the full 1850-onwards series
+  its consumer expects.
+- **Two no-SAI runs, two roles (MIROC).** `baseline` and `ssp245` are distinct
+  realizations under the same SSP2-4.5 forcing (global means agree to ~0.1–0.2 K, but
+  the weather differs), and the pipeline uses each where it belongs:
+
+  | Role | Run used | Why |
+  |------|----------|-----|
+  | **SAI delta** (`scripts/fit_delta.py`) | `baseline` | The G6 experiments branched from it, so rebasing the anchors against it isolates the SAI signal from inter-run drift. |
+  | **Climate-change-only fit** (`scripts/fit_map.py`, dashboard projection + historical series) | `ssp245` | The standard ScenarioMIP run: 2015–2100, continuous with historical, and the same scenario definition CESM's baseline provides. |
+
+  CESM publishes one run that serves both roles, so only MIROC has the split. The
+  selection lives in `backend.constants.REGIONAL_MODEL2PROJECTION_BASELINE_FILES`
+  (projection side) and `scripts/fit_delta.ANCHORS` (delta side).
+- **`ssp245` evaporation and sea ice.** Native ScenarioMIP `hfls` for this run lives
+  only on the offline ESGF node `esgf-data02.diasjp.net`, so the store's `QFLX` is
+  **filled from the GeoMIP baseline run's hfls** over 2020–2084 (NaN for 2015–2019 and
+  2085–2100; see the array's `note` attr) — same SSP2-4.5 forcing but a different
+  realization, so monthly P−E covariance is approximate while climatological means are
+  consistent; MIROC's `ssp245` p−e output covers 65 years accordingly. `ICEFRAC` is
+  regridded from the run's **own CMOR `siconc`** (ESGF ORNL mirror; full 2015–2100,
+  bilinear from the curvilinear ocean grid; validated same-run against the shipped
+  historical ICEFRAC to 0.1–0.8% on September Arctic ice area — ice-edge cells differ
+  slightly from the producer's GeoMIP seaice conversion, see the array's `note` attr).
+  The sea-ice **sigmoid fit** still trains on the GeoMIP family (branch-consistency
+  with the G6 anchors), not on `ssp245`.
+- **The two G6 experiments share one branch-point baseline.** JAMSTEC publishes
+  `*_baseline_*` files under both `G6-1.5K-SAI/` and `G6-0.5K-SAI/`; they are
+  byte-identical (verified bitwise for hfls, size-identical for every other variable),
+  so `MIROC-ES2H_baseline.zarr` is the correct rebase reference for **both** G6 anchors
+  in the delta fit — no per-experiment baseline stores are needed.
+- **SAI experiment naming.** The CESM GAUSS runs and MIROC G6 runs are labeled by
+  their temperature *target* above pre-industrial (e.g. `0.5K` targets +0.5 °C, which
+  requires the largest cooling), and each is rebased against its own model's baseline
+  in the delta fit (`scripts/fit_delta.py`).
+- **MIROC evaporation.** MIROC's `QFLX` (used for water availability, P−E) is derived
+  from JAMSTEC's monthly latent heat flux: `QFLX = hfls / 2.5e6`.
+- **SO2 injection.** The SO2-by-latitude controller data exists only for the CESM
+  GAUSS runs, so the SO2 fit is CESM-only.
 
 ## Setup Options
 
@@ -249,6 +326,59 @@ For custom injection
 ```bash
 python variable_launch_gradio.py --use_local_cache
 ```
+
+## 🧩 Adding a New Model
+
+The pipeline is multi-model: each climate model is processed independently and
+contributes its SAI experiment(s) as additional training **anchors** to the
+delta fit. CESM2-WACCM (GAUSS) and MIROC-ES2H (G6-1.5K) are wired in today;
+adding another model (e.g. UKESM, once its data is public) is mostly
+configuration. There are commented `UKESM1-1-LL` stubs in the files below to
+copy from.
+
+**Producer side (off-repo).** Build per-experiment Zarr stores for the new
+model in R2 under the `/simulator-inputs/` prefix, matching the existing
+convention: CESM-style variable names (`TREFHT`, `PRECT`, `ICEFRAC`,
+`TREFHTMN`/`TREFHTMX`, the `*_above_*`/`*_below_*` exposure counts), the same
+group layout (`Mon/atmos_2d`, `Mon/atmos_2d_derived`, `Mon/atmos_2d_tasminmax`),
+all available members, and an SSP2-4.5 baseline plus the model's G6 SAI run(s).
+Regrid sea ice to `ICEFRAC` (land filled with 0) and precompute the exposure
+counts so the consumer stays model-agnostic. The consumer bilinearly regrids
+every model onto the CESM2-WACCM target grid, so the native grid needs no
+special handling.
+
+**Repo side (five edits, all by analogy to the MIROC entries):**
+
+1. `scripts/data_sanity_checks.py` — add the new store filenames to
+   `STORE_NAMES`. If the model publishes no evaporative-flux source at all (no
+   `QFLX`, which means no `p-e` downstream), add it to `ALLOWED_MISSING` so the
+   absence is treated as allowed rather than a failure.
+2. `scripts/process_monthly_gauss.py` — add a `MODELS` entry: the
+   `(store, label)` experiment pairs, `model_coord`, a unique `output_suffix`
+   (e.g. `"-ukesm"`), `has_historical`, `no_sai_experiments` (every no-SAI run
+   the model publishes — the historical run is stitched into each), and
+   `experiment_missing_vars` for any variable a given store ships as a
+   placeholder, plus `compute_variability: False`.
+3. `scripts/fit_delta.py` — add one `Anchor` to `ANCHORS` per SAI cooling label,
+   pointing at the consumer's `output_gauss-<label><output_suffix>.nc` and, as
+   the baseline, **the run those SAI experiments branched from**.
+4. `backend/constants.py` — add the model to `REGIONAL_MODEL_NAMES` and give it
+   an entry in `REGIONAL_MODEL2PROJECTION_BASELINE_FILES` listing its
+   projection-baseline file(s) in preference order (the ScenarioMIP run first,
+   then any fallback for variables that run lacks).
+5. Run the pipeline (`process_monthly_gauss.py --model all`, then
+   `scripts/fit_all.sh`) and validate.
+
+**Weighting note.** The SAI slope is one **pooled** through-origin least
+squares over every model's anchors, which weights each anchor by the *square*
+of its cooling magnitude (currently CESM 60.4% / MIROC 39.6% overall) — unlike
+the no-SAI emulators and sea-ice sigmoids, which average per-model results
+50/50 at prediction time. The pooled form is deliberate: fitting per model and
+averaging would make model totals equal but concentrate 41.7% of all influence
+in MIROC's single G6-0.5K run (see the ``scripts/fit_delta.py`` docstring).
+A new model contributing only a lone ~1.5K G6 run (the shallowest cooling)
+adds the least leverage an anchor can have — worth a conscious decision if you
+want balanced coverage across cooling magnitudes.
 
 ## 🔒 License
 

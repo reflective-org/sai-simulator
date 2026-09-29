@@ -260,14 +260,20 @@ def load_icefrac_params(model_dir: Union[str, Path]) -> xr.DataArray:
     """
     Loads and caches logistic interpolation parameters from the model directory.
 
-    It assumes the parameters are stored in 'icefrac_arctic/interpolator.nc' 
+    It assumes the parameters are stored in 'icefrac_arctic/interpolator.nc'
     and strictly validates that the DataArray is named 'logistic_params'.
+
+    The returned array always carries a ``model`` dimension — one entry per
+    climate model whose sigmoids were fit by ``scripts/fit_icefrac_arctic.py``.
+    Older single-model interpolator files (no ``model`` dim) are promoted to a
+    singleton ``model`` dim for backward compatibility.
 
     Args:
         model_dir: Base directory containing the model subdirectories.
 
     Returns:
-        xr.DataArray: The loaded parameters array.
+        xr.DataArray: The loaded parameters array with dims
+        ``(model, features, lon_band, lat_band, lat, lon)``.
 
     Raises:
         FileNotFoundError: If the interpolator file does not exist.
@@ -287,8 +293,13 @@ def load_icefrac_params(model_dir: Union[str, Path]) -> xr.DataArray:
                 f"Invalid parameter file. Expected DataArray named 'logistic_params', "
                 f"but found '{da.name}' in {path}."
             )
-            
-        return da.load()
+
+        da = da.load()
+
+    if 'model' not in da.dims:
+        # Legacy single-model file (pre-multi-model fit): CESM2-WACCM only.
+        da = da.expand_dims(model=["CESM2-WACCM"])
+    return da
 
 
 def get_parameter_values(
@@ -329,15 +340,21 @@ def get_parameter_values(
 
 
 def predict_icefrac(
-    temp_ds: xr.Dataset, 
-    model_dir: Union[str, Path], 
-    start_lat: float = 60.0, 
-    end_lat: float = 90.0
+    temp_ds: xr.Dataset,
+    model_dir: Union[str, Path],
+    start_lat: float = 60.0,
+    end_lat: float = 90.0,
+    per_model: bool = False,
 ) -> xr.DataArray:
     """
-    Emulates ICEFRAC response to temperature anomalies using a logistic model.
+    Emulates ICEFRAC response to temperature anomalies using per-model logistic fits.
 
-    This function automatically detects if the input time coordinate represents 
+    Every climate model's sigmoid is evaluated and the predictions are averaged
+    (mean of the sigmoids, not one sigmoid fit to pooled data). Cells where a
+    model's per-cell fit failed contribute 0 for that model — the same "no fit
+    ⇒ no ice" convention the single-model predictor used.
+
+    This function automatically detects if the input time coordinate represents
     datetimes or integer years and handles both cases safely.
 
     Args:
@@ -345,10 +362,13 @@ def predict_icefrac(
         model_dir: Directory containing the 'icefrac_arctic/interpolator.nc' file.
         start_lat: Southernmost latitude of the Arctic region. Defaults to 60.0.
         end_lat: Northernmost latitude of the Arctic region. Defaults to 90.0.
+        per_model: If True, skip the across-model mean and keep the ``model``
+            dimension — used to compute the across-model uncertainty band.
 
     Returns:
-        xr.DataArray: Global ICEFRAC predictions (time, lat, lon). 
-                      Non-arctic regions are filled with 0.
+        xr.DataArray: Global ICEFRAC predictions (time, lat, lon), averaged
+                      across models — or (model, time, lat, lon) when
+                      ``per_model`` is True. Non-arctic regions are filled with 0.
     """
     # 1. Robust Year Extraction
     # ------------------------------------------------------------------
@@ -383,21 +403,28 @@ def predict_icefrac(
 
     # 4. Apply Logistic Model (Vectorized Broadcasting)
     # ------------------------------------------------------------------
-    # Xarray broadcasts dims automatically: (time, bands) vs (lat, lon, bands)
+    # Xarray broadcasts dims automatically: (time, bands) vs (model, lat, lon, bands)
     prediction_bands = logistic(anomalies_da, L, x0, k, b)
 
     # 5. Aggregation
     # ------------------------------------------------------------------
-    # Sum over bands (handling NaNs as 0) to flatten the sparse arctic structure
+    # Sum over bands (handling NaNs as 0) to flatten the sparse arctic structure.
+    # Each (lat, lon) cell lives in exactly one band, so this collapses the
+    # sparse structure per model; cells with a failed fit (NaN params) become 0.
     prediction_arctic = prediction_bands.sum(dim=['lat_band', 'lon_band'], min_count=0)
 
-    # 6. Global Reconstruction
+    # 6. Across-Model Mean (mean of the sigmoids)
+    # ------------------------------------------------------------------
+    if not per_model:
+        prediction_arctic = prediction_arctic.mean(dim='model')
+
+    # 7. Global Reconstruction
     # ------------------------------------------------------------------
     # Reindex back to global grid, filling non-arctic areas with 0
     prediction_global = prediction_arctic.reindex(
-        lat=temp_ds.lat, 
-        lon=temp_ds.lon, 
+        lat=temp_ds.lat,
+        lon=temp_ds.lon,
         fill_value=0.0
     )
 
-    return prediction_global.transpose('time', 'lat', 'lon')
+    return prediction_global.transpose(..., 'time', 'lat', 'lon')

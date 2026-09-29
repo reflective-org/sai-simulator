@@ -1,6 +1,9 @@
 """Project-wide version constants."""
 
-SIMULATOR_VERSION = "v1.3.0"
+# v1.4.0: FaIR default climate calibration switched from CESM-tuned to the AR6
+# calibrated-constrained ensemble (mean across members) — every FaIR-dependent
+# cache artifact and pregenerated golden changes; regenerate under this version.
+SIMULATOR_VERSION = "v1.4.0"
 
 # Public Cloudflare R2 location of the per-experiment Zarr training-data
 # stores consumed by scripts/process_monthly_gauss.py and verified by

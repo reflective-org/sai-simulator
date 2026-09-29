@@ -1,22 +1,29 @@
 """Fit per-grid-cell logistic regressions mapping Arctic ``tas`` anomaly to ``icefrac``.
 
-Stitches together baseline + GAUSS SAI experiments, loads the matching Arctic temperature
-and ice-fraction fields, filters out grid cells with too little signal or too few valid
-observations, then drives :class:`backend.sigmoid.LogisticFitter` to fit a four-parameter
-decreasing logistic for every cell in the Arctic. The resulting ``(features, lon_band, lat_band,
-lat, lon)`` parameter array is expanded back to the global grid (non-Arctic = NaN) and saved
-as ``output_dir/<var>_arctic/interpolator.nc`` — this is the ``logistic_params`` file consumed
-by :func:`backend.icefrac.predict_icefrac`.
+For **each model** in :data:`MODEL_SCENARIOS` independently: stitches together that model's
+baseline + SAI experiments, loads the matching Arctic temperature and ice-fraction fields,
+filters out grid cells with too little signal or too few valid observations, then drives
+:class:`backend.sigmoid.LogisticFitter` to fit a four-parameter decreasing logistic for every
+cell in the Arctic. Temperature anomalies are computed against each model's **own** baseline
+1850-1900 climatology so inter-model bias doesn't leak into the fit. The per-model parameter
+arrays are stacked into one ``(model, features, lon_band, lat_band, lat, lon)`` DataArray
+(non-Arctic = NaN) and saved as ``output_dir/<var>_arctic/interpolator.nc`` — this is the
+``logistic_params`` file consumed by :func:`backend.icefrac.predict_icefrac`, which evaluates
+every model's sigmoid and averages the predictions (mean of sigmoids, not sigmoid of pooled
+data).
 
 CLI entry: ``python scripts/fit_icefrac_arctic.py <var> <data_dir> <output_dir> [--ignore_existing]``.
 """
-import fire
 import numpy as np
 import xarray as xr
 from pathlib import Path
 import warnings
 import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+# ``fire`` is imported lazily inside the ``__main__`` block below so that
+# importing this module (e.g. for unit tests of ``MODEL_SCENARIOS`` and the
+# fit helpers) does not require ``fire`` in the test environment.
 from backend.sigmoid import LogisticFitter
 from backend.icefrac import calculate_temperature_anomalies, create_arctic_dataset
 from backend.utils import open_xarray_datasets, save_processed_data
@@ -26,14 +33,38 @@ from backend.utils import open_xarray_datasets, save_processed_data
 # Configuration
 # ------------------------------------------------------------------------------
 
-# Define experiment scenarios to ensure consistent processing and avoid code duplication.
-# Keys represent internal scenario names, values contain file names and time ranges.
-SCENARIOS = {
-    "baseline": {"file": "output_gauss-baseline.nc", "start": 1900, "end": 2098},
-    "sai_0_5":  {"file": "output_gauss-0.5.nc",      "start": 2050, "end": 2069},
-    "sai_1_0":  {"file": "output_gauss-1.0.nc",      "start": 2050, "end": 2069},
-    "sai_1_5":  {"file": "output_gauss-1.5.nc",      "start": 2050, "end": 2069},
+# Per-model experiment scenarios. Outer keys are the ``model`` coord values the
+# rest of the pipeline uses (see MODELS in process_monthly_gauss.py); inner keys
+# are internal scenario names, values contain file names and time ranges. The
+# "baseline" entry doubles as the source of each model's 1850-1900 anomaly
+# reference, so it must be the merged historical+SSP2-4.5 file.
+#
+# MIROC uses its GeoMIP ``baseline`` rather than the ScenarioMIP ``ssp245`` run the
+# projection emulator trains on: the sigmoid pairs each G6 SAI scenario with the
+# run it branched from (as the delta fit does), keeping the temperature-anomaly
+# axis and the ice response on one realization. (ssp245 ICEFRAC exists since the
+# CMOR-siconc fill and could be ADDED as extra no-SAI training data later — a
+# deliberate decision, since its regrid recipe differs slightly at the ice edge
+# from the GeoMIP-derived stores; see the store's ICEFRAC note attr.) A model whose
+# baseline file is missing is skipped with a warning (except the primary model,
+# which is required); individual missing SAI files are skipped likewise.
+MODEL_SCENARIOS = {
+    "CESM2-WACCM": {
+        "baseline": {"file": "output_gauss-baseline.nc", "start": 1900, "end": 2098},
+        "sai_0_5":  {"file": "output_gauss-0.5.nc",      "start": 2050, "end": 2069},
+        "sai_1_0":  {"file": "output_gauss-1.0.nc",      "start": 2050, "end": 2069},
+        "sai_1_5":  {"file": "output_gauss-1.5.nc",      "start": 2050, "end": 2069},
+    },
+    "MIROC-ES2H": {
+        "baseline":   {"file": "output_gauss-baseline-miroc.nc", "start": 1900, "end": 2098},
+        "sai_g6_0_5": {"file": "output_gauss-g6-0.5-miroc.nc",   "start": 2050, "end": 2069},
+        "sai_g6_1_5": {"file": "output_gauss-g6-1.5-miroc.nc",   "start": 2050, "end": 2069},
+    },
 }
+
+# The model whose baseline file must exist (its grid is the common target grid
+# every other model is regridded onto, and it supplies the output coords).
+PRIMARY_MODEL = "CESM2-WACCM"
 
 VAR_TEMP = "tas"
 
@@ -259,43 +290,66 @@ def _load_and_process_ice(
     return reshaped_data
 
 
-def _save_params_to_netcdf(
-    params: np.ndarray, 
-    template_ds: xr.Dataset, 
-    arctic_ref: xr.Dataset, 
-    output_path: Path,
-) -> None:
+def _expand_params_to_global(
+    params: np.ndarray,
+    template_ds: xr.Dataset,
+    arctic_ref: xr.Dataset,
+) -> np.ndarray:
     """
-    Expands fitted parameters back to the full global grid and saves to NetCDF.
+    Expands one model's fitted parameters back to the full global grid.
 
-    This handles the complexity of padding the non-Arctic regions with NaNs so the 
+    This handles the complexity of padding the non-Arctic regions with NaNs so the
     output matches the dimensions of the original global input files.
 
     Args:
         params: The fitted logistic parameters (features, lon_band, lat_band, spatial_flat).
-        template_ds: A global dataset used to extract full lat/lon coordinates.
-        arctic_ref: The arctic-subset dataset used to extract band coordinates.
-        output_path: Path where the NetCDF file will be saved.
+        template_ds: A global dataset used to extract full lat/lon shapes.
+        arctic_ref: The arctic-subset dataset used to recover the (lat, lon) shape.
+
+    Returns:
+        np.ndarray with shape (features, lon_band, lat_band, global_lat, global_lon).
     """
     # 1. Reshape params from flat spatial dim back to (lat, lon) for the arctic region
     # Expected shape: (features, lon_band, lat_band, arctic_lat, lon)
     params_reshaped = params.reshape(params.shape[:-1] + arctic_ref.tas.shape[-2:])
-    
+
     # 2. Create a container for the full global grid filled with NaNs
     # Structure: (features, lon_band, lat_band, global_lat, global_lon)
     expanded_shape = list(params_reshaped.shape[:-2] + template_ds.tas.shape[-2:])
     expanded_params = np.full(expanded_shape, np.nan)
-    
+
     # 3. Fill the Arctic portion of the grid
     # We assume the Arctic data corresponds to the highest latitudes (end of the array)
     lat_cutoff = params_reshaped.shape[-2]
     expanded_params[..., -lat_cutoff:, :] = params_reshaped
 
-    # 4. Construct DataArray
+    return expanded_params
+
+
+def _save_params_to_netcdf(
+    model2expanded_params: dict[str, np.ndarray],
+    template_ds: xr.Dataset,
+    arctic_ref: xr.Dataset,
+    output_path: Path,
+) -> None:
+    """
+    Stacks per-model global parameter grids on a ``model`` dim and saves to NetCDF.
+
+    Args:
+        model2expanded_params: model name → global parameter grid from
+            :func:`_expand_params_to_global`, one entry per fitted model.
+        template_ds: A global dataset used to extract full lat/lon coordinates.
+        arctic_ref: The arctic-subset dataset used to extract band coordinates.
+        output_path: Path where the NetCDF file will be saved.
+    """
+    models = list(model2expanded_params)
+    stacked = np.stack([model2expanded_params[m] for m in models], axis=0)
+
     params_xr = xr.DataArray(
-        expanded_params, 
-        dims=['features', 'lon_band', 'lat_band', 'lat', 'lon'],
+        stacked,
+        dims=['model', 'features', 'lon_band', 'lat_band', 'lat', 'lon'],
         coords={
+            'model': models,
             'features': ['L', 'x0', 'k', 'b'],
             'lon_band': arctic_ref.lon_band,
             'lat_band': arctic_ref.lat_band,
@@ -312,25 +366,102 @@ def _save_params_to_netcdf(
 # Main Function
 # ------------------------------------------------------------------------------
 
+def _fit_one_model(
+    var: str,
+    data_path: Path,
+    scenarios: dict[str, dict],
+) -> np.ndarray | None:
+    """Fit one model's per-cell logistics from its own baseline + SAI scenarios.
+
+    Temperature anomalies are computed against this model's own baseline
+    1850-1900 climatology. Missing SAI files are skipped with a warning;
+    returns ``None`` when the baseline file itself is missing (the model can't
+    be fit at all).
+
+    Returns:
+        (features, lon_band, lat_band, spatial_flat) parameter array, or None.
+    """
+    baseline_file = scenarios["baseline"]["file"]
+    if not (data_path / VAR_TEMP / baseline_file).exists():
+        return None
+
+    # --- 1. Prepare Baseline Reference ---
+    # The model's own baseline temperature serves as the climatology reference
+    # for anomaly calculations across all of its scenarios.
+    baseline_raw = open_xarray_datasets(data_path / VAR_TEMP / baseline_file)
+    baseline_arctic_ref = create_arctic_dataset(baseline_raw)
+
+    # --- 2. Load & Process Data Scenarios ---
+    X_arrays = []
+    Y_arrays = []
+
+    for name, config in scenarios.items():
+        if not (data_path / VAR_TEMP / config["file"]).exists() or not (
+            data_path / var / config["file"]
+        ).exists():
+            print(f"  scenario {name}: missing {config['file']} — skipping")
+            continue
+
+        # Process Temperature (X)
+        x_data = _load_and_process_temp(
+            data_path,
+            config["file"],
+            config["start"],
+            config["end"],
+            baseline_arctic_ref
+        )
+        X_arrays.append(x_data)
+
+        # Process Ice Fraction (Y)
+        y_data = _load_and_process_ice(
+            data_path,
+            var,
+            config["file"],
+            config["start"],
+            config["end"]
+        )
+        Y_arrays.append(y_data)
+
+    if not X_arrays:
+        return None
+
+    # --- 3. Merge & Filter ---
+    # Concatenate all scenarios along the time axis (axis 2)
+    X = np.concatenate(X_arrays, axis=2)
+    Y = np.concatenate(Y_arrays, axis=2)
+
+    # Filter Y data (removes noise and insufficient data points)
+    # Note: X is not filtered here; the fitter handles per-cell NaN masking
+    Y, _, _ = filter_icefrac_data(Y)
+
+    # --- 4. Model Fitting ---
+    fitter = LogisticFitter(X, Y)
+
+    # Fit models using all available cores (n_jobs=-1)
+    params, _, _, _ = fitter.fit_all(n_jobs=-1)
+    return params
+
+
 def fit_arctic_logistic(
-    var: str, 
-    data_dir: str, 
-    output_dir: str, 
+    var: str,
+    data_dir: str,
+    output_dir: str,
     ignore_existing: bool = False
 ) -> None:
     """
-    Orchestrates the loading, transforming, and fitting of logistic models 
-    relating Arctic temperature anomalies to ice fraction.
+    Orchestrates the loading, transforming, and fitting of logistic models
+    relating Arctic temperature anomalies to ice fraction, one fit per model.
 
     The workflow follows these steps:
     1. Checks if output exists (skips if so).
-    2. Prepares a baseline reference for temperature anomalies.
-    3. Iterates through configured scenarios (Baseline, SAI 0.5, 1.0, 1.5) to 
-       load and process both Temperature (X) and Ice Fraction (Y) data.
-    4. Concatenates all scenarios into a single training set.
-    5. Filters invalid or low-quality ice data.
-    6. Fits logistic models (in parallel).
-    7. Saves the resulting parameters to a NetCDF file.
+    2. For each model in :data:`MODEL_SCENARIOS` (against its own baseline
+       reference): loads and processes Temperature (X) and Ice Fraction (Y)
+       for every scenario, concatenates them into that model's training set,
+       filters invalid or low-quality ice data, and fits per-cell logistics
+       (in parallel).
+    3. Stacks the per-model parameters on a ``model`` dim and saves them to a
+       single NetCDF file, from which :func:`backend.icefrac.predict_icefrac`
+       averages the per-model sigmoid predictions.
 
     Args:
         var: The variable name to fit (e.g., 'icefrac').
@@ -341,62 +472,46 @@ def fit_arctic_logistic(
     data_path = Path(data_dir)
     out_path = Path(output_dir) / f"{var}_arctic"
     out_path.mkdir(exist_ok=True, parents=True)
-    
+
     interpolator_path = out_path / "interpolator.nc"
     if interpolator_path.exists() and not ignore_existing:
         return
 
-    # --- 1. Prepare Baseline Reference ---
-    # We load the raw baseline temperature first to serve as the climatology reference
-    # for anomaly calculations across all scenarios.
-    baseline_raw = open_xarray_datasets(data_path / VAR_TEMP / SCENARIOS["baseline"]["file"])
-    baseline_arctic_ref = create_arctic_dataset(baseline_raw)
+    model2expanded_params: dict[str, np.ndarray] = {}
+    for model_name, scenarios in MODEL_SCENARIOS.items():
+        print(f"--- Fitting {var} logistics for {model_name} ---")
+        params = _fit_one_model(var, data_path, scenarios)
+        if params is None:
+            if model_name == PRIMARY_MODEL:
+                raise ValueError(
+                    f"Baseline file {scenarios['baseline']['file']} for primary model "
+                    f"{PRIMARY_MODEL} is missing. Need to run process_monthly_gauss.py first."
+                )
+            print(f"\033[93m  no usable data for {model_name} — skipping this model\033[0m")
+            continue
 
-    # --- 2. Load & Process Data Scenarios ---
-    X_arrays = []
-    Y_arrays = []
-    
-    for config in SCENARIOS.values():
-        # Process Temperature (X)
-        x_data = _load_and_process_temp(
-            data_path, 
-            config["file"], 
-            config["start"], 
-            config["end"], 
-            baseline_arctic_ref
+        # Expand to the global grid using this model's own baseline for the
+        # arctic band shape (identical across models — all are regridded onto
+        # the primary model's grid by process_monthly_gauss.py).
+        baseline_raw = open_xarray_datasets(
+            data_path / VAR_TEMP / scenarios["baseline"]["file"]
         )
-        X_arrays.append(x_data)
-        
-        # Process Ice Fraction (Y)
-        y_data = _load_and_process_ice(
-            data_path, 
-            var, 
-            config["file"], 
-            config["start"], 
-            config["end"]
+        baseline_arctic_ref = create_arctic_dataset(baseline_raw)
+        model2expanded_params[model_name] = _expand_params_to_global(
+            params, baseline_raw, baseline_arctic_ref
         )
-        Y_arrays.append(y_data)
 
-    # --- 3. Merge & Filter ---
-    # Concatenate all scenarios along the time axis (axis 2)
-    X = np.concatenate(X_arrays, axis=2)
-    Y = np.concatenate(Y_arrays, axis=2)
-    
-    # Filter Y data (removes noise and insufficient data points)
-    # Note: X is not filtered here; the fitter likely handles alignment or masking
-    Y, _, _ = filter_icefrac_data(Y)
-    # print(f"Y shape: {Y.shape}")
-    # print(f"X shape: {X.shape}")
-
-    # --- 4. Model Fitting ---
-    fitter = LogisticFitter(X, Y)
-    
-    # Fit models using all available cores (n_jobs=-1)
-    params, _, _, _ = fitter.fit_all(n_jobs=-1)
-
-    # --- 5. Save Output ---
-    _save_params_to_netcdf(params, baseline_raw, baseline_arctic_ref, interpolator_path)
+    # --- Save Output ---
+    # Coords come from the primary model's baseline (the common target grid).
+    primary_raw = open_xarray_datasets(
+        data_path / VAR_TEMP / MODEL_SCENARIOS[PRIMARY_MODEL]["baseline"]["file"]
+    )
+    primary_arctic_ref = create_arctic_dataset(primary_raw)
+    _save_params_to_netcdf(
+        model2expanded_params, primary_raw, primary_arctic_ref, interpolator_path
+    )
 
 
 if __name__ == "__main__":
+    import fire  # CLI-only; kept out of module-level imports (see top of file)
     fire.Fire(fit_arctic_logistic)

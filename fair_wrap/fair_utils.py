@@ -264,33 +264,97 @@ def fill_aerosols(
     return f
 
 
+# Named climate-response calibrations selectable via ``calibrate_to``.
+#
+# "constrained" (the default) keeps the per-member values of the FaIR v1.2.0
+# calibrated-constrained ensemble that ``get_df_configs`` already samples, so the
+# run spans the assessed climate-response uncertainty and ``get_global_temp``
+# averages across it.
+#
+# "cesm" overwrites every member with one Cummins 3-layer parameter set tuned so
+# FaIR's global ``tas`` tracks CESM2-WACCM. That was the default while CESM was the
+# only regional model. It is retained — switchable, not deleted — because the
+# regional emulators' *patterns* are still CESM-derived in part, so reproducing
+# pre-2026-08 output requires it. Note its ``clim_kappa1`` (0.649) sits below the
+# 5th percentile of the constrained ensemble, i.e. a more sensitive climate than
+# almost the whole assessed range.
+#
+# Provenance of the CESM numbers is unrecorded in this repo; they predate it.
+#
+# Scope: ``calibrate_to`` sets only the no-SAI global *warming* magnitude. The SAI
+# response chain — the GAUSS-fit Tg-per-K SO2 slopes, the per-K regional delta slopes,
+# and the custom-injection impulse responses (CESM_params.mat) — remains CESM-derived
+# regardless of the calibration. Under "constrained" the projected warming (hence the
+# ``temp_diff`` that sizes injections) is smaller than under "cesm", so reported SO2
+# amounts shrink and SAI start years move later relative to pre-flip output; the analytic
+# and custom-injection modes stay mutually consistent because their CESM-derived factors
+# cancel to first order.
+CLIMATE_CALIBRATIONS: dict[str, dict[str, float] | None] = {
+    "constrained": None,  # keep the ensemble's own per-member climate configs
+    "cesm": {
+        "clim_c1": 4.830712, "clim_c2": 6.397801, "clim_c3": 71.294445,
+        "clim_kappa1": 0.649448, "clim_kappa2": 3.876076, "clim_kappa3": 0.900808,
+        "clim_epsilon": 1.678583,
+        "clim_gamma": 2.796757,
+        "clim_sigma_eta": 0.713515,
+        "clim_sigma_xi": 0.491656,
+        "clim_F_4xCO2": 8.175245,
+    },
+}
+
+DEFAULT_CALIBRATION = "constrained"
+
+
+def apply_climate_calibration(df_configs: pd.DataFrame, calibrate_to: str) -> pd.DataFrame:
+    """Return a copy of ``df_configs`` with the named calibration's climate columns applied.
+
+    ``calibrate_to="constrained"`` keeps the input's values: the sampled ensemble keeps its
+    own per-member climate response. Any other name must be a key of
+    :data:`CLIMATE_CALIBRATIONS`, and collapses every member onto that single set. The input
+    frame is never mutated, so calling with ``"cesm"`` and then ``"constrained"`` on the same
+    ensemble frame yields the two distinct calibrations (not CESM twice).
+    """
+    if calibrate_to not in CLIMATE_CALIBRATIONS:
+        raise ValueError(
+            f"Unknown calibrate_to={calibrate_to!r}; "
+            f"expected one of {sorted(CLIMATE_CALIBRATIONS)}."
+        )
+    df_configs = df_configs.copy()
+    overrides = CLIMATE_CALIBRATIONS[calibrate_to]
+    if overrides is not None:
+        missing = set(overrides) - set(df_configs.columns)
+        if missing:
+            # Plain ``df[col] = value`` would silently append a new column on a typo'd
+            # key while the real column keeps its ensemble values — refuse instead.
+            raise ValueError(
+                f"Calibration {calibrate_to!r} overrides columns not present in "
+                f"df_configs: {sorted(missing)}."
+            )
+        for column, value in overrides.items():
+            df_configs[column] = value
+    return df_configs
+
+
 def fill_in_configs(
     f: FAIR,
     df_configs: pd.DataFrame,
     co2_input: np.ndarray | None = None,
     scenario: str | None = None,
-    calibrate_to: str = "cesm",
+    calibrate_to: str = DEFAULT_CALIBRATION,
 ) -> FAIR:
     """Apply the climate-config + species-config calibrations and (optionally) override CO2 FFI emissions.
 
-    When ``calibrate_to == "cesm"``, the climate configs (``c1..c3``, ``kappa1..kappa3``,
-    ``epsilon``, ``gamma``, ``sigma_eta``, ``sigma_xi``, ``F_4xCO2``) are replaced with the
-    CESM-tuned values so FaIR's global ``tas`` response matches CESM2-WACCM's. The species
-    configs are filled from ``species_configs_properties_calibration1.2.0.csv`` and the
-    per-config aerosol-direct, aerosol-indirect, ozone, and forcing-scale factors.
+    ``calibrate_to`` selects a climate-response calibration from
+    :data:`CLIMATE_CALIBRATIONS` (see there for what each means); the default keeps the
+    calibrated-constrained ensemble's own per-member values. The species configs are
+    filled from ``species_configs_properties_calibration1.2.0.csv`` and the per-config
+    aerosol-direct, aerosol-indirect, ozone, and forcing-scale factors regardless.
 
     When ``co2_input`` is supplied (an ``(N, 2)`` array of ``[year, Gt CO2]`` rows covering
     ``[CANVAS_START_YEAR, CANVAS_END_YEAR]``), the CO2 FFI emissions are overridden in that
     window and CO2 AFOLU is zeroed so the sum still represents total CO2 emissions.
     """
-    if calibrate_to == "cesm":
-        df_configs.loc[:, "clim_c1":"clim_c3"] = [4.830712, 6.397801, 71.294445]
-        df_configs.loc[:, "clim_kappa1":"clim_kappa3"] = [0.649448, 3.876076, 0.900808]
-        df_configs["clim_epsilon"] = 1.678583
-        df_configs["clim_gamma"] = 2.796757
-        df_configs["clim_sigma_eta"] = 0.713515
-        df_configs["clim_sigma_xi"] = 0.491656
-        df_configs["clim_F_4xCO2"] = 8.175245
+    df_configs = apply_climate_calibration(df_configs, calibrate_to)
 
     ### 8b. Fill in climate_configs
     fill(f.climate_configs["ocean_heat_capacity"], df_configs.loc[:, "clim_c1":"clim_c3"].values)
@@ -459,16 +523,16 @@ def get_runner(
     co2_input: np.ndarray | None,
     ssp_scenario: str,
     initial_conditions: dict | None = None,
-    calibrate_to: str = "cesm",
+    calibrate_to: str = DEFAULT_CALIBRATION,
 ) -> FAIR:
     """High-level builder used by :mod:`backend.baseline`: returns a ready-to-``run`` FaIR instance.
 
     Caches the post-``set_up_fair`` instance under ``f_no_sai/<ssp>.pkl`` so repeated calls
     for the same SSP skip the expensive scenario-setup step (which downloads RCMIP, builds
     all species buffers, and patches NOx). The cached instance is then routed through
-    :func:`fill_aerosols` (with no SAI), :func:`fill_in_configs` (with the CESM calibration
-    by default), and :func:`initialize_run` (with optional restart conditions) before being
-    handed back to the caller.
+    :func:`fill_aerosols` (with no SAI), :func:`fill_in_configs` (with the
+    calibrated-constrained ensemble by default), and :func:`initialize_run` (with
+    optional restart conditions) before being handed back to the caller.
 
     Accepts the dashboard's fancy SSP titles (``"SSP2-4.5"`` etc.) and translates them to
     the FaIR short keys via :data:`REVERSE_FANCY_SSP_TITLES`.

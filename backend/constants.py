@@ -5,15 +5,54 @@ temperature-target range, the per-variable ``VAR2INFO`` display table (title, un
 SO2-overlay color), and the ``exposurevar2var`` mapping from exposure-variable names to their
 underlying daily climate variables.
 """
+from pathlib import Path
+
 from matplotlib.colors import LinearSegmentedColormap
 import matplotlib.pyplot as plt
 
 
 REGIONAL_MODEL_NAMES = [
-    "CESM2-WACCM"
+    "CESM2-WACCM",
+    "MIROC-ES2H",
 ]
+
+# A model can publish two distinct no-SAI runs, which serve two different roles:
+#
+#   * **SAI-delta rebase reference** — the run the model's SAI experiments branched from.
+#     The delta fit must rebase each anchor against it (see ``ANCHORS`` in
+#     scripts/fit_delta.py), so that choice is pinned there, not here.
+#   * **projection baseline** — the standard ScenarioMIP SSP2-4.5 run that the
+#     climate-change-only emulator trains on (scripts/fit_map.py) and that backs the
+#     dashboard's historical series. That is what this table selects.
+#
+# CESM2-WACCM's single baseline run serves both roles. MIROC-ES2H ships them separately:
+# its GeoMIP ``baseline`` (2020-2084) is the G6 branch point, while ``ssp245`` (2015-2100)
+# is the ScenarioMIP run — longer, and continuous with the historical run.
+#
+# Values are preference-ordered: the first file present in a variable's processed
+# directory wins. MIROC publishes no ScenarioMIP evaporation or sea ice, so those
+# variables have no ``ssp245`` output and fall back to the branch-point baseline.
+REGIONAL_MODEL2PROJECTION_BASELINE_FILES = {
+    "CESM2-WACCM": ("output_gauss-baseline.nc",),
+    "MIROC-ES2H": ("output_gauss-ssp245-miroc.nc", "output_gauss-baseline-miroc.nc"),
+}
+
+
+def resolve_projection_baseline_file(variable_dir: str | Path, model: str) -> Path | None:
+    """Return ``model``'s projection-baseline file inside ``variable_dir``, or ``None``.
+
+    Walks :data:`REGIONAL_MODEL2PROJECTION_BASELINE_FILES` in preference order and returns
+    the first file that exists, so a variable missing from the preferred (ScenarioMIP) store
+    falls back to the model's other no-SAI run. ``None`` means the model has no processed
+    baseline for this variable at all.
+    """
+    for filename in REGIONAL_MODEL2PROJECTION_BASELINE_FILES[model]:
+        candidate = Path(variable_dir) / filename
+        if candidate.exists():
+            return candidate
+    return None
 NUM_EMULATORS = 100
-# CESM2-WACCM dimensions
+# CESM2-WACCM grid dimensions (all other models are regridded onto this grid)
 NUM_LAT = 192
 NUM_LON = 288
 MIN_SAI_START = 2035

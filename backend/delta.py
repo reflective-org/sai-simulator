@@ -10,6 +10,7 @@ import xarray as xr
 from pathlib import Path
 
 from fair_wrap.fair_utils import REVERSE_FANCY_SSP_TITLES, SIM_END_YEAR
+from .baseline import validate_cache_dir
 from .constants import *
 from .utils import get_interpolator, clip_to_land, apply_ramp_up_factor
 from .utils import save_processed_data
@@ -34,6 +35,7 @@ def get_regional_delta_without_rampup(
     underlying daily variable for exposure inputs via :data:`exposurevar2var`. Results are
     cached on disk at ``cache_dir/{simple_ssp}_{temp_target:.1f}_regional_delta_{var}.nc``.
     """
+    validate_cache_dir(cache_dir)
     simple_ssp = REVERSE_FANCY_SSP_TITLES[ssp_scenario]
 
     regional_delta_cache_path = cache_dir / f"{simple_ssp}_{temp_target:.1f}_regional_delta_{var}.nc"
@@ -51,10 +53,16 @@ def get_regional_delta_without_rampup(
             var = exposurevar2var[var]
 
         variable_dir = model_dir / var
-        
+
         interpolator = get_interpolator(variable_dir / "interpolator.nc")
 
-        regional_delta = interpolator.sel(features='slope') * temp_diff
+        slope = interpolator.sel(features='slope')
+        if 'model' in slope.dims:
+            # The shipped interpolators carry one pooled slope (no model dim);
+            # tolerate a per-model variant (equal-weight mean at prediction)
+            # so either artifact format works.
+            slope = slope.mean(dim='model')
+        regional_delta = slope * temp_diff
 
         regional_delta = regional_delta[var]
 

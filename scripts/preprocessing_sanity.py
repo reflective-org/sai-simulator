@@ -22,6 +22,11 @@ class SanityCheckError(ValueError):
 EXPECTED_YEARS_BY_EXPERIMENT = {
     "historical": (164, 165),
     "baseline": (50, 85),
+    # ScenarioMIP SSP2-4.5 (MIROC): 2015-2100 for most variables (85-86 yr), but
+    # p-e is limited to the store's QFLX fill window 2020-2084 (65 yr; the NaN-
+    # padded months drop as incomplete years). Lower bound set to catch gross
+    # truncation without failing the p-e case.
+    "ssp245": (63, 86),
     "0.5": (33, 36),
     "1.0": (33, 36),
     "1.5": (33, 36),
@@ -41,6 +46,27 @@ EXPOSURE_VARIABLES = {
 # After yearly resampling, cumulative "days per month" metrics are summed over months;
 # upper bound is ~12 × 31 days/year (leap / calendar quirks), not 365.
 EXPOSURE_YEARLY_SUM_MAX = 372
+
+# Temperature lower-bound margin (K) below the per-cell historical minimum for
+# the monthly plausibility check. The check exists to catch gross unit/scale
+# blunders (°C-shipped-as-K ≈ 273 K offset, scale errors are far larger), so the
+# margin only needs to clear genuine climate variability. 10 K was enough for
+# CESM, but MIROC-ES2H's SSP2-4.5 runs contain spatially coherent Antarctic
+# winter cold events reaching well below the 165-year per-cell historical
+# minimum — deepest measured dip 19.6 K in the GeoMIP baseline (tasmin; Ross Ice
+# Shelf, member r01, April 2033) and 21.3 K in the ScenarioMIP ssp245 run. Each
+# additional realization has pushed that maximum up, so 30 K leaves headroom for
+# the next one while remaining an order of magnitude below a unit-error signature.
+TEMP_MONTHLY_LOW_MARGIN_K = 30.0
+
+# Per-cell yearly-mean precipitation (mm/day) tops out around ~30 mm/day even in
+# the wettest places on Earth. A generous 100 mm/day cap catches gross unit/scale
+# blunders — e.g. precip shipped in kg/m²/s (≈ mm/s) instead of m/s, which the
+# consumer's m/s→mm/day scaler then inflates 1000× — without false-positiving on
+# genuinely wet cells. This is the model-agnostic guard for precip magnitude;
+# unlike the monthly cell-bound check it does not need a historical experiment,
+# so it also protects models (e.g. MIROC) that have none.
+PR_YEARLY_CELL_MAX_MM_PER_DAY = 100
 
 
 def expected_year_count_for_experiment(exp: str) -> tuple[int, int] | None:
@@ -144,32 +170,45 @@ def _stack_experiment_members(member2data: dict[str, list[xr.DataArray]]) -> xr.
 
 
 def build_monthly_cell_bounds(
-    var_name: str, exp2member2data: dict[str, dict[str, list[xr.DataArray]]]
+    var_name: str,
+    exp2member2data: dict[str, dict[str, list[xr.DataArray]]],
+    no_sai_experiments: tuple[str, ...] = ("baseline",),
 ) -> dict[str, xr.DataArray] | None:
     """
     Build per-grid-cell monthly bounds.
-    - Min bound from historical minimum (temperature only, minus 10).
-    - Max bound from baseline/SSP2-4.5 maximum (all checked vars, plus 10).
+    - Min bound from historical minimum (temperature only, minus
+      ``TEMP_MONTHLY_LOW_MARGIN_K``).
+    - Max bound from the no-SAI SSP2-4.5 maxima (all checked vars, plus 10). A model
+      publishing more than one no-SAI run (e.g. a GeoMIP branch point alongside the
+      ScenarioMIP run) contributes the elementwise max over all of them, so each run's
+      own extremes sit inside the envelope it is later checked against.
     - For precipitation, min bound is fixed at 0.
     """
     if not requires_monthly_cell_bound_check(var_name):
         return None
 
     historical = exp2member2data.get("historical", {})
-    baseline = exp2member2data.get("baseline", {})
+    reference_members = [
+        exp2member2data[exp] for exp in no_sai_experiments if exp2member2data.get(exp)
+    ]
     if not historical:
         raise SanityCheckError("Cannot build monthly bounds: missing historical data.")
-    if not baseline:
+    if not reference_members:
         raise SanityCheckError("Cannot build monthly bounds: missing baseline (SSP2-4.5) data.")
 
     historical_stack = _stack_experiment_members(historical)
-    baseline_stack = _stack_experiment_members(baseline)
 
     historical_min = historical_stack.min(dim=("member", "time"))
-    baseline_max = baseline_stack.max(dim=("member", "time"))
+    baseline_max = xr.concat(
+        [
+            _stack_experiment_members(members).max(dim=("member", "time"))
+            for members in reference_members
+        ],
+        dim="reference",
+    ).max(dim="reference")
 
     if var_name in TEMP_BOUND_VARIABLES:
-        min_allowed = historical_min - 10.0
+        min_allowed = historical_min - TEMP_MONTHLY_LOW_MARGIN_K
     else:
         min_allowed = xr.zeros_like(baseline_max)
 
@@ -183,36 +222,40 @@ def validate_monthly_cell_bounds(
     exp: str,
     member: str,
     bounds: dict[str, xr.DataArray] | None,
+    no_sai_experiments: tuple[str, ...] = ("baseline",),
 ) -> None:
     """
-    Plausibility bounds from historical minima and SSP2-4.5 baseline maxima.
+    Plausibility bounds from historical minima and SSP2-4.5 no-SAI maxima.
 
     Historical monthly data can exceed future SSP245 maxima (e.g. heavy rain); SAI
     scenarios can fall outside the historical / SSP245 envelope by design. We
     therefore enforce temperature **lower** bounds (vs historical min − margin) on
-    ``historical`` and ``baseline`` only, **upper** bounds (vs baseline max + margin)
-    on ``baseline`` only, and ``pr >= 0`` on all experiments.
+    ``historical`` and the no-SAI runs only, **upper** bounds (vs the no-SAI max +
+    margin) on those same no-SAI runs only, and ``pr >= 0`` on all experiments.
     """
     if bounds is None:
         return
 
-    sai_exps = ("0.5", "1.0", "1.5")
+    # SAI experiments: the GAUSS cooling labels plus any G6 run ("g6-1.5",
+    # "g6-0.5", ...). They may cool below the historical envelope by design,
+    # so the temperature lower bound does not apply to them.
+    is_sai_exp = exp in ("0.5", "1.0", "1.5") or exp.startswith("g6-")
     if var_name in TEMP_BOUND_VARIABLES:
         low_count = (
             0
-            if exp in sai_exps
+            if is_sai_exp
             else _reduced_bool_sum(data < bounds["min"])
         )
         high_count = (
             0
-            if exp != "baseline"
+            if exp not in no_sai_experiments
             else _reduced_bool_sum(data > bounds["max"])
         )
     elif var_name in PR_BOUND_VARIABLES:
         low_count = _reduced_bool_sum(data < 0.0)
         high_count = (
             0
-            if exp != "baseline"
+            if exp not in no_sai_experiments
             else _reduced_bool_sum(data > bounds["max"])
         )
     else:
@@ -254,6 +297,17 @@ def validate_variable_specific_ranges(
                 f"Range sanity check failed at {stage} for var={var_name}, exp={exp}, "
                 f"member={member}: {below_zero} values below 0 and {above_max} values "
                 f"above {EXPOSURE_YEARLY_SUM_MAX}."
+            )
+
+    if var_name in PR_BOUND_VARIABLES:
+        # Upper-bound guard against unit/scale errors (negatives are caught by
+        # validate_no_negative_values). See PR_YEARLY_CELL_MAX_MM_PER_DAY.
+        above_max = _reduced_bool_sum(array_like > PR_YEARLY_CELL_MAX_MM_PER_DAY)
+        if above_max > 0:
+            raise SanityCheckError(
+                f"Range sanity check failed at {stage} for var={var_name}, exp={exp}, "
+                f"member={member}: {above_max} values above {PR_YEARLY_CELL_MAX_MM_PER_DAY} "
+                f"mm/day (likely a unit/scale error, e.g. kg/m²/s vs m/s)."
             )
 
 

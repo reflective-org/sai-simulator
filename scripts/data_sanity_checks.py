@@ -41,6 +41,14 @@ STORE_NAMES = [
     "CESM2-WACCM-MA_1.5K-SAI.zarr",
     "CESM2-WACCM-MA_1.0K-SAI.zarr",
     "CESM2-WACCM-MA_0.5K-SAI.zarr",
+    "MIROC-ES2H_baseline.zarr",
+    "MIROC-ES2H_ssp245.zarr",
+    "MIROC-ES2H_historical.zarr",
+    "MIROC-ES2H_G6-1.5K-SAI.zarr",
+    "MIROC-ES2H_G6-0.5K-SAI.zarr",
+    # UKESM (stub; uncomment once the public stores land — confirm real names).
+    # "UKESM1-1-LL_baseline.zarr",
+    # "UKESM1-1-LL_G6-1.5K-SAI.zarr",
 ]
 
 # Per-group required variables. Mirrors the routing logic in
@@ -58,6 +66,15 @@ REQUIRED_GROUPS: dict[str, list[str]] = {
     ],
 }
 
+# Variables permitted to be absent for stores whose name contains the key.
+# (MIROC used to be listed here for QFLX, but its stores now ship QFLX derived
+# from JAMSTEC's monthly hfls — QFLX = hfls / 2.5e6 — so it is required again.)
+ALLOWED_MISSING: dict[str, set[str]] = {
+    # If UKESM ships no evaporative-flux source, add an entry so its missing
+    # QFLX (→ no p-e downstream) is treated as allowed, not a failure:
+    # "UKESM1-1-LL": {"QFLX"},
+}
+
 # Canonical dims the consumer pipeline aligns on.
 EXPECTED_DIMS = {"member", "time", "lat", "lon"}
 
@@ -65,6 +82,12 @@ EXPECTED_DIMS = {"member", "time", "lat", "lon"}
 def check_store(store_uri: str) -> list[str]:
     """Return failure messages for one store. Empty list ⇒ all checks passed."""
     failures: list[str] = []
+    # Vars this store is allowed to be missing (see ALLOWED_MISSING).
+    allowed_missing: set[str] = set()
+    for substring, vars_ in ALLOWED_MISSING.items():
+        if substring in store_uri:
+            allowed_missing |= vars_
+
     for group, expected_vars in REQUIRED_GROUPS.items():
         try:
             ds = xr.open_zarr(store_uri, group=group, consolidated=True)
@@ -75,9 +98,19 @@ def check_store(store_uri: str) -> list[str]:
             continue
         for var in expected_vars:
             if var not in ds.data_vars:
-                failures.append(f"  [{group}] missing variable: {var}")
+                if var in allowed_missing:
+                    print(f"  [{group}] {var} absent (allowed for this store)")
+                else:
+                    failures.append(f"  [{group}] missing variable: {var}")
                 continue
             da = ds[var]
+            # Producer-declared all-NaN placeholders (e.g. MIROC's ScenarioMIP store
+            # carries QFLX/ICEFRAC stubs because hfls/siconc for that run are only on
+            # an offline ESGF node). The array is well-formed, so this is a warning:
+            # consumers fall back to the model's other no-SAI run for those variables.
+            note = str(da.attrs.get("note", ""))
+            if "PLACEHOLDER" in note.upper():
+                print(f"{YELLOW}  [{group}/{var}] all-NaN placeholder — {note}{RESET}")
             missing_dims = EXPECTED_DIMS - set(da.dims)
             if missing_dims:
                 failures.append(
@@ -93,7 +126,7 @@ def check_store(store_uri: str) -> list[str]:
 
 
 def run_checks(zarr_uri: str = ZARR_STORES_URI) -> int:
-    """Iterate the 5 stores and check each. Returns the count of failing stores."""
+    """Iterate the stores in :data:`STORE_NAMES` and check each. Returns the count of failing stores."""
     print(f"Zarr root: {zarr_uri}\n")
     failed_stores = 0
     for store_name in STORE_NAMES:

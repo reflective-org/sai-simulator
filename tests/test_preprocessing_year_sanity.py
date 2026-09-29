@@ -26,6 +26,8 @@ from scripts.preprocessing_sanity import (
 def test_expected_year_count_for_experiment_values() -> None:
     assert expected_year_count_for_experiment("historical") == (164, 165)
     assert expected_year_count_for_experiment("baseline") == (50, 85)
+    # Lower bound covers p-e, whose ssp245 QFLX fill spans only 2020-2084 (65 yr).
+    assert expected_year_count_for_experiment("ssp245") == (63, 86)
     assert expected_year_count_for_experiment("1.5") == (33, 36)
     assert expected_year_count_for_experiment("1.0") == (33, 36)
     assert expected_year_count_for_experiment("0.5") == (33, 36)
@@ -128,8 +130,72 @@ def test_build_monthly_cell_bounds_for_temperature() -> None:
     }
     bounds = build_monthly_cell_bounds("tas", exp2member2data)
     assert bounds is not None
-    assert float(bounds["min"].item()) == 260.0
+    assert float(bounds["min"].item()) == 270.0 - 30.0
     assert float(bounds["max"].item()) == 310.0
+
+
+def test_build_monthly_cell_bounds_spans_every_no_sai_run() -> None:
+    """A model with two no-SAI runs bounds against the hotter of the two."""
+    exp2member2data = {
+        "historical": {"r01": [_make_monthly_da(270.0, name="tas")]},
+        "baseline": {"r01": [_make_monthly_da(300.0, name="tas")]},
+        "ssp245": {"r01": [_make_monthly_da(305.0, name="tas")]},
+    }
+    bounds = build_monthly_cell_bounds(
+        "tas", exp2member2data, no_sai_experiments=("baseline", "ssp245")
+    )
+    assert bounds is not None
+    assert float(bounds["max"].item()) == 315.0  # from ssp245, the hotter run
+
+
+def test_validate_monthly_cell_bounds_checks_upper_for_every_no_sai_run() -> None:
+    """The upper bound applies to each declared no-SAI run, not just 'baseline'."""
+    bounds = {"min": _make_monthly_da(10.0), "max": _make_monthly_da(20.0)}
+    data = _make_monthly_da(25.0)
+    with pytest.raises(SanityCheckError, match="Monthly grid-cell bound check failed"):
+        validate_monthly_cell_bounds(
+            data=data, var_name="tas", exp="ssp245", member="r01", bounds=bounds,
+            no_sai_experiments=("baseline", "ssp245"),
+        )
+
+
+def test_validate_monthly_cell_bounds_ignores_upper_for_undeclared_experiment() -> None:
+    """An experiment outside the no-SAI set keeps the SAI-style exemption."""
+    bounds = {"min": _make_monthly_da(10.0), "max": _make_monthly_da(20.0)}
+    data = _make_monthly_da(25.0)
+    validate_monthly_cell_bounds(
+        data=data, var_name="tas", exp="ssp245", member="r01", bounds=bounds,
+        no_sai_experiments=("baseline",),
+    )
+
+
+def test_baseline_polar_cold_extreme_within_margin_passes() -> None:
+    """MIROC's SSP2-4.5 runs contain Antarctic winter events well below the per-cell
+    historical minimum — 19.6 K in the GeoMIP baseline and 21.3 K in ssp245 (tasmin) —
+    physical variability that must not trip the plausibility bound."""
+    exp2member2data = {
+        "historical": {"r01": [_make_monthly_da(250.0, name="tas")]},
+        "baseline": {"r01": [_make_monthly_da(280.0, name="tas")]},
+    }
+    bounds = build_monthly_cell_bounds("tas", exp2member2data)
+    data = _make_monthly_da(250.0 - 21.3)
+    validate_monthly_cell_bounds(
+        data=data, var_name="tas", exp="baseline", member="r01", bounds=bounds
+    )
+
+
+def test_baseline_unit_error_still_fails_low_bound() -> None:
+    """A gross error (e.g. °C shipped as K → ~273 K offset) must still be caught."""
+    exp2member2data = {
+        "historical": {"r01": [_make_monthly_da(250.0, name="tas")]},
+        "baseline": {"r01": [_make_monthly_da(280.0, name="tas")]},
+    }
+    bounds = build_monthly_cell_bounds("tas", exp2member2data)
+    data = _make_monthly_da(250.0 - 273.0)
+    with pytest.raises(SanityCheckError, match="Monthly grid-cell bound check failed"):
+        validate_monthly_cell_bounds(
+            data=data, var_name="tas", exp="baseline", member="r01", bounds=bounds
+        )
 
 
 def test_build_monthly_cell_bounds_for_pr() -> None:
@@ -177,6 +243,16 @@ def test_validate_monthly_cell_bounds_allows_low_for_sai() -> None:
     )
 
 
+@pytest.mark.parametrize("exp", ["g6-1.5", "g6-0.5"])
+def test_validate_monthly_cell_bounds_allows_low_for_g6_sai(exp: str) -> None:
+    """MIROC's G6 runs are SAI experiments too — exempt from the lower bound."""
+    bounds = {"min": _make_monthly_da(10.0), "max": _make_monthly_da(20.0)}
+    data = _make_monthly_da(5.0)
+    validate_monthly_cell_bounds(
+        data=data, var_name="tas", exp=exp, member="r01", bounds=bounds
+    )
+
+
 def test_validate_monthly_cell_bounds_fails_low_historical() -> None:
     bounds = {"min": _make_monthly_da(10.0), "max": _make_monthly_da(20.0)}
     data = _make_monthly_da(5.0)
@@ -221,6 +297,22 @@ def test_validate_variable_specific_ranges_fails_for_exposure_out_of_bounds() ->
     with pytest.raises(ValueError, match="Range sanity check failed"):
         validate_variable_specific_ranges(
             data=data, var_name="pr_above_10", exp="1.0", member="002", stage="test"
+        )
+
+
+def test_validate_variable_specific_ranges_passes_for_realistic_pr() -> None:
+    data = xr.DataArray([0.0, 2.5, 30.0], dims=["time"], name="pr")
+    validate_variable_specific_ranges(
+        data=data, var_name="pr", exp="baseline", member="001", stage="test"
+    )
+
+
+def test_validate_variable_specific_ranges_fails_for_pr_unit_error() -> None:
+    """A kg/m²/s-vs-m/s 1000x inflation (mean ~2600 mm/day) must be rejected."""
+    data = xr.DataArray([2600.0, 29629.0], dims=["time"], name="pr")
+    with pytest.raises(SanityCheckError, match="unit/scale error"):
+        validate_variable_specific_ranges(
+            data=data, var_name="pr", exp="baseline", member="001", stage="test"
         )
 
 
