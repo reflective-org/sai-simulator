@@ -12,8 +12,8 @@ import pytest
 import scripts.process_monthly_gauss as pmg
 
 
-def test_models_are_cesm_and_miroc() -> None:
-    assert set(pmg.MODELS) == {"CESM2-WACCM-MA", "MIROC-ES2H"}
+def test_models_are_cesm_miroc_and_ukesm() -> None:
+    assert set(pmg.MODELS) == {"CESM2-WACCM-MA", "MIROC-ES2H", "UKESM1-1-LL"}
 
 
 def test_cesm_config() -> None:
@@ -53,6 +53,52 @@ def test_miroc_ssp245_has_no_missing_variables() -> None:
     (2020-2084) and ICEFRAC regridded from the run's own CMOR siconc (2015-2100)."""
     cfg = pmg.MODELS["MIROC-ES2H"]
     assert cfg["experiment_missing_vars"] == {}
+
+
+def test_ukesm_config_isolates_its_quirks() -> None:
+    cfg = pmg.MODELS["UKESM1-1-LL"]
+    assert cfg["model_coord"] == "UKESM1-1-LL"
+    assert cfg["output_suffix"] == "-ukesm"
+    assert cfg["has_historical"] is True
+    assert cfg["compute_variability"] is False
+    labels = [label for _, label in cfg["experiments"]]
+    assert labels == ["baseline", "historical", "g6-1.5"]
+    # One het-chem SSP2-4.5 run is both the G6 branch point and the projection
+    # baseline (CESM-style).
+    assert cfg["no_sai_experiments"] == ("baseline",)
+
+
+def test_ukesm_historical_has_nothing_left_to_skip() -> None:
+    """MACLOUD publishes neither sea ice nor evaporative flux for the historical
+    suites, but ESGF publishes both (siconca, hfls), so every variable now stitches
+    across 2015. An entry reappearing here means a store lost its ESGF-backed
+    array and some variable silently went back to a 2015 start."""
+    assert pmg.MODELS["UKESM1-1-LL"]["experiment_missing_vars"] == {}
+
+
+def test_ukesm_esgf_backed_vars_use_one_realization_everywhere() -> None:
+    """ESGF publishes UKESM historical sea ice and hfls for one member, the run
+    this repo calls r3. Restricting both to r3 in every experiment keeps each
+    series on a single realization; a three-member mean after 2015 against one
+    member before it would step the variance at the stitch, and the sea-ice
+    sigmoid trains on exactly that series."""
+    cfg = pmg.MODELS["UKESM1-1-LL"]
+    assert cfg["variable_members"] == {"icefrac": ("r3",), "p-e": ("r3",)}
+    # The restriction is per variable: tas, pr and the rest keep all three members.
+    assert set(cfg["variable_members"]) == {"icefrac", "p-e"}
+
+
+def test_pe_member_restriction_covers_only_the_qflx_term() -> None:
+    """p-e is assembled as (the model's pr output) - QFLX, and variable_members is
+    keyed on the OUTPUT variable, so restricting "p-e" restricts the QFLX term
+    alone — the pr file it subtracts from stays a three-member mean. That is
+    intended (both terms are uniform across the stitch, and the ensemble mean is
+    the better estimate of forced pr), but it means p-e is not single-member the
+    way icefrac is, and anyone reading the config should not assume it is."""
+    cfg = pmg.MODELS["UKESM1-1-LL"]
+    assert cfg["variable_members"]["p-e"] == ("r3",)
+    assert "pr" not in cfg["variable_members"]
+    assert pmg.var2esm_var["p-e"] == "QFLX"
 
 
 def test_experiment_uris_use_zarr_root() -> None:

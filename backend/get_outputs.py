@@ -1502,7 +1502,7 @@ def generate_sai_netcdf(
     start_year: int | None,
     ramp_up: int | None,
     variable_injection: np.ndarray | None,
-    model_name: str = "CESM2-WACCM + MIROC-ES2H (equal-weight mean)",
+    model_name: str = DEFAULT_MODEL_NAME,
     output_path: str | Path | None = None,
     output_config: dict | None = None,
 ) -> xr.Dataset:

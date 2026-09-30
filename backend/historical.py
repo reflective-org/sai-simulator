@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .constants import (
     exposurevar2var,
-    REGIONAL_MODEL_NAMES,
+    regional_models_for_var,
     resolve_projection_baseline_file,
 )
 from .utils import clip_to_land
@@ -30,8 +30,12 @@ def _load_multi_model_baseline(variable_dir: Path, models: list[str]) -> xr.Data
     averages the models over their overlapping years so the historical reference stays
     consistent with the multi-model projection mean taken in :mod:`backend.baseline`.
 
-    Every model's baseline file carries the same stitched historical run, so the
-    ``time <= 2014`` slice the caller takes is unaffected by which no-SAI run backs the
+    Every model in ``models`` must carry the stitched historical run in its baseline
+    file: the inner join averages over the years the models SHARE, so a model whose
+    file starts in 2015 would silently erase everyone's pre-2015 series. That is what
+    ``REGIONAL_MODEL_VAR_EXCLUSIONS`` guards (UKESM has no historical p-e) — callers
+    pass ``regional_models_for_var(var)``, never the raw roster. For a model that does
+    carry it, the ``time <= 2014`` slice is unaffected by which no-SAI run backs the
     projection years.
     """
     per_model = []
@@ -83,9 +87,12 @@ def get_historical_model(
         "pr", "p-e", "pr_above_10", "pr_above_20",
         "icefrac"
     ]:
-        # icefrac projections come from the CESM-trained interpolator rather than the
-        # REGIONAL_MODEL_NAMES emulators, so its historical reference stays CESM-only.
-        models = ["CESM2-WACCM"] if var == "icefrac" else REGIONAL_MODEL_NAMES
+        # icefrac projections come from the per-model sea-ice sigmoids
+        # (scripts/fit_icefrac_arctic.MODEL_SCENARIOS, averaged in predict_icefrac)
+        # rather than the fit_map emulators, and their historical reference stays
+        # CESM-only. Other variables use the models that participate in that
+        # variable's projection side (e.g. UKESM sits out p-e: no pre-2015 coverage).
+        models = ["CESM2-WACCM"] if var == "icefrac" else regional_models_for_var(var)
         historical_model_data = _load_multi_model_baseline(data_dir / var, models)
     # elif var in []:
     #     with xr.open_dataarray(data_dir / var / "output_gauss-cmip_historical.nc") as da:
@@ -94,7 +101,7 @@ def get_historical_model(
     #     historical_model_data = historical_model_data.drop_vars(["ssp", "model"])
     elif is_exposure:
         daily_var = exposurevar2var[var]
-        historical_model_data = _load_multi_model_baseline(data_dir / daily_var, REGIONAL_MODEL_NAMES)
+        historical_model_data = _load_multi_model_baseline(data_dir / daily_var, regional_models_for_var(var))
     else:
         historical_model_data = None
 

@@ -60,7 +60,30 @@ MODEL_SCENARIOS = {
         "sai_g6_0_5": {"file": "output_gauss-g6-0.5-miroc.nc",   "start": 2050, "end": 2069},
         "sai_g6_1_5": {"file": "output_gauss-g6-1.5-miroc.nc",   "start": 2050, "end": 2069},
     },
+    # UKESM's icefrac is a SINGLE realization (r3) in every experiment, because
+    # ESGF publishes its historical sea ice for that one member — see
+    # variable_members in process_monthly_gauss.MODELS. Its tas is still a
+    # three-member mean, so this pairs a one-member ice record against an
+    # ensemble-mean temperature; the forced response they share is what the
+    # logistic fits, and the extra realization noise on the ice side widens the
+    # scatter without biasing the curve.
+    "UKESM1-1-LL": {
+        "baseline":   {"file": "output_gauss-baseline-ukesm.nc", "start": 1900, "end": 2098},
+        "sai_g6_1_5": {"file": "output_gauss-g6-1.5-ukesm.nc",   "start": 2050, "end": 2069},
+    },
 }
+
+# Models whose scenarios are known-good but which are deliberately NOT fitted.
+# Kept as real configuration (rather than commented-out code) so an exclusion is
+# testable, and so ``scripts/plot_icefrac_fit.py`` can show what the rejected fit
+# would look like. Nothing in the fitting path reads this dict.
+#
+# Empty today. UKESM1-1-LL sat here while its ICEFRAC began in 2015, which left
+# the training window with no cold regime and the logistic's full-ice plateau
+# extrapolated rather than fitted. ESGF supplied historical sea ice for the member
+# this repo calls r3, so it now trains from 1900 like the others and has moved into
+# MODEL_SCENARIOS above.
+EXCLUDED_MODEL_SCENARIOS: dict[str, dict] = {}
 
 # The model whose baseline file must exist (its grid is the common target grid
 # every other model is regridded onto, and it supplies the output coords).
@@ -102,9 +125,11 @@ def reshape_icefrac_data(
     # Note: We assume the input dataset is already processed (e.g. create_arctic_dataset applied beforehand)
     # to maintain separation of concerns.
     subset = dataset[var_name].sel(time=slice(start_year, end_year))
-    # Remove 2015 from the time selection if it's present
-    if 'time' in subset.dims:
-        subset = subset.sel(time=subset.time[subset.time != 2015])
+    # No year is dropped here. This used to remove 2015 unconditionally, which
+    # was a compensation for CESM2-WACCM (its processed tas has no 2015 while its
+    # icefrac does). For a model carrying 2015 in BOTH files the drop shifted ice
+    # one year against tas for every later year. _fit_one_model now pairs the two
+    # on their common years instead, which handles CESM without special-casing it.
     
     # print(f"Subset shape: {subset.shape}")
     # print(f"Subset time range: {subset.time.values}")
@@ -126,18 +151,27 @@ def reshape_icefrac_data(
 def filter_icefrac_data(
     data: np.ndarray, 
     min_valid_obs: int = 10, 
-    low_value_threshold: float = 0.01, 
     intensity_threshold: float = 0.15
 ):
     """
     Filters ice fraction data based on observational quality and intensity thresholds.
     
-    This function performs three filtering steps:
-    1. Hard Threshold: Values <= `low_value_threshold` are set to NaN.
-    2. Insufficient Data: Grid cells with fewer than `min_valid_obs` non-NaN values 
+    This function performs two filtering steps:
+    1. Insufficient Data: Grid cells with fewer than `min_valid_obs` non-NaN values 
        along the time dimension are entirely masked (set to NaN).
-    3. Low Intensity: Grid cells where all remaining valid values are below 
+    2. Low Intensity: Grid cells where all valid values are below 
        `intensity_threshold` are entirely masked (set to NaN).
+
+    **Ice-free observations are KEPT.** An earlier version set every value <= 0.01
+    to NaN as "noise", which censored the training set exactly where a decreasing
+    logistic needs data: the zeros are what pin its warm asymptote. The cost scaled
+    with how ice-free a model gets — CESM2-WACCM lost 1.8% of its observations,
+    MIROC-ES2H 8.0%, UKESM1-1-LL 43.6% — and left the warm end unconstrained, so
+    the fitted curve settled on a floor instead of decaying. Arctic-wide September
+    ice bias against each model's own output improved for all three when the zeros
+    were kept (UKESM +0.647 -> +0.001, MIROC +0.051 -> -0.017 million km^2).
+    Marginal cells are still excluded, by `intensity_threshold` below, which is the
+    guard the value threshold appeared to be aiming at.
 
     Note: This is a vectorized implementation. It avoids loops for performance and 
     fixes a logic issue in older versions where "Insufficient Data" cells were 
@@ -147,8 +181,6 @@ def filter_icefrac_data(
         data (np.ndarray): Input array with shape (lon, lat, time, grid_cells).
         min_valid_obs (int, optional): Minimum required non-NaN observations per time series. 
             Defaults to 10.
-        low_value_threshold (float, optional): Values less than or equal to this are 
-            considered noise and set to NaN. Defaults to 0.01.
         intensity_threshold (float, optional): If the maximum value in a time series 
             is below this, the series is considered low intensity. Defaults to 0.15.
 
@@ -162,13 +194,7 @@ def filter_icefrac_data(
     Y = data.copy()
 
     # ---------------------------------------------------------
-    # Step 1: Filter noise (Vectorized)
-    # ---------------------------------------------------------
-    # Set all individual values below threshold to NaN instantly
-    Y[Y <= low_value_threshold] = np.nan
-
-    # ---------------------------------------------------------
-    # Step 2: Analyze Time Series (Axis 2)
+    # Step 1: Analyze Time Series (Axis 2)
     # ---------------------------------------------------------
     # Count how many non-NaN values exist for every grid cell along the time axis
     valid_counts = np.count_nonzero(~np.isnan(Y), axis=2)
@@ -181,7 +207,7 @@ def filter_icefrac_data(
         max_vals = np.nanmax(Y, axis=2)
 
     # ---------------------------------------------------------
-    # Step 3: Create Boolean Masks (Shape: lon, lat, grid_cells)
+    # Step 2: Create Boolean Masks (Shape: lon, lat, grid_cells)
     # ---------------------------------------------------------
     
     # Mask A: "Insufficient Data"
@@ -195,7 +221,7 @@ def filter_icefrac_data(
     mask_low_intensity = (max_vals < intensity_threshold) & (~mask_too_few)
 
     # ---------------------------------------------------------
-    # Step 4: Apply Masks and Aggregate Counts
+    # Step 3: Apply Masks and Aggregate Counts
     # ---------------------------------------------------------
     
     # Expand masks to match the 4D shape (lon, lat, time, grid_cells)
@@ -216,6 +242,16 @@ def filter_icefrac_data(
     count_low_intensity = np.sum(mask_low_intensity, axis=-1)
 
     return Y, count_insufficient_data, count_low_intensity
+
+
+def _window_years(path: Path, start: int, end: int) -> list[int]:
+    """Integer years a processed file contributes to ``[start, end]``, in file order.
+
+    The loaders below return bare arrays, so the caller needs this to know which
+    year each time index corresponds to and pair ``tas`` with ``icefrac`` correctly.
+    """
+    ds = open_xarray_datasets(path)
+    return [int(y) for y in ds.time.values if start <= int(y) <= end]
 
 
 def _load_and_process_temp(
@@ -420,6 +456,35 @@ def _fit_one_model(
             config["start"],
             config["end"]
         )
+
+        # Pair the two on the years BOTH files actually provide. A model's tas and
+        # icefrac files need not cover the same years: CESM2-WACCM's processed tas
+        # has no 2015 while its icefrac does. Aligning explicitly keeps each year's
+        # ice with its own year's temperature; relying on index position would
+        # silently regress ice on the previous year's anomaly wherever they differ.
+        temp_years = _window_years(
+            data_path / VAR_TEMP / config["file"], config["start"], config["end"]
+        )
+        ice_years = _window_years(
+            data_path / var / config["file"], config["start"], config["end"]
+        )
+        if x_data.shape[2] != len(temp_years) or y_data.shape[2] != len(ice_years):
+            raise ValueError(
+                f"scenario {name}: loader returned {x_data.shape[2]} tas and "
+                f"{y_data.shape[2]} {var} steps for {len(temp_years)} and "
+                f"{len(ice_years)} years — year bookkeeping is out of step"
+            )
+        shared = sorted(set(temp_years) & set(ice_years))
+        if not shared:
+            print(f"  scenario {name}: no year covered by both tas and {var} — skipping")
+            X_arrays.pop()
+            continue
+        if len(shared) < len(temp_years) or len(shared) < len(ice_years):
+            print(f"  scenario {name}: pairing on {len(shared)} shared years "
+                  f"(tas {len(temp_years)}, {var} {len(ice_years)})")
+        x_data = x_data[:, :, [temp_years.index(y) for y in shared]]
+        y_data = y_data[:, :, [ice_years.index(y) for y in shared], :]
+        X_arrays[-1] = x_data
         Y_arrays.append(y_data)
 
     if not X_arrays:

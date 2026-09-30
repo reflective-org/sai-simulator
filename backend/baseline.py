@@ -42,10 +42,25 @@ FAIR_CALIBRATION = DEFAULT_CALIBRATION
 CACHE_META_FILENAME = "cache_meta.json"
 
 
+def _cache_fingerprint() -> dict:
+    """Everything a cache artifact's numbers depend on besides the input data.
+
+    The model roster and the per-variable exclusions are part of it: adding a
+    model changes every multi-model mean and the pooled SAI delta, so a cache
+    produced under a different roster must be refused, not served.
+    """
+    return {
+        "simulator_version": SIMULATOR_VERSION,
+        "fair_calibration": FAIR_CALIBRATION,
+        "regional_models": list(REGIONAL_MODEL_NAMES),
+        "var_exclusions": {k: list(v) for k, v in sorted(REGIONAL_MODEL_VAR_EXCLUSIONS.items())},
+    }
+
+
 def stamp_cache_dir(cache_dir: Path) -> None:
     """Record this process's (simulator version, FaIR calibration) fingerprint in ``cache_dir``."""
     cache_dir.mkdir(parents=True, exist_ok=True)
-    meta = {"simulator_version": SIMULATOR_VERSION, "fair_calibration": FAIR_CALIBRATION}
+    meta = _cache_fingerprint()
     # Write-then-rename so a concurrent reader never sees a truncated stamp
     # (parallel cache.py --scenario runs stamp the same dir with identical bytes).
     tmp_path = cache_dir / (CACHE_META_FILENAME + ".tmp")
@@ -61,7 +76,7 @@ def validate_cache_dir(cache_dir: Path) -> None:
     a stamp predates the fingerprint mechanism — and therefore the AR6-constrained FaIR
     default — so serving its files would silently mix climate calibrations.
     """
-    expected = {"simulator_version": SIMULATOR_VERSION, "fair_calibration": FAIR_CALIBRATION}
+    expected = _cache_fingerprint()
     meta_path = cache_dir / CACHE_META_FILENAME
     if meta_path.exists():
         try:
@@ -141,17 +156,18 @@ def get_global_temp(
 def get_regional_models(variable_dir: Path) -> LinearRegression:
     """Load and concatenate the per-model, per-emulator ``FaIR → SMIP`` linear regressors.
 
-    For every ``(model, emulator)`` pair in ``REGIONAL_MODEL_NAMES × range(NUM_EMULATORS)``
-    loads ``fair_to_smip_{model}_{i}.joblib`` from ``variable_dir`` and concatenates the
-    coefficients and intercepts into a single :class:`sklearn.linear_model.LinearRegression`
-    instance whose ``.predict`` returns stacked outputs for all emulators at once. Cached on
-    ``variable_dir`` via :func:`functools.lru_cache` (32 entries) since the load is I/O-heavy.
+    For every ``(model, emulator)`` pair in ``regional_models_for_var(var) ×
+    range(NUM_EMULATORS)`` loads ``fair_to_smip_{model}_{i}.joblib`` from
+    ``variable_dir`` and concatenates the coefficients and intercepts into a single
+    :class:`sklearn.linear_model.LinearRegression` instance whose ``.predict``
+    returns stacked outputs for all emulators at once. Cached on ``variable_dir``
+    via :func:`functools.lru_cache` (32 entries) since the load is I/O-heavy.
     """
     var = variable_dir.name
-    
+
     fair2smip_coefs, fair2smip_intercepts = [], []
 
-    for model in REGIONAL_MODEL_NAMES:
+    for model in regional_models_for_var(var):
         for i in range(NUM_EMULATORS):
             fair2smip = joblib.load(variable_dir / f"fair_to_smip_{model}_{i}.joblib")
             fair2smip_coefs.append(fair2smip.coef_)
@@ -166,18 +182,22 @@ def get_regional_models(variable_dir: Path) -> LinearRegression:
 
     return fair2smip
 
-def get_smip(global_temp: xr.DataArray, fair2smip: LinearRegression) -> np.ndarray:
+def get_smip(
+    global_temp: xr.DataArray, fair2smip: LinearRegression, models: list[str]
+) -> np.ndarray:
     """Run the concatenated ``FaIR → SMIP`` regressor and reshape its output into a 5-D array.
 
     Slices ``global_temp`` to ``[2015, …]`` (the emulator's training range), predicts the
     stacked per-emulator regional fields, then reshapes the flat output into
     ``(time, model, emulator, lat, lon)`` using ``NUM_LAT`` / ``NUM_LON`` / ``NUM_EMULATORS``
-    and the regional model list.
+    and ``models`` — the variable's participating model list
+    (:func:`backend.constants.regional_models_for_var`), which must match the list the
+    regressor was concatenated over.
     """
     # Get regional projections for each model
     smip = fair2smip.predict(global_temp.sel(timebounds=slice(2015, None)))
 
-    smip = smip.reshape((smip.shape[0], len(REGIONAL_MODEL_NAMES), NUM_EMULATORS, NUM_LAT, NUM_LON))
+    smip = smip.reshape((smip.shape[0], len(models), NUM_EMULATORS, NUM_LAT, NUM_LON))
 
     return smip
 
@@ -202,10 +222,11 @@ def get_regional_map_from_global_temp(
     model exists for this variable (see :func:`get_historical_model`).
     """
     # Get regional map from global temperature
-    smip = get_smip(global_temp, fair2smip)
+    models = regional_models_for_var(var)
+    smip = get_smip(global_temp, fair2smip, models)
     regional_map = xr.DataArray(smip, dims=('time', 'model', 'emulator', 'lat', 'lon'))
     regional_map.coords['time'] = np.arange(2015, SIM_END_YEAR+1)
-    regional_map.coords['model'] = REGIONAL_MODEL_NAMES
+    regional_map.coords['model'] = models
     regional_map.coords['emulator'] = np.arange(NUM_EMULATORS)
     correct_lat = np.load(data_dir / "correct_lat.npy")
     regional_map.coords['lat'] = correct_lat

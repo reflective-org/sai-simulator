@@ -25,7 +25,9 @@ from scripts.preprocessing_sanity import (
 
 def test_expected_year_count_for_experiment_values() -> None:
     assert expected_year_count_for_experiment("historical") == (164, 165)
-    assert expected_year_count_for_experiment("baseline") == (50, 85)
+    # Upper bound 86: UKESM's het-chem SSP2-4.5 baseline spans 2015-2100 and its
+    # 360-day calendar never drops an edge year.
+    assert expected_year_count_for_experiment("baseline") == (50, 86)
     # Lower bound covers p-e, whose ssp245 QFLX fill spans only 2020-2084 (65 yr).
     assert expected_year_count_for_experiment("ssp245") == (63, 86)
     assert expected_year_count_for_experiment("1.5") == (33, 36)

@@ -178,9 +178,12 @@ model_internal_variability.npy
 *.zip
 
 # plots
-*png
+*.png
 *.tif
 *.svg
+# ...except the README's banner, which is committed. Generated figures
+# (e.g. scripts/plot_icefrac_fit.py output) stay ignored.
+!img/preview.png
 
 # so2 csv generated
 so2_by_latitude_*.csv

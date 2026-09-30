@@ -10,18 +10,19 @@ models together). The single slope field is saved as
 **Weighting — read before adding anchors.** A pooled through-origin least
 squares does NOT weight anchors equally: each anchor's influence is
 ``x_i^2 / sum x_j^2`` (the square of its cooling magnitude). With the current
-five anchors that is 7.3 / 20.1 / 32.9% (CESM gauss-1.5/1.0/0.5) and
-6.6 / 33.1% (MIROC g6-1.5/g6-0.5) — CESM 60.4% / MIROC 39.6% overall, while
-the no-SAI baseline map is a strict 50/50 model mean. This asymmetry is a
-**deliberate choice**: the alternative (fit per model, average the slopes
-50/50 — tried and reverted) makes total influence per *model* equal at the
-cost of concentrating it per *anchor* — MIROC's g6-0.5 run alone would carry
-41.7% of the fit, dominating every variable from a single simulation. Until a
-model contributes a balanced anchor set across cooling magnitudes, the pooled
-fit's data-driven weighting is the lesser distortion. Note this means the SAI
-delta aggregates models at a different stage (and weighting) than the no-SAI
-emulators and sea-ice sigmoids, which average per-model results 50/50 at
-prediction time.
+six anchors that is 6.2 / 17.0 / 27.8% (CESM gauss-1.5/1.0/0.5),
+5.6 / 28.0% (MIROC g6-1.5/g6-0.5) and 15.4% (UKESM g6-1.5, which cools
+1.37 K — a high-ECS model pulled back to the same target) — CESM 51.1% /
+MIROC 33.6% / UKESM 15.4% overall, while the no-SAI baseline map is a strict
+equal-weight model mean. This asymmetry is a **deliberate choice**: the
+alternative (fit per model, average the slopes equally — tried and reverted)
+makes total influence per *model* equal at the cost of concentrating it per
+*anchor* — MIROC's g6-0.5 run alone would carry ~40% of the fit, dominating
+every variable from a single simulation. Until a model contributes a balanced
+anchor set across cooling magnitudes, the pooled fit's data-driven weighting
+is the lesser distortion. Note this means the SAI delta aggregates models at a
+different stage (and weighting) than the no-SAI emulators and sea-ice
+sigmoids, which average per-model results equally at prediction time.
 
 Anchors (see ``ANCHORS``): the three CESM2-WACCM GAUSS cooling targets
 (0.5 / 1.0 / 1.5 K) plus MIROC-ES2H's G6-1.5K and G6-0.5K SAI runs. Each anchor
@@ -76,14 +77,12 @@ ANCHORS = [
     Anchor("gauss-0.5",    "output_gauss-0.5.nc",          "output_gauss-baseline.nc",       "CESM2-WACCM"),
     Anchor("g6-1.5-miroc", "output_gauss-g6-1.5-miroc.nc", "output_gauss-baseline-miroc.nc", "MIROC-ES2H"),
     Anchor("g6-0.5-miroc", "output_gauss-g6-0.5-miroc.nc", "output_gauss-baseline-miroc.nc", "MIROC-ES2H"),
-    # UKESM (stub; uncomment once its consumer outputs are staged). The exp/
-    # baseline filenames follow the consumer's "-ukesm" output_suffix; add one
-    # Anchor per UKESM G6 cooling label declared in process_monthly_gauss.py's
-    # MODELS entry. Each anchor joins the pooled fit with x^2 leverage (see the
-    # module docstring), so a lone ~1.5K G6 run (the shallowest cooling) is the
-    # lowest-leverage kind of anchor a model can contribute — recompute the
-    # per-model totals when adding one.
-    # Anchor("g6-1.5-ukesm", "output_gauss-g6-1.5-ukesm.nc", "output_gauss-baseline-ukesm.nc", "UKESM1-1-LL"),
+    # UKESM contributes one G6-1.5K anchor (MACLOUD het-chem runs), rebased
+    # against the het-chem SSP2-4.5 baseline it branched from. Each anchor joins
+    # the pooled fit with x^2 leverage (see the module docstring), so this lone
+    # ~1.5K run (the shallowest cooling) is the lowest-leverage kind of anchor a
+    # model can contribute.
+    Anchor("g6-1.5-ukesm", "output_gauss-g6-1.5-ukesm.nc", "output_gauss-baseline-ukesm.nc", "UKESM1-1-LL"),
 ]
 
 

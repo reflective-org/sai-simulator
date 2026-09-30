@@ -28,11 +28,12 @@ def _save_yearly_nc(path: Path, var: str, value: float) -> None:
     ds.to_netcdf(path)
 
 
-def test_anchors_cover_gauss_and_miroc() -> None:
+def test_anchors_cover_gauss_miroc_and_ukesm() -> None:
     names = [a.name for a in fd.ANCHORS]
     assert names[:3] == ["gauss-1.5", "gauss-1.0", "gauss-0.5"]
     assert "g6-1.5-miroc" in names
     assert "g6-0.5-miroc" in names
+    assert "g6-1.5-ukesm" in names
 
 
 def test_miroc_anchors_point_at_miroc_files() -> None:
@@ -53,12 +54,26 @@ def test_miroc_anchors_share_one_miroc_baseline() -> None:
     assert {a.baseline_file for a in miroc} == {"output_gauss-baseline-miroc.nc"}
 
 
+def test_ukesm_anchor_rebases_against_its_branch_point() -> None:
+    """UKESM's G6-1.5K run branched from the het-chem SSP2-4.5 baseline —
+    the delta must rebase against that run's own output file."""
+    ukesm = [a for a in fd.ANCHORS if a.name.endswith("-ukesm")]
+    assert len(ukesm) == 1
+    anchor = ukesm[0]
+    assert anchor.exp_file == "output_gauss-g6-1.5-ukesm.nc"
+    assert anchor.baseline_file == "output_gauss-baseline-ukesm.nc"
+
+
 def test_anchor_models_match_their_files() -> None:
     for anchor in fd.ANCHORS:
         if anchor.name.startswith("gauss-"):
             assert anchor.model == "CESM2-WACCM"
         elif anchor.name.endswith("-miroc"):
             assert anchor.model == "MIROC-ES2H"
+        elif anchor.name.endswith("-ukesm"):
+            assert anchor.model == "UKESM1-1-LL"
+        else:
+            raise AssertionError(f"anchor {anchor.name} matches no known model suffix")
 
 
 def _write_anchor_pair(var_dir, tas_dir, anchor, tas_exp, tas_base, var_exp, var_base, var):

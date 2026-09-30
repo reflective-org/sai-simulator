@@ -30,14 +30,16 @@ The SAI Simulator is a web-based tool that runs in your browser at [simulator.re
 
 ## Climate Model Data
 
-The simulator is trained on monthly output from two Earth system models, combined as an
-equal-weight multi-model mean of **patterns per kelvin**: each model's regional fields
-are regressed on **its own global-mean tas anomaly** (vs its own 1850–1900 mean), and at
-request time FaIR's global anomaly (AR6 calibrated-constrained ensemble mean by default;
-see `FAIR_CALIBRATION` in `backend/baseline.py`) is fed through every model's fitted
-line and the lines are averaged 50/50 — that average is the final mapping from global
-temperature to grid-cell values, so both patterns count equally even though the models'
-transient sensitivities differ. One Zarr store per (model, experiment) is served from
+The simulator is trained on monthly output from three Earth system models, combined as
+an equal-weight multi-model mean of **patterns per kelvin**: each model's regional
+fields are regressed on **its own global-mean tas anomaly** (vs its own 1850–1900 mean),
+and at request time FaIR's global anomaly (AR6 calibrated-constrained ensemble mean by
+default; see `FAIR_CALIBRATION` in `backend/baseline.py`) is fed through every model's
+fitted line and the lines are averaged equally — that average is the final mapping from
+global temperature to grid-cell values, so every pattern counts equally even though the
+models' transient sensitivities differ. (A model can sit out a variable it has no data
+for — see `REGIONAL_MODEL_VAR_EXCLUSIONS` in `backend/constants.py`; today UKESM sits
+out p−e on the projection side.) One Zarr store per (model, experiment) is served from
 the public bucket configured in `version.py` (`ZARR_STORES_URI`); the table lists what
 each store contains.
 
@@ -53,6 +55,9 @@ each store contains.
 | MIROC-ES2H | ssp245 (ScenarioMIP SSP2-4.5) | 3 | 86 | 2015–2100 | 128 × 256 |
 | MIROC-ES2H | G6-1.5K-SAI (GeoMIP) | 3 | 50 | 2035–2084 | 128 × 256 |
 | MIROC-ES2H | G6-0.5K-SAI (GeoMIP) | 3 | 50 | 2035–2084 | 128 × 256 |
+| UKESM1-1-LL | historical | 3 (`r2`/`r3`/`r12`) | 165 | 1850–2014 | 144 × 192 (N96, 1.25° × 1.875°) |
+| UKESM1-1-LL | baseline (het-chem SSP2-4.5, GeoMIP branch parent) | 3 | 86 | 2015–2100 | 144 × 192 |
+| UKESM1-1-LL | G6-1.5K-SAI (GeoMIP) | 3 | 51 | 2034–2084 | 144 × 192 |
 
 Notes:
 
@@ -89,6 +94,15 @@ Notes:
   slightly from the producer's GeoMIP seaice conversion, see the array's `note` attr).
   The sea-ice **sigmoid fit** still trains on the GeoMIP family (branch-consistency
   with the G6 anchors), not on `ssp245`.
+- **The sea-ice fit keeps ice-free years.** `filter_icefrac_data` excludes marginal
+  grid cells — those with too few valid years, or whose September ice never reaches
+  `intensity_threshold` — but it does **not** discard individual ice-free
+  observations. It once set every value ≤ 0.01 to NaN as noise, which censored the
+  training set precisely where a decreasing logistic needs data: the zeros are what
+  pin its warm asymptote. The cost scaled with how ice-free a model gets (CESM lost
+  1.8% of its observations, MIROC 8.0%), leaving the warm end unconstrained and the
+  fitted curve resting on a floor rather than decaying. Removing that step improved
+  the Arctic-wide September ice bias for every model against its own output.
 - **The two G6 experiments share one branch-point baseline.** JAMSTEC publishes
   `*_baseline_*` files under both `G6-1.5K-SAI/` and `G6-0.5K-SAI/`; they are
   byte-identical (verified bitwise for hfls, size-identical for every other variable),
@@ -100,6 +114,65 @@ Notes:
   in the delta fit (`scripts/fit_delta.py`).
 - **MIROC evaporation.** MIROC's `QFLX` (used for water availability, P−E) is derived
   from JAMSTEC's monthly latent heat flux: `QFLX = hfls / 2.5e6`.
+- **UKESM1.1 provenance.** The UKESM runs are the **het-chem** UKESM1.1 variant
+  (heterogeneous chemistry on injected stratospheric aerosols; UM 13.1 for the
+  scenarios, 11.7 for historical), distributed by the Met Office/Exeter via the
+  public JASMIN MACLOUD workspace rather than ESGF, on a 360-day calendar. Its
+  single het-chem SSP2-4.5 run is both the G6 branch parent and the projection
+  baseline (CESM-style). Monthly TREFHT/PRECT are derived as 30-day means of the
+  daily fields in every experiment (the shipped monthly files mix 6-hourly- and
+  1-hourly-sampled duplicates inconsistently across experiments); TREFHTMX/MN and
+  the exposure counts likewise come from the daily fields; QFLX = evap / 2.5e6
+  (latent heat flux, as for MIROC); ICEFRAC is the shipped atmosphere-grid
+  fraction (no regridding). The historical suites carry no realization metadata,
+  so the suite-to-member pairing (`r2=u-bz502`, `r3=u-by791`, `r12=u-bz897` —
+  not alphabetical) was established by cross-boundary weather continuity at the
+  2015 stitch, then confirmed independently by Matthew Henry on 2026-09-24. It
+  is documented in the stores' note attrs and is what `--historical-map`
+  expects.
+- **UKESM historical sea ice comes from ESGF, for one member.** MACLOUD
+  publishes none, but CMIP6 ESGF carries `siconca` for UKESM1-1-LL historical
+  `r1i1p1f2` (CEDA node, `v20220512`, atmosphere grid, no regridding needed).
+  ESGF publishes historical for that variant alone — `r2i1p1f2` and `r3i1p1f2`
+  have `ssp126` only, and there is no `r12` at all — so it covers one of our
+  three members. It is the same run as this store's **r3**: monthly `tas` agrees
+  with r3 to 0.0001 K RMS and with r2/r12 to only 1.97–1.99 K, which is the
+  scale our own members differ from each other by. The CMIP variant label and
+  MACLOUD's member numbering therefore do **not** correspond; matching on the
+  label alone pairs the wrong run. The historical store's ICEFRAC is `PARTIAL`
+  as a result: real for r3, all-NaN for r2 and r12. Two conversions matter —
+  ESGF ships percent where the store holds a 0–1 fraction, and marks land with
+  a real `_FillValue` where the store holds 0.
+- **UKESM missing sources.** The MACLOUD historical publishes no evaporative
+  flux or sea ice, so the historical store ships all-NaN QFLX/ICEFRAC
+  placeholders: UKESM's p−e and icefrac series start in 2015. Its p−e therefore
+  feeds only the SAI delta (branch-consistent baseline/G6 pair) and sits out the
+  projection side (`REGIONAL_MODEL_VAR_EXCLUSIONS`). Its **icefrac now trains
+  the sea-ice sigmoid** alongside the other two: once ESGF supplied historical
+  sea ice (see above) the training window reaches back to 1900 and the logistic's
+  full-ice plateau is fitted rather than extrapolated. It held out while its ice
+  began in 2015, which left no cold regime in the training data. UKESM's
+  September Arctic sea-ice **area** is low-biased against observations —
+  0.2–2.4 Mkm² over 2015–34 against 2.8–3.5 Mkm² observed over 2015–25 (the
+  `area` column of `data/processed/september-sea-ice-extent-observation.csv`) —
+  which is a property of the model, and shows up as the lowest of the three
+  curves rather than as a fitting artefact. `python scripts/plot_icefrac_fit.py`
+  renders a diagnostic figure of the fitted sigmoids, each model's training
+  coverage, and what including UKESM does to the mean (written to
+  `img/icefrac_fit.png`, a generated artefact that is not committed).
+- **UKESM icefrac is one realization.** ESGF publishes its historical sea ice for
+  a single member, so `variable_members` in `process_monthly_gauss.MODELS`
+  restricts icefrac to `r3` in **every** experiment. A three-member mean after
+  2015 against one member before it would step the variance at the stitch, and
+  the sigmoid trains on exactly that series. Its `tas` stays a three-member mean,
+  so the fit pairs a one-member ice record against an ensemble-mean temperature;
+  the forced response they share is what the logistic fits.
+- **UKESM 360-day calendar and exposure counts.** UKESM years have 360 days, so
+  its exposure counts saturate at 360 days/year where CESM's reach 365 and
+  MIROC's 366. Nothing rescales by days-per-year; in fully saturated cells
+  UKESM is therefore ~1.4% low in the multi-model mean (the CESM/MIROC leap-year
+  gap is the same class of effect at 0.3%), and the SAI delta largely cancels
+  it. Documented rather than corrected — counts are stored as integers.
 - **SO2 injection.** The SO2-by-latitude controller data exists only for the CESM
   GAUSS runs, so the SO2 fit is CESM-only.
 
@@ -331,10 +404,9 @@ python variable_launch_gradio.py --use_local_cache
 
 The pipeline is multi-model: each climate model is processed independently and
 contributes its SAI experiment(s) as additional training **anchors** to the
-delta fit. CESM2-WACCM (GAUSS) and MIROC-ES2H (G6-1.5K) are wired in today;
-adding another model (e.g. UKESM, once its data is public) is mostly
-configuration. There are commented `UKESM1-1-LL` stubs in the files below to
-copy from.
+delta fit. CESM2-WACCM (GAUSS), MIROC-ES2H (G6-1.5K/0.5K) and UKESM1-1-LL
+(G6-1.5K) are wired in today; adding another model is mostly configuration —
+copy the entries the existing models have in the files below.
 
 **Producer side (off-repo).** Build per-experiment Zarr stores for the new
 model in R2 under the `/simulator-inputs/` prefix, matching the existing
@@ -345,7 +417,12 @@ all available members, and an SSP2-4.5 baseline plus the model's G6 SAI run(s).
 Regrid sea ice to `ICEFRAC` (land filled with 0) and precompute the exposure
 counts so the consumer stays model-agnostic. The consumer bilinearly regrids
 every model onto the CESM2-WACCM target grid, so the native grid needs no
-special handling.
+special handling. UKESM's producer chain lives in this repo as a worked
+example: `scripts/mirror_macloud_to_r2.py` (JASMIN MACLOUD → R2 raw staging;
+`scripts/copy_ukesm_to_r2.py` does the same from the 2i2c hub bucket, and
+`scripts/mirror_esgf_to_r2.py` from ESGF) and `scripts/zarrify_ukesm11.py`
+(raw NetCDF → the three `UKESM1-1-LL_*.zarr` stores, with schema helpers in
+`scripts/zarrify_common.py`).
 
 **Repo side (five edits, all by analogy to the MIROC entries):**
 
@@ -371,14 +448,17 @@ special handling.
 
 **Weighting note.** The SAI slope is one **pooled** through-origin least
 squares over every model's anchors, which weights each anchor by the *square*
-of its cooling magnitude (currently CESM 60.4% / MIROC 39.6% overall) — unlike
+of its cooling magnitude (currently CESM 51.1% / MIROC 33.6% / UKESM 15.4% overall) — unlike
 the no-SAI emulators and sea-ice sigmoids, which average per-model results
-50/50 at prediction time. The pooled form is deliberate: fitting per model and
+equally at prediction time. The pooled form is deliberate: fitting per model and
 averaging would make model totals equal but concentrate 41.7% of all influence
 in MIROC's single G6-0.5K run (see the ``scripts/fit_delta.py`` docstring).
-A new model contributing only a lone ~1.5K G6 run (the shallowest cooling)
-adds the least leverage an anchor can have — worth a conscious decision if you
-want balanced coverage across cooling magnitudes.
+A new model contributing only a lone G6 run adds leverage proportional to the
+square of that run's actual cooling — for a nominal "1.5K target" that depends
+on the model's sensitivity: UKESM's single G6-1.5K anchor cools 1.37 K
+(high-ECS model, large overshoot to pull back) and lands at 15.4%, whereas the
+same target in MIROC cools only 0.82 K (5.6%). Recompute the split when adding
+an anchor if you care about balanced coverage across cooling magnitudes.
 
 ## 🔒 License
 

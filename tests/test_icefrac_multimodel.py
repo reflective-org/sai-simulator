@@ -69,13 +69,29 @@ def _arctic_cells(prediction: xr.DataArray) -> xr.DataArray:
     return prediction.sel(lat=slice(60, 90))
 
 
-def test_model_scenarios_cover_cesm_and_miroc() -> None:
-    assert set(fia.MODEL_SCENARIOS) == {"CESM2-WACCM", "MIROC-ES2H"}
+def test_model_scenarios_cover_all_three_models() -> None:
+    assert set(fia.MODEL_SCENARIOS) == {"CESM2-WACCM", "MIROC-ES2H", "UKESM1-1-LL"}
     assert fia.PRIMARY_MODEL in fia.MODEL_SCENARIOS
     for scenarios in fia.MODEL_SCENARIOS.values():
         assert "baseline" in scenarios
         for config in scenarios.values():
             assert set(config) == {"file", "start", "end"}
+
+
+def test_ukesm_trains_from_the_same_window_as_the_others() -> None:
+    """UKESM only joined once ESGF supplied historical sea ice. A baseline window
+    starting after 1900 would mean its ice record still lacks a cold regime, which
+    is what left its full-ice plateau extrapolated rather than fitted."""
+    ukesm = fia.MODEL_SCENARIOS["UKESM1-1-LL"]["baseline"]
+    cesm = fia.MODEL_SCENARIOS["CESM2-WACCM"]["baseline"]
+    assert (ukesm["start"], ukesm["end"]) == (cesm["start"], cesm["end"])
+
+
+def test_no_model_is_currently_excluded() -> None:
+    """The mechanism stays (it is what the plot script reads to show a rejected
+    fit), but nothing should be sitting in it unnoticed."""
+    assert fia.EXCLUDED_MODEL_SCENARIOS == {}
+    assert not set(fia.EXCLUDED_MODEL_SCENARIOS) & set(fia.MODEL_SCENARIOS)
 
 
 def test_miroc_scenarios_point_at_miroc_files() -> None:
@@ -248,3 +264,83 @@ def test_mean_over_time_band_absent_for_single_model() -> None:
     # A one-model ensemble has no across-model spread to report.
     assert res.model_spread_2sigma_no_sai is None
     assert res.model_spread_2sigma_with_sai is None
+
+
+class TestIceFreeObservationsAreKept:
+    """The fit must see ice-free years — they are what pin a decreasing logistic's
+    warm asymptote. An earlier filter discarded every value <= 0.01 as noise, which
+    censored the training set worst for the models that actually go ice-free."""
+
+    @staticmethod
+    def _cell(values):
+        """One (lon_band, lat_band, time, cell) column from a list of values."""
+        return np.asarray(values, dtype=float).reshape(1, 1, -1, 1)
+
+    def test_zeros_survive_the_filter(self):
+        # A real ice cell: icy early, ice-free later. Every year must be kept.
+        series = [0.9] * 10 + [0.0] * 10
+        out, _, _ = fia.filter_icefrac_data(self._cell(series))
+        assert not np.isnan(out).any()
+        assert out.ravel().tolist() == series
+
+    def test_low_intensity_cells_are_still_dropped(self):
+        # Never exceeds intensity_threshold (0.15) -> the marginal-cell guard fires.
+        out, too_few, low = fia.filter_icefrac_data(self._cell([0.05] * 20))
+        assert np.isnan(out).all()
+        assert int(low.sum()) == 1 and int(too_few.sum()) == 0
+
+    def test_cells_with_too_few_observations_are_still_dropped(self):
+        series = [0.9] * 5 + [np.nan] * 15          # only 5 valid, below min_valid_obs
+        out, too_few, low = fia.filter_icefrac_data(self._cell(series))
+        assert np.isnan(out).all()
+        assert int(too_few.sum()) == 1 and int(low.sum()) == 0
+
+    def test_an_all_ice_free_cell_is_dropped_as_low_intensity(self):
+        # Keeping zeros must not admit cells that never had ice: max 0 < 0.15.
+        out, too_few, low = fia.filter_icefrac_data(self._cell([0.0] * 20))
+        assert np.isnan(out).all()
+        assert int(low.sum()) == 1
+
+
+class TestYearPairing:
+    """tas and icefrac files need not cover the same years, so the fit pairs them
+    explicitly rather than by index position."""
+
+    @staticmethod
+    def _write(path, years):
+        da = xr.DataArray(
+            np.ones((len(years), 2, 2)),
+            dims=("time", "lat", "lon"),
+            coords={"time": np.asarray(years), "lat": [60.0, 70.0], "lon": [0.0, 180.0]},
+            name="icefrac",
+        )
+        da.to_dataset().to_netcdf(path)
+        return path
+
+    def test_window_years_respects_the_window_and_file_order(self, tmp_path):
+        path = self._write(tmp_path / "a.nc", range(2010, 2021))
+        assert fia._window_years(path, 2012, 2015) == [2012, 2013, 2014, 2015]
+
+    def test_shared_years_exclude_one_missing_from_either_file(self, tmp_path):
+        # CESM's real asymmetry: tas has no 2015, icefrac does.
+        tas = self._write(tmp_path / "tas.nc", [y for y in range(2013, 2018) if y != 2015])
+        ice = self._write(tmp_path / "ice.nc", range(2013, 2018))
+        ty = fia._window_years(tas, 2013, 2017)
+        iy = fia._window_years(ice, 2013, 2017)
+        assert 2015 not in ty and 2015 in iy
+        assert sorted(set(ty) & set(iy)) == [2013, 2014, 2016, 2017]
+
+    def test_a_model_carrying_2015_in_both_files_keeps_it(self, tmp_path):
+        # UKESM's case. The old unconditional 2015 drop would have removed it from
+        # the ice side alone, shifting every later year against tas.
+        tas = self._write(tmp_path / "tas.nc", range(2013, 2018))
+        ice = self._write(tmp_path / "ice.nc", range(2013, 2018))
+        shared = sorted(set(fia._window_years(tas, 2013, 2017))
+                        & set(fia._window_years(ice, 2013, 2017)))
+        assert shared == [2013, 2014, 2015, 2016, 2017]
+
+    def test_reshape_no_longer_drops_2015(self, tmp_path):
+        ds = xr.open_dataset(self._write(tmp_path / "ice.nc", range(2013, 2018)))
+        arctic = create_arctic_dataset(ds)
+        out = fia.reshape_icefrac_data(arctic, "icefrac", "2013", "2017")
+        assert out.shape[-2] == 5

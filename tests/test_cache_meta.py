@@ -24,12 +24,29 @@ def test_fresh_dir_is_stamped_and_passes(tmp_path):
     cache_dir = tmp_path / "cache"
     validate_cache_dir(cache_dir)
     meta = json.loads((cache_dir / CACHE_META_FILENAME).read_text())
+    from backend.constants import REGIONAL_MODEL_NAMES, REGIONAL_MODEL_VAR_EXCLUSIONS
     assert meta == {
         "simulator_version": SIMULATOR_VERSION,
         "fair_calibration": FAIR_CALIBRATION,
+        "regional_models": list(REGIONAL_MODEL_NAMES),
+        "var_exclusions": {k: list(v) for k, v in sorted(REGIONAL_MODEL_VAR_EXCLUSIONS.items())},
     }
     # Idempotent: a matching stamped dir keeps passing.
     validate_cache_dir(cache_dir)
+
+
+def test_other_model_roster_stamp_is_refused(tmp_path):
+    """A cache built under a different regional-model roster (e.g. the two-model
+    v1.4 caches) must be refused: every multi-model mean and the pooled SAI delta
+    depend on the roster, and nothing in the artifacts records it otherwise."""
+    validate_cache_dir(tmp_path)
+    meta_path = tmp_path / CACHE_META_FILENAME
+    meta = json.loads(meta_path.read_text())
+    meta["regional_models"] = ["CESM2-WACCM", "MIROC-ES2H"]
+    meta_path.write_text(json.dumps(meta))
+    (tmp_path / "historical_tas.nc").write_bytes(b"x")
+    with pytest.raises(Exception):
+        validate_cache_dir(tmp_path)
 
 
 def test_populated_unstamped_dir_is_refused(tmp_path):

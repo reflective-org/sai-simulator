@@ -113,11 +113,14 @@ var2esm_var = {
 #                     the climate-change-only emulator trains on (pinned in
 #                     backend.constants.REGIONAL_MODEL2PROJECTION_BASELINE_FILES).
 #   experiment_missing_vars  per-experiment variables the store does not publish,
-#                     skipped up front rather than failing member-by-member. MIROC's
-#                     ScenarioMIP store ships all-NaN QFLX/ICEFRAC placeholders
-#                     (hfls and siconc for that run are only on an offline ESGF
-#                     node), so p-e and icefrac produce no ssp245 output and their
-#                     consumers fall back to the branch-point baseline.
+#                     skipped up front rather than failing member-by-member.
+#                     Nothing uses it at present: UKESM's historical QFLX and
+#                     ICEFRAC, the one live case, now come from CMIP6 ESGF.
+#   variable_members  per-VARIABLE member restriction, applied in every
+#                     experiment. Used where a variable is backed by a source
+#                     that covers fewer members than the store, so that the
+#                     series stays on one realization instead of stepping its
+#                     variance where the coverage changes.
 #   compute_variability  whether to emit the dashboard variability artifacts
 #                     (single set, from the primary model only).
 MODELS = {
@@ -160,31 +163,41 @@ MODELS = {
         "experiment_missing_vars": {},
         "compute_variability": False,
     },
-    # --- UKESM (stub; uncomment + fill in once the public stores land) ---
-    # Mirror the MIROC entry: the G6 branch-point baseline + the G6 SAI run(s),
-    # CESM-style variable names, all available members, no variability. Confirm the
-    # real store filenames and the SAI cooling label(s) — if UKESM ships more than
-    # one G6 cooling target, add one (store, label) pair each, and add a matching
-    # Anchor per label in scripts/fit_delta.py. If a separate ScenarioMIP ssp245 run
-    # is published, add it as a second no_sai_experiments entry (as MIROC does) and
-    # list it first in REGIONAL_MODEL2PROJECTION_BASELINE_FILES in
-    # backend/constants.py; declare any placeholder variables it ships in
-    # experiment_missing_vars so they fall back to the branch-point baseline. If
-    # UKESM has no evaporative-flux source at all (MIROC ships QFLX derived from
-    # hfls), add it to ALLOWED_MISSING in scripts/data_sanity_checks.py so p-e
-    # auto-drops.
-    # "UKESM1-1-LL": {
-    #     "experiments": [
-    #         (f"{ZARR_STORES_URI}/UKESM1-1-LL_baseline.zarr",    "baseline"),
-    #         (f"{ZARR_STORES_URI}/UKESM1-1-LL_G6-1.5K-SAI.zarr", "g6-1.5"),
-    #     ],
-    #     "model_coord": "UKESM1-1-LL",
-    #     "output_suffix": "-ukesm",
-    #     "has_historical": False,
-    #     "no_sai_experiments": ("baseline",),
-    #     "experiment_missing_vars": {},
-    #     "compute_variability": False,
-    # },
+    "UKESM1-1-LL": {
+        "experiments": [
+            (f"{ZARR_STORES_URI}/UKESM1-1-LL_baseline.zarr",    "baseline"),
+            (f"{ZARR_STORES_URI}/UKESM1-1-LL_historical.zarr",  "historical"),
+            (f"{ZARR_STORES_URI}/UKESM1-1-LL_G6-1.5K-SAI.zarr", "g6-1.5"),
+        ],
+        "model_coord": "UKESM1-1-LL",
+        "output_suffix": "-ukesm",
+        "has_historical": True,
+        # One het-chem SSP2-4.5 run (2015-2100, MACLOUD) is both the G6 branch
+        # point and the projection baseline — CESM-style single no-SAI run.
+        "no_sai_experiments": ("baseline",),
+        # MACLOUD publishes neither sea ice nor evaporative flux for the
+        # historical suites, but CMIP6 ESGF publishes both (siconca and hfls; see
+        # the store's PARTIAL note attrs), so nothing is missing for any
+        # experiment and both series stitch like any other variable.
+        "experiment_missing_vars": {},
+        # ESGF publishes both for ONE member, the run this store calls r3. Using
+        # r3 alone in every experiment keeps each series on a single realization:
+        # a three-member mean after 2015 and a one-member series before it would
+        # step the variance at the stitch, and the sea-ice sigmoid trains on
+        # exactly that series. tas stays a three-member mean, so the fit pairs a
+        # single-member record against an ensemble-mean temperature — the forced
+        # response both sides share is what it fits.
+        #
+        # For p-e this restricts the QFLX term ONLY. p-e is assembled below as
+        # (this model's pr output) - QFLX, and that pr file stays a three-member
+        # mean, so p-e pairs ensemble-mean precipitation with single-member
+        # evaporation. That is deliberate rather than an oversight: both terms are
+        # uniform across the 2015 stitch so there is no seam, and the three-member
+        # mean is the better estimate of forced pr. It does mean p-e is not
+        # "r3 throughout" in the way icefrac is.
+        "variable_members": {"icefrac": ("r3",), "p-e": ("r3",)},
+        "compute_variability": False,
+    },
 }
 
 # Zarr group per variable family: cumulative exposure counts live under
@@ -758,11 +771,16 @@ def _process_model(
     has_historical = model_cfg["has_historical"]
     no_sai_experiments = tuple(model_cfg.get("no_sai_experiments", ("baseline",)))
     experiment_missing_vars = model_cfg.get("experiment_missing_vars", {})
+    variable_members = model_cfg.get("variable_members", {})
+    allowed_members = variable_members.get(var)
     compute_variability = model_cfg["compute_variability"]
 
     # Loading from Zarr stores. Each store carries all members for one
     # experiment under the appropriate Mon/atmos_2d* subgroup; one DataArray
     # lands per (experiment, member) in exp2member2data.
+    if allowed_members is not None:
+        print(f"\033[93m>> {var}: restricted to member(s) {', '.join(allowed_members)} "
+              f"for {model_name}\033[0m")
     print(">> Loading Zarr stores …")
     group = _group_for_var(var)
     exp2member2data: dict[str, dict[str, list[xr.DataArray]]] = defaultdict(
@@ -787,6 +805,12 @@ def _process_model(
 
         for m_value in ds["member"].values:
             m = str(m_value)
+            if allowed_members is not None and m not in allowed_members:
+                # This variable is restricted to a subset of the model's members
+                # (see variable_members in the MODELS entry). Skipping here keeps
+                # the restriction in one place rather than leaving members to fail
+                # a downstream NaN check.
+                continue
             member_da = ds[esm_var].sel(member=m_value).drop_vars(
                 "member", errors="ignore"
             )

@@ -21,7 +21,7 @@ the model's pattern per K of its own global warming (multi-model global tas
 slope = 1 by construction), and the intercept needs no post-hoc anchoring. At
 request time the backend feeds FaIR's global anomaly into every model's line
 and takes the equal-weight model mean — since the emulators are linear, that
-mean of predictions IS the 50/50 average of the fitted lines, which is the
+mean of predictions IS the equal-weight average of the fitted lines, which is the
 final global-temp → grid-cell mapping. Under this anchoring the displayed
 multi-model global mean tracks the FaIR driver with no constant offset (each
 model's ``intercept − historical rebase`` cancels its own mean warming).
@@ -56,7 +56,7 @@ from sklearn.linear_model import LinearRegression
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from backend.constants import (  # noqa: E402  (needs the repo-root path above)
-    REGIONAL_MODEL_NAMES,
+    regional_models_for_var,
     resolve_projection_baseline_file,
 )
 
@@ -173,7 +173,7 @@ def fit_map(
 ) -> None:
     """Train bootstrapped global-tas-to-regional-``var`` linear emulators and dump each to disk.
 
-    For every model in :data:`backend.constants.REGIONAL_MODEL_NAMES`, resolves that
+    For every model in :func:`backend.constants.regional_models_for_var`, resolves that
     model's projection baseline under ``<data_dir>/<var>/`` (see
     :func:`backend.constants.resolve_projection_baseline_file`) and trains
     ``num_bootstrap_replicates`` regressors of the regional fields on the model's
@@ -187,8 +187,9 @@ def fit_map(
     Raises :class:`ValueError` if the primary model has no processed baseline for this
     variable — in that case ``process_monthly_gauss.py`` needs to run first. Secondary
     models are skipped with a warning, so the fit still works before their outputs are
-    staged (the runtime then has no emulators for them and must not list them in
-    ``REGIONAL_MODEL_NAMES``).
+    staged; a model that permanently lacks a variable must be declared in
+    ``backend.constants.REGIONAL_MODEL_VAR_EXCLUSIONS`` so the runtime does not look
+    for its emulators (UKESM1-1-LL / p-e is the current case).
     """
     data_dir = Path(data_dir)
     var_dir = data_dir / var
@@ -198,7 +199,7 @@ def fit_map(
     model_dir = output_dir / var
     model_dir.mkdir(exist_ok=True)
 
-    for position, model in enumerate(REGIONAL_MODEL_NAMES):
+    for position, model in enumerate(regional_models_for_var(var)):
         baseline_path = resolve_projection_baseline_file(var_dir, model)
         if baseline_path is None:
             if position == 0:

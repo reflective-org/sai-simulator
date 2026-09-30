@@ -46,9 +46,13 @@ STORE_NAMES = [
     "MIROC-ES2H_historical.zarr",
     "MIROC-ES2H_G6-1.5K-SAI.zarr",
     "MIROC-ES2H_G6-0.5K-SAI.zarr",
-    # UKESM (stub; uncomment once the public stores land — confirm real names).
-    # "UKESM1-1-LL_baseline.zarr",
-    # "UKESM1-1-LL_G6-1.5K-SAI.zarr",
+    # UKESM1-1-LL (MACLOUD het-chem runs; built by scripts/zarrify_ukesm11.py).
+    # The historical store ships all-NaN QFLX/ICEFRAC placeholders (MACLOUD
+    # publishes no evap or sea ice for historical) — present with PLACEHOLDER
+    # note attrs, so they warn rather than fail below.
+    "UKESM1-1-LL_baseline.zarr",
+    "UKESM1-1-LL_historical.zarr",
+    "UKESM1-1-LL_G6-1.5K-SAI.zarr",
 ]
 
 # Per-group required variables. Mirrors the routing logic in
@@ -70,9 +74,11 @@ REQUIRED_GROUPS: dict[str, list[str]] = {
 # (MIROC used to be listed here for QFLX, but its stores now ship QFLX derived
 # from JAMSTEC's monthly hfls — QFLX = hfls / 2.5e6 — so it is required again.)
 ALLOWED_MISSING: dict[str, set[str]] = {
-    # If UKESM ships no evaporative-flux source, add an entry so its missing
-    # QFLX (→ no p-e downstream) is treated as allowed, not a failure:
-    # "UKESM1-1-LL": {"QFLX"},
+    # UKESM ships QFLX (= evap / 2.5e6) in its baseline and G6 stores; its
+    # historical store carries QFLX/ICEFRAC as all-NaN PLACEHOLDER arrays,
+    # which the note-attr check below reports as warnings, so nothing is
+    # allowed-missing today. Add a model here only when a variable is absent
+    # from the store entirely.
 }
 
 # Canonical dims the consumer pipeline aligns on.
@@ -111,6 +117,11 @@ def check_store(store_uri: str) -> list[str]:
             note = str(da.attrs.get("note", ""))
             if "PLACEHOLDER" in note.upper():
                 print(f"{YELLOW}  [{group}/{var}] all-NaN placeholder — {note}{RESET}")
+            elif "PARTIAL" in note.upper():
+                # Real for some ensemble members and NaN for the rest, because the
+                # source only covers those members (UKESM historical ICEFRAC: ESGF
+                # publishes sea ice for one of the three). Well-formed, so a warning.
+                print(f"{YELLOW}  [{group}/{var}] partial — {note}{RESET}")
             missing_dims = EXPECTED_DIMS - set(da.dims)
             if missing_dims:
                 failures.append(

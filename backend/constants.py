@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 REGIONAL_MODEL_NAMES = [
     "CESM2-WACCM",
     "MIROC-ES2H",
+    "UKESM1-1-LL",
 ]
 
 # A model can publish two distinct no-SAI runs, which serve two different roles:
@@ -35,7 +36,55 @@ REGIONAL_MODEL_NAMES = [
 REGIONAL_MODEL2PROJECTION_BASELINE_FILES = {
     "CESM2-WACCM": ("output_gauss-baseline.nc",),
     "MIROC-ES2H": ("output_gauss-ssp245-miroc.nc", "output_gauss-baseline-miroc.nc"),
+    # UKESM's single het-chem SSP2-4.5 run serves both roles (CESM-style).
+    "UKESM1-1-LL": ("output_gauss-baseline-ukesm.nc",),
 }
+
+# Variables a model cannot contribute to the PROJECTION side (the fit_map
+# emulators, the multi-model projection mean, and the multi-model historical
+# reference). UKESM1-1-LL's historical publishes no evaporative flux, so its
+# p-e series starts in 2015: no 1850-1900 rebase window and nothing to
+# contribute to the historical mean — and _load_multi_model_baseline averages
+# models over their OVERLAPPING years, so including it would erase everyone's
+# pre-2015 p-e. UKESM's p-e still feeds the SAI delta fit (fit_delta.ANCHORS),
+# which rebases against the fully-covered branch-point baseline instead.
+# (icefrac needs no entry: its projection side is CESM-only by construction —
+# see backend/historical.py.)
+REGIONAL_MODEL_VAR_EXCLUSIONS: dict[str, tuple[str, ...]] = {
+    # Empty since UKESM's historical QFLX was sourced from CMIP6 ESGF hfls: it
+    # previously sat out p-e's projection side because its evaporative flux began
+    # in 2015, and _load_multi_model_baseline inner-joins years, so a 2015-start
+    # series left the <= 2014 historical reference EMPTY rather than merely short.
+}
+
+
+def regional_models_for_var(var: str) -> list[str]:
+    """The regional models that participate in ``var``'s projection side.
+
+    Exposure variables are looked up under two names — the count variable
+    (``tas_above_35``, the processed/emulator directory name) and its exposure
+    alias (``exposure_above_35``, the dashboard name) — so both resolve to the
+    same list; exclusions are declared on the count-variable name.
+    """
+    base = exposurevar2var.get(var, var)
+    excluded = REGIONAL_MODEL_VAR_EXCLUSIONS.get(base, ())
+    return [m for m in REGIONAL_MODEL_NAMES if m not in excluded]
+
+
+# The first regional model is the primary: its grid is the target grid, its
+# processed baseline must exist, and fit_map / the cache pipeline treat
+# position 0 specially. It can never be excluded from a variable.
+for _var, _models in REGIONAL_MODEL_VAR_EXCLUSIONS.items():
+    if REGIONAL_MODEL_NAMES[0] in _models:
+        raise ValueError(f"the primary model {REGIONAL_MODEL_NAMES[0]} cannot be excluded ({_var})")
+    if not set(_models) <= set(REGIONAL_MODEL_NAMES):
+        raise ValueError(f"unknown model in REGIONAL_MODEL_VAR_EXCLUSIONS[{_var!r}]: {_models}")
+
+# Provenance string written into exported NetCDFs (see backend/get_outputs.py).
+DEFAULT_MODEL_NAME = (
+    " + ".join(REGIONAL_MODEL_NAMES)
+    + " (equal-weight mean; per-variable exclusions in REGIONAL_MODEL_VAR_EXCLUSIONS)"
+)
 
 
 def resolve_projection_baseline_file(variable_dir: str | Path, model: str) -> Path | None:

@@ -21,7 +21,10 @@ class SanityCheckError(ValueError):
 # members (007–009) under ``baseline`` / ``tasmax`` / ``tasmin``.
 EXPECTED_YEARS_BY_EXPERIMENT = {
     "historical": (164, 165),
-    "baseline": (50, 85),
+    # Baseline (raw, pre-merge): CESM 2015-2099 (85), MIROC GeoMIP 2020-2084 (65),
+    # UKESM het-chem SSP2-4.5 2015-2100 (86 — the 360-day calendar never drops an
+    # edge year).
+    "baseline": (50, 86),
     # ScenarioMIP SSP2-4.5 (MIROC): 2015-2100 for most variables (85-86 yr), but
     # p-e is limited to the store's QFLX fill window 2020-2084 (65 yr; the NaN-
     # padded months drop as incomplete years). Lower bound set to catch gross
