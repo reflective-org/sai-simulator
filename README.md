@@ -426,6 +426,18 @@ For custom injection
 python variable_launch_gradio.py --use_local_cache
 ```
 
+The custom-injection dashboard shows temperature, minimum and maximum temperature, water
+availability and ice fraction. Its SAI response comes from the CESM impulse-response
+parameters in `data/processed/`. `CESM_PARAMS_FILE` in `backend/variable.py` names the file,
+and `data/processed/CESM_params_README.md` describes the files and how they differ. To use a
+new parameter file, add it to `data/processed/` and change `CESM_PARAMS_FILE` and its sha1,
+`CESM_PARAMS_SHA1`.
+
+The file must be in whatever directory `--data_dir` points to. The repo keeps it in
+`data/processed/`; a deployment that uses another processed-data directory has to copy
+`CESM_params_updated.mat` there too, or every custom-injection variable fails with a missing-file
+error. `setup.sh` does not copy it.
+
 ## 🧩 Adding a New Model
 
 The pipeline is multi-model: each climate model is processed independently and

@@ -152,6 +152,20 @@ def test_compute_params_hash_injection_array_sensitivity() -> None:
     assert h_a != h_b
 
 
+def test_compute_params_hash_injection_path_follows_cesm_params(monkeypatch) -> None:
+    # A new CESM parameter file must change the custom-injection key (so saved outputs are not
+    # reused) and leave the analytic key alone.
+    import sys
+
+    go = sys.modules[_compute_params_hash.__module__]  # backend.get_outputs is also a function name
+    inj = np.zeros((7, 66), dtype=np.float64)
+    h_inj = _compute_params_hash("SSP1-2.6", None, 2091, 2100, None, None, inj)
+    h_ana = _compute_params_hash("SSP1-2.6", 1.5, 2091, 2100, 2050, 10, None)
+    monkeypatch.setattr(go, "CESM_PARAMS_SHA1", "0" * 40)
+    assert _compute_params_hash("SSP1-2.6", None, 2091, 2100, None, None, inj) != h_inj
+    assert _compute_params_hash("SSP1-2.6", 1.5, 2091, 2100, 2050, 10, None) == h_ana
+
+
 def test_compute_params_hash_injection_drops_analytic_params() -> None:
     # With the same injection array, varying temp_target / start_year / ramp_up
     # must NOT change the hash (they're excluded from the injection-path key).
@@ -844,3 +858,35 @@ def test_generate_sai_netcdf_writes_expected_variables(tmp_path: Path) -> None:
     # Global metadata propagated.
     assert ds.attrs["scenario"] == "SSP1-2.6"
     assert ds.attrs["sai_start_year"] == 2050
+
+
+def test_generate_sai_netcdf_puts_injection_rows_at_their_latitudes(tmp_path: Path) -> None:
+    # Injection rows run 60N → 60S, so SO2 in the first row only must land at latitude_bin 60.
+    proj_time = np.arange(2050, 2101)
+    rmap = _time_lat_lon_da(np.zeros((len(proj_time), 2, 2)), proj_time)
+    recent = _time_lat_lon_da(np.zeros((35, 2, 2)), np.arange(2015, 2050))
+    injection = np.zeros((7, 66))
+    injection[0, :] = 5.0
+
+    ds = generate_sai_netcdf(
+        var="tas",
+        recent_regional_map=recent,
+        regional_map=rmap,
+        regional_delta=rmap,
+        historical_model=None,
+        historical_rebase=None,
+        model_internal_variability=0.5,
+        ssp_scenario="SSP2-4.5",
+        temp_target=None,
+        decade_start_year=2091,
+        decade_end_year=2100,
+        start_year=None,
+        ramp_up=None,
+        variable_injection=injection,
+        output_config={"output_dir": str(tmp_path)},
+    )
+
+    so2 = ds["so2_injection_amount"]
+    assert so2.latitude_bin.values.tolist() == [60, 30, 15, 0, -15, -30, -60]
+    assert float(so2.sel(latitude_bin=60).sum()) == 5.0 * 66
+    assert float(so2.sel(latitude_bin=-60).sum()) == 0.0

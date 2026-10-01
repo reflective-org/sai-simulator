@@ -116,6 +116,9 @@ NUM_LAT = 192
 NUM_LON = 288
 MIN_SAI_START = 2035
 DEFAULT_SAI_START_YEAR = MIN_SAI_START
+# Latitudes of the 7 custom-injection rows, in row order (60N → 60S). This is the row order of
+# the CESM parameter file and of the dashboard sliders; see data/processed/CESM_params_README.md.
+INJECTION_LATS = [60, 30, 15, 0, -15, -30, -60]
 
 # Reference periods for temperature/precipitation anomalies.
 # PREINDUSTRIAL_* is the frame the *projections* and the SAI ``temp_target`` live in (the

@@ -14,6 +14,14 @@ from scipy.special import erfc
 
 from .constants import *
 
+# CESM impulse-response parameters and patterns, in ``data_dir``. See
+# data/processed/CESM_params_README.md for what each file contains.
+CESM_PARAMS_FILE = 'CESM_params_updated.mat'
+# sha1 of that file. It goes into the custom-injection output-file key, so saved maps and
+# NetCDFs are not reused after the parameters change. Update it with the file; a unit test
+# checks the two match.
+CESM_PARAMS_SHA1 = 'd776093fd1d5d4dedd4195afdadc65ec0c1ec7df'
+
 
 def impulse_firstOdiff_wGammaInj(
     beta: float,
@@ -384,13 +392,18 @@ def get_variable_regional_delta(
     Expands the (7-latitude × 65-year) annual injection into a monthly series by repeating
     each year 12× and dividing by 12 (per-month Tg). Runs the full convolution chain via
     :func:`pattern_from_all_injections_and_CO2` against the relevant ``param_*_all`` /
-    ``pattern_*_all`` matrices from ``CESM_params.mat`` (``tas``, ``pr``, or ``e``), assumes
-    zero CO2 forcing, and reshapes monthly → yearly by averaging over 12-month windows.
-    The output is wrapped as a ``(time, lat, lon)`` :class:`xr.DataArray` covering 2035-2100.
+    ``pattern_*_all`` matrices from :data:`CESM_PARAMS_FILE` (``tas``, ``tasmin``, ``tasmax``,
+    ``pr``, or ``e``), assumes zero CO2 forcing, and reshapes monthly → yearly by averaging over
+    12-month windows. The output is wrapped as a ``(time, lat, lon)`` :class:`xr.DataArray`
+    covering 2035-2100.
 
-    Raises :class:`ValueError` for any ``var`` other than ``"tas"``, ``"pr"``, or ``"e"`` —
+    ``tasmin`` / ``tasmax`` use the TMN / TMX entries: the monthly minimum of daily minimum and the
+    monthly maximum of daily maximum 2 m temperature, the same quantities as the simulator's
+    ``tasmin`` / ``tasmax``.
+
+    Raises :class:`ValueError` for any other ``var`` —
     other variables either are not supported by the variable-injection path or are derived
-    upstream from these three (e.g., ``"p-e"`` is computed by :mod:`get_outputs` from
+    upstream from these (e.g., ``"p-e"`` is computed by :mod:`get_outputs` from
     ``"pr"`` and ``"e"`` separately).
     """
     # Assumes variable injection is the amount of Tg per latitude per year, of shape (7, 65)
@@ -402,7 +415,7 @@ def get_variable_regional_delta(
 
     all_injection_and_CO2 = np.concatenate([variable_injection.T, co2_forcing], axis=1)
 
-    mat = scipy.io.loadmat(data_dir / 'CESM_params.mat')
+    mat = scipy.io.loadmat(data_dir / CESM_PARAMS_FILE)
     param_AOD_all = np.array(mat['param_AOD_all'])
 
     if var == "tas":
@@ -414,6 +427,12 @@ def get_variable_regional_delta(
     elif var == "e":
         param_all = np.array(mat['param_Q_all'])
         pattern_all = np.array(mat['pattern_Q_all'])
+    elif var == "tasmin":
+        param_all = np.array(mat['param_TMN_all'])
+        pattern_all = np.array(mat['pattern_TMN_all'])
+    elif var == "tasmax":
+        param_all = np.array(mat['param_TMX_all'])
+        pattern_all = np.array(mat['pattern_TMX_all'])
     else:
         raise ValueError(f"{var} not supported for variable injection")
 

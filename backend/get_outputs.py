@@ -46,7 +46,7 @@ from .baseline import REBASED_VARS, get_regional_map, validate_cache_dir
 from .delta import get_regional_delta
 from .p_values import get_grid_level_p_values, sai_p_values_cache_path
 from .population import get_population_data
-from .variable import get_variable_regional_delta
+from .variable import CESM_PARAMS_SHA1, get_variable_regional_delta
 from .utils import get_interpolator, create_mask, regional_aggregation, apply_constraints, clip_to_land, apply_ramp_up_factor
 from .icefrac import get_area, predict_icefrac
 
@@ -1321,7 +1321,7 @@ def get_outputs(
             variable_injection,
             dims=('lat', 'time'),
             coords={
-                'lat': [-60, -30, -15, 0, 15, 30, 60],
+                'lat': INJECTION_LATS,
                 'time': np.arange(2035, 2101),
             },
         )
@@ -1588,7 +1588,8 @@ def _compute_params_hash(
     (``ssp_scenario``, ``temp_target``, decade range, ``start_year``, ``ramp_up``).
     Otherwise the injection array is hashed via :func:`_hash_variable_injection` and
     used in place of the analytic params, so two cases that differ only in injection
-    produce different keys.
+    produce different keys. The custom-injection key also carries ``CESM_PARAMS_SHA1``, so
+    files saved with an earlier CESM parameter file are not reused.
 
     The display baseline period is folded into the key for both paths so cached map tiles are
     not reused across deployments that present anomalies against a different baseline.
@@ -1611,6 +1612,7 @@ def _compute_params_hash(
             decade_start_year,
             decade_end_year,
             f"vinj_{variable_hash}",
+            f"cesm_{CESM_PARAMS_SHA1[:10]}",
             display_baseline,
         ]
     params_str = "_".join(map(str, params))
@@ -1910,13 +1912,11 @@ def generate_sai_netcdf(
 
     # 4. Handle Optional SO2 Injection
     if variable_injection is not None:
-        # variable_injection is (lat, time) with time from 2035-2101
-        # latitude_bin coordinates are [-60, -30, -15, 0, 15, 30, 60]
-        lat_bins = [-60, -30, -15, 0, 15, 30, 60]
+        # variable_injection is (lat, time) with time from 2035-2101, rows in INJECTION_LATS order
         injection_time = np.arange(2035, 2101)
         inj_da = xr.DataArray(
             variable_injection,
-            coords={'latitude_bin': lat_bins, 'time': injection_time},
+            coords={'latitude_bin': INJECTION_LATS, 'time': injection_time},
             dims=['latitude_bin', 'time'],
             name="so2_injection_amount",
             attrs={'units': 'Tg SO2', 'long_name': 'Strategic SO2 Injection Amount'}

@@ -4,8 +4,8 @@ Variant of :mod:`launch_gradio` where the user provides a per-latitude × per-de
 injection grid (7 lat bands × 7 decades) instead of choosing a temperature target. The grid
 is expanded to a yearly ``(7, 66)`` array, the analytic ``temp_target`` / ``start_year`` /
 ``ramp_up`` knobs are bypassed by passing ``None``, and the resulting maps / time series /
-PDFs are rendered for ``tas`` / ``p-e`` / ``icefrac`` only (the smaller variable list keeps
-the custom-injection panel responsive).
+PDFs are rendered for ``tas`` / ``tasmin`` / ``tasmax`` / ``p-e`` / ``icefrac`` only (the smaller
+variable list keeps the custom-injection panel responsive).
 """
 from launch_gradio import *
 
@@ -61,7 +61,7 @@ def generate_gradio_plots(
     # Repeat the other decades 10 times
     other_decades = np.repeat(other_decades, 10, axis=1)
     variable_injection_amounts = np.concatenate([first_decade, other_decades], axis=1)
-    vars = ["tas", "p-e", "icefrac"]
+    vars = ["tas", "tasmin", "tasmax", "p-e", "icefrac"]
     output_data = get_outputs(ssp_scenario, None, spatial_gdf, spatial_item,
                               decade_start_year, decade_end_year, None, None,
                               DATA_DIR, MODEL_DIR, CACHE_DIR, var=vars,
@@ -336,7 +336,7 @@ def generate_gradio_plots(
     cmap = LinearSegmentedColormap.from_list("CustomMap", colors, N=256)
     so2_by_latitude_df = so2_by_latitude.to_dataframe("so2").unstack(level='time')
     so2_by_latitude_df = so2_by_latitude_df.droplevel(level=0, axis=1)
-    so2_by_latitude_df = so2_by_latitude_df.iloc[::-1]
+    so2_by_latitude_df = so2_by_latitude_df.sort_index(ascending=False)  # north at the top
     sns.heatmap(so2_by_latitude_df, annot=False, cmap=cmap, cbar_kws={'label': 'Tg SO2'}, ax=so2_by_latitude_ax)
     so2_by_latitude_ax.set_title('Latitude vs. Tg SO2')
     so2_by_latitude_ax.set_xlabel('Year')
@@ -412,6 +412,8 @@ if __name__ == "__main__":
         ]
         other_variables = [
             # ("Precipitation", "red"),
+            ("Min Temperature", "blue"),
+            ("Max Temperature", "blue"),
             ("Water Availability", "red"),
             ("Ice Fraction", "blue"),
         ]
