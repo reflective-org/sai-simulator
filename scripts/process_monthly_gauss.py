@@ -1060,15 +1060,38 @@ def _process_model(
 
     for exp, ds_ensemble in final_output_data.items():
 
-        # Save "All Members" for specific variables BEFORE averaging.
-        if var in ["icefrac", "tas"]:
+        # Save "All Members" BEFORE averaging. Every variable writes its no-SAI reference
+        # experiment(s) -- the standalone variability step (scripts/variability.py) derives
+        # each model's internal variability from these regridded members -- and tas/icefrac
+        # additionally write their SAI experiments, which the icefrac hindcast in that
+        # script trains on.
+        ds_members_renamed = None
+        if var in ["icefrac", "tas"] or exp in no_sai_experiments:
+            ds_members_renamed = ds_ensemble.rename_vars({esm_var: var})
+            if var == "p-e":
+                # Per-member P-E = pr - evap from the matching pr all-members file, so the
+                # file holds what its name says (the ensemble-mean path below does the
+                # same). Without the pr file we would be saving evaporation under "p-e".
+                pr_members_path = (
+                    output_dir.parent / "pr" / f"output_gauss-{exp}{output_suffix}-all-members.nc"
+                )
+                if pr_members_path.exists():
+                    with xr.open_dataset(pr_members_path, decode_times=True) as ds_pr_members:
+                        ds_pr_members = ds_pr_members.load()
+                    ds_members_renamed[var] = ds_pr_members["pr"] - ds_members_renamed[var]
+                else:
+                    print(
+                        f"\033[93m  [WARNING] Skipping p-e all-members for {exp}: "
+                        f"missing {pr_members_path}\033[0m"
+                    )
+                    ds_members_renamed = None
+
+        if ds_members_renamed is not None:
             out_path_members = output_dir / f"output_gauss-{exp}{output_suffix}-all-members.nc"
             print(f"  Saving all-members data to {out_path_members.name}...")
-
-            ds_members_renamed = ds_ensemble.rename_vars({esm_var: var})
-            # No NaN check here: this block only runs for icefrac and tas, and
-            # icefrac legitimately carries NaNs from the NH-September mask. (The
-            # negative-value and range guards below still apply.)
+            # No NaN check here: icefrac legitimately carries NaNs from the NH-September
+            # mask, and the member/time union (join='outer') can leave NaNs for any
+            # variable. (The negative-value and range guards below still apply.)
             validate_no_negative_values(
                 data=ds_members_renamed[var], var_name=var, exp=exp,
                 member="all-members", stage="all-members output",

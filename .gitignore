@@ -220,3 +220,12 @@ validation_celery_report.json
 data/raw/
 data/cache/
 data/processed_new/
+data/models/
+# pipeline outputs under data/processed/<var>/ (static inputs at the top level and in
+# geojsons/ and so2/ stay tracked)
+data/processed/*/
+!data/processed/geojsons/
+!data/processed/so2/
+# audit outputs
+figs/
+harness/

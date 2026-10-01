@@ -66,10 +66,21 @@ fit_models() {
 calculate_variability() {
     print_header "Step E: Variability Calculation"
 
-    print_info "Calculating model internal variability for sea ice..."
+    # scripts/variability.py is the only writer of each model's internal-variability artifacts
+    # (grid_level_model_internal_variability_<model>.nc, grid_level_lag1_autocorr_<model>.nc,
+    # grid_level_reference_variability_<model>.nc, the global .npy and the region columns), which
+    # the significance test and the band read for EVERY variable. icefrac also needs the sea-ice
+    # sigmoids fitted in Step D. Same variable list as scripts/process_all_monthly.sh.
+    print_info "Calculating each model's internal variability for every variable..."
 
     if [ -f "scripts/variability.py" ]; then
-        python scripts/variability.py icefrac "$PROCESSED_DATA_DIR" "$MODELS_DIR"
+        for var in tas pr tasmax tasmin tas_above_35 tas_above_40 tas_below_0 pr_above_10 pr_above_20 p-e icefrac; do
+            print_info "  $var"
+            if ! python scripts/variability.py "$var" "$PROCESSED_DATA_DIR" "$MODELS_DIR"; then
+                print_error "Variability failed for $var."
+                return 1
+            fi
+        done
         print_success "Variability calculated."
     else
         print_error "scripts/variability.py not found!"

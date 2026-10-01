@@ -9,6 +9,7 @@ the across-model mean by default, per-model predictions when requested.
 from pathlib import Path
 
 import numpy as np
+import pytest
 import pandas as pd
 import xarray as xr
 
@@ -185,7 +186,9 @@ def _per_model_field(values: tuple[float, float], time: np.ndarray) -> xr.DataAr
     ).assign_coords(model=["CESM2-WACCM", "MIROC-ES2H"])
 
 
-def test_mean_over_time_computes_2sigma_band_across_models() -> None:
+def test_mean_over_time_combined_bands_from_end_to_end_per_model_series() -> None:
+    """Two models, no internal variability: the spread is half the model gap (ddof=0), reported
+    as sigma_model, and the band (internal variability only) is zero."""
     from backend.get_outputs import _compute_mean_over_time
 
     hist_time = np.arange(1850, 2015)
@@ -195,7 +198,7 @@ def test_mean_over_time_computes_2sigma_band_across_models() -> None:
     area = _constant_field(1.0, np.array([0])).isel(time=0, drop=True)
 
     # Per-model fractions 0.2 / 0.6 (no-SAI) and 0.1 / 0.3 (with-SAI) over a
-    # 12-cell all-ones-area grid → extent sums 2.4 / 7.2 and 1.2 / 3.6.
+    # 12-cell all-ones-area grid -> extent sums 2.4 / 7.2 and 1.2 / 3.6.
     per_model = _per_model_field((0.2, 0.6), full_time)
     per_model_with_sai = _per_model_field((0.1, 0.3), proj_time)
 
@@ -213,40 +216,79 @@ def test_mean_over_time_computes_2sigma_band_across_models() -> None:
         data_dir=Path("/unused"),
         icefrac_per_model=per_model,
         icefrac_with_sai_per_model=per_model_with_sai,
+        sigma_internal_per_model={"CESM2-WACCM": 0.0, "MIROC-ES2H": 0.0},
     )
 
-    band_no_sai = res.model_spread_2sigma_no_sai
-    band_with_sai = res.model_spread_2sigma_with_sai
-    assert band_no_sai is not None and band_with_sai is not None
-    assert list(band_no_sai.time.values) == list(res.mean_no_sai.time.values)
-    assert list(band_with_sai.time.values) == list(res.mean_with_sai.time.values)
+    bands = res.bands
+    assert bands is not None
+    assert bands["band_models"] == ["CESM2-WACCM", "MIROC-ES2H"]
+    assert bands["band_n_models"] == 2 and bands["band_ddof"] == 0
+    for segment in ("historical", "no_sai", "with_sai"):
+        for key in ("band_internal", "sigma_model", "band_mean"):
+            assert f"{key}_{segment}" in bands
+    assert "M=2" in bands["band_labels"]["internal"]
 
-    # 2σ (ddof=1) of two constant extent series {2.4, 7.2}: 2 * 4.8/√2.
-    np.testing.assert_allclose(band_no_sai.values, 2 * 4.8 / np.sqrt(2))
-    # With-SAI band from {1.2, 3.6} after the SAI start...
-    np.testing.assert_allclose(
-        band_with_sai.sel(time=slice(2050, None)).values, 2 * 2.4 / np.sqrt(2)
-    )
-    # ...and anchored to the no-SAI band before it (the seam year).
-    seam_years = band_with_sai.time.values[band_with_sai.time.values < 2050]
+    # No-SAI: per-model extents {2.4, 7.2} -> mean 4.8, sigma_model (ddof=0) 2.4.
+    np.testing.assert_allclose(bands["band_mean_no_sai"].values, 4.8)
+    np.testing.assert_allclose(bands["sigma_model_no_sai"].values, 2.4)
+    np.testing.assert_allclose(bands["band_internal_no_sai"].values, 0.0)  # zero internal σ here
+    assert list(bands["band_mean_no_sai"].time.values) == list(res.mean_no_sai.time.values)
+
+    # With-SAI: each model's own sigmoid -> {1.2, 3.6} after the SAI start...
+    with_sai = bands["sigma_model_with_sai"]
+    np.testing.assert_allclose(with_sai.sel(time=slice(2050, None)).values, 1.2)
+    # ...and anchored to the model's own no-SAI series before it (the seam year).
+    seam_years = with_sai.time.values[with_sai.time.values < 2050]
     if len(seam_years):
-        np.testing.assert_allclose(
-            band_with_sai.sel(time=seam_years).values, 2 * 4.8 / np.sqrt(2)
-        )
+        np.testing.assert_allclose(with_sai.sel(time=seam_years).values, 2.4)
+
+    # The per-model series the bands were built from are exposed for figures.
+    assert set(bands["per_model_series"]) == {"historical", "no_sai", "with_sai"}
+    assert bands["per_model_series"]["no_sai"].sizes["model"] == 2
 
 
-def test_mean_over_time_band_absent_for_single_model() -> None:
+def test_mean_over_time_band_is_internal_variability_not_model_spread() -> None:
     from backend.get_outputs import _compute_mean_over_time
+    from backend.uncertainty import Z
 
     proj_time = np.arange(2050, 2101)
     recent_time = np.arange(2015, 2050)
     area = _constant_field(1.0, np.array([0])).isel(time=0, drop=True)
-    single_model = _per_model_field((0.4, 0.4), np.arange(2015, 2101)).isel(
-        model=[0]
-    )
+    per_model = _per_model_field((0.2, 0.6), np.arange(2015, 2101))
 
     res = _compute_mean_over_time(
         "icefrac",
+        regional_map=_constant_field(0.4, proj_time),
+        regional_delta=_constant_field(-0.2, proj_time),
+        recent_regional_map=_constant_field(0.4, recent_time),
+        historical_model=None,
+        area=area,
+        spatial_gdf=None,
+        spatial_item=None,
+        start_year=2050,
+        variable_injection=None,
+        data_dir=Path("/unused"),
+        icefrac_per_model=per_model,
+        icefrac_with_sai_per_model=None,
+        sigma_internal_per_model={"CESM2-WACCM": 0.6, "MIROC-ES2H": 0.4},
+    )
+    bands = res.bands
+    sigma_int_mean = np.sqrt(0.6**2 + 0.4**2) / 2
+    assert bands["sigma_internal_mean"] == pytest.approx(sigma_int_mean)
+    np.testing.assert_allclose(
+        bands["band_internal_no_sai"].values, Z * sigma_int_mean
+    )  # the 2.4 model spread (sigma_model) is not in the band
+
+
+def test_mean_over_time_bands_absent_without_per_model_sigma_and_zero_spread_for_one_model() -> None:
+    from backend.get_outputs import _compute_mean_over_time
+    from backend.uncertainty import Z
+
+    proj_time = np.arange(2050, 2101)
+    recent_time = np.arange(2015, 2050)
+    area = _constant_field(1.0, np.array([0])).isel(time=0, drop=True)
+    single_model = _per_model_field((0.4, 0.4), np.arange(2015, 2101)).isel(model=[0])
+    common = dict(
         regional_map=_constant_field(0.4, proj_time),
         regional_delta=_constant_field(-0.2, proj_time),
         recent_regional_map=_constant_field(0.4, recent_time),
@@ -261,9 +303,16 @@ def test_mean_over_time_band_absent_for_single_model() -> None:
         icefrac_with_sai_per_model=None,
     )
 
-    # A one-model ensemble has no across-model spread to report.
-    assert res.model_spread_2sigma_no_sai is None
-    assert res.model_spread_2sigma_with_sai is None
+    # No per-model internal sigma supplied -> no bands at all (the caller decides).
+    assert _compute_mean_over_time("icefrac", **common).bands is None
+
+    # One model: no across-model spread, prediction interval is internal variability only.
+    res = _compute_mean_over_time(
+        "icefrac", **common, sigma_internal_per_model={"CESM2-WACCM": 0.5}
+    )
+    assert res.bands["band_n_models"] == 1
+    np.testing.assert_allclose(res.bands["sigma_model_no_sai"].values, 0.0)
+    np.testing.assert_allclose(res.bands["band_internal_no_sai"].values, Z * 0.5)
 
 
 class TestIceFreeObservationsAreKept:

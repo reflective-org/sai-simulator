@@ -16,15 +16,21 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from backend.get_outputs import get_temp_diff, get_so2_by_latitude
+# The with-SAI p-values are built through the same helpers the live request path uses, so
+# the file served at the default deployment is exactly what a live request would compute.
+from backend.get_outputs import (
+    _compute_regional_delta,
+    _load_variable_fields,
+    _with_sai_comparison_field,
+    get_so2_by_latitude,
+    get_temp_diff,
+)
 from backend.baseline import get_global_temp, get_regional_models, get_regional_map_from_global_temp, get_regional_map, validate_cache_dir
-from backend.delta import get_regional_delta
-from backend.historical import get_historical_model
+from backend.historical import get_historical_model, get_historical_model_per_model
 from backend.p_values import get_grid_level_p_values, no_sai_p_values_cache_path, sai_p_values_cache_path
 from backend.constants import *
 from backend.utils import get_interpolator
-from fair_wrap.fair_utils import REVERSE_FANCY_SSP_TITLES, CANVAS_START_YEAR, SIM_END_YEAR
-from backend.icefrac import predict_icefrac
+from fair_wrap.fair_utils import REVERSE_FANCY_SSP_TITLES, SIM_END_YEAR
 
 def cache_historical(data_dir: str | Path, output_dir: str | Path) -> None:
     """Pre-generate shared historical_*.nc files (safe to call before parallel runs)."""
@@ -37,6 +43,8 @@ def cache_historical(data_dir: str | Path, output_dir: str | Path) -> None:
         historical_model = get_historical_model(var, data_dir, output_dir)
         if historical_model is not None:
             print(f"  historical_{var}.nc ready")
+        if get_historical_model_per_model(var, data_dir, output_dir) is not None:
+            print(f"  historical_per_model_{var}.nc ready")
     print("Historical cache complete.")
 
 
@@ -87,61 +95,26 @@ def cache(
         # First get FaIR global temperature
         global_temp = get_global_temp(ssp_scenario)
 
+        # tas first: icefrac is each model's sigmoid on that model's own temperature map, and
+        # the live helpers below read every variable's no-SAI maps back from this cache.
+        cache_no_sai("tas", ssp_scenario, global_temp, data_dir, model_dir, output_dir)
+        regional_temp, regional_temp_no_sai_p_values, regional_temp_per_model = get_regional_map(
+            "tas", data_dir, model_dir, output_dir, ssp_scenario
+        )
+        temp_fields = dict(
+            regional_temp=regional_temp,
+            regional_temp_no_sai_p_values=regional_temp_no_sai_p_values,
+            regional_temp_per_model=regional_temp_per_model,
+        )
+
         for var in tqdm(VAR2INFO):
-
-            # Get historical model data
-            historical_model = get_historical_model(var, data_dir, output_dir)
-            if historical_model is None:
+            if get_historical_model(var, data_dir, output_dir) is None:
                 continue
-            historical_rebase = historical_model.sel(time=slice(PREINDUSTRIAL_START, PREINDUSTRIAL_END)).mean('time')
-            # Significance is judged against the current-climate baseline, matching the request-time
-            # path in backend.get_outputs; historical_rebase is only used to recover absolute fields.
-            significance_reference = historical_model.sel(time=slice(DISPLAY_BASELINE_START, DISPLAY_BASELINE_END)).mean('time')
-            # Bound only on the icefrac no-SAI path; the SAI branch below must
-            # not rely on it having been set (resumed runs skip that branch).
-            regional_temp = None
+            cache_no_sai(var, ssp_scenario, global_temp, data_dir, model_dir, output_dir, **temp_fields)
 
-            # cache no sai regional map and p values
-            no_sai_cache_paths = [output_dir / f"{simple_ssp}_regional_{var}.nc",
-                                  no_sai_p_values_cache_path(output_dir, simple_ssp, var)]
-            if all(cache_path.exists() for cache_path in no_sai_cache_paths):
-                print("Found no sai cache for", var)
-                for cache_path in no_sai_cache_paths:
-                    print(cache_path)
-                with xr.open_dataarray(no_sai_cache_paths[0]) as da:
-                    regional_map = da.load()
-                with xr.open_dataarray(no_sai_cache_paths[1]) as da:
-                    regional_p_values = da.load()
-            else:
-                is_exposure = "exposure" in var
-
-                if var == "icefrac":
-                    regional_temp, regional_temp_no_sai_p_values = get_regional_map(
-                        "tas", data_dir, model_dir, output_dir, ssp_scenario
-                    )
-                    regional_map = predict_icefrac(regional_temp, model_dir)
-                    regional_p_values = get_grid_level_p_values(
-                        var, data_dir, significance_reference, regional_map
-                    )
-                else:
-                    if not is_exposure:
-                        # Get regional models for tas
-                        variable_dir = model_dir / var
-                    else:
-                        daily_var = exposurevar2var[var]
-                        variable_dir = model_dir / daily_var
-                    fair2smip = get_regional_models(variable_dir)
-
-                    # Cache regional map and historical data (the latter is saved under the hood)
-                    regional_map, regional_p_values = get_regional_map_from_global_temp(
-                        global_temp, fair2smip, var, data_dir, output_dir
-                    )
-
-                regional_map.to_netcdf(no_sai_cache_paths[0])
-                regional_p_values.to_netcdf(no_sai_cache_paths[1])
-
+            fields = None  # loaded on first use; a resumed run with every SAI file present skips it
             for temp_target in np.linspace(MIN_TARGET, MAX_TARGET, num_targets):
-                
+
                 temp_diff = get_temp_diff(data_dir, model_dir, output_dir, ssp_scenario, temp_target)
                 so2_cache_path = output_dir / f"{simple_ssp}_{temp_target:.1f}_so2_by_latitude.nc"
                 if not so2_cache_path.exists():
@@ -163,51 +136,123 @@ def cache(
                     so2_by_latitude['start_year'] = start_years
                     so2_by_latitude.to_netcdf(so2_cache_path)
 
-                sai_cache_paths = [output_dir / f"{simple_ssp}_{temp_target:.1f}_regional_delta_{var}.nc",
-                                   sai_p_values_cache_path(output_dir, simple_ssp, temp_target, var)]
-
-                if all(cache_path.exists() for cache_path in sai_cache_paths) and so2_cache_path.exists():
-                    print("Found sai cache for", var)
-                    for cache_path in sai_cache_paths + [so2_cache_path]:
-                        print(cache_path)
+                sai_p_cache_path = sai_p_values_cache_path(output_dir, simple_ssp, temp_target, var)
+                if sai_p_cache_path.exists():
+                    print("Found sai cache for", var, "->", sai_p_cache_path)
                     continue
-                
-                if var == "icefrac":
-                    # Historically this read the leftover `start_year` binding from the SO2
-                    # loop above (its final value, 2090), which is undefined when the SO2
-                    # caches already exist. Pin it so regeneration reproduces the incumbent
-                    # cache contents (icefrac deltas covering 2090-2100) either way.
-                    temp_regional_delta = get_regional_delta(
-                        "tas", data_dir, model_dir, output_dir, ssp_scenario,
-                        temp_target, 10, temp_diff, start_year=2090
+
+                if fields is None:
+                    fields = _load_variable_fields(
+                        var, ssp_scenario=ssp_scenario, data_dir=data_dir, model_dir=model_dir,
+                        cache_dir=output_dir, **temp_fields,
                     )
+                cache_sai_p_values(
+                    var, fields, ssp_scenario, temp_target, temp_diff,
+                    data_dir, model_dir, output_dir, **temp_fields,
+                )
 
-                    # On a resumed run the no-SAI branch above was skipped (its
-                    # caches exist), so regional_temp was never set — load it
-                    # here (get_regional_map serves it from its own cache).
-                    if regional_temp is None:
-                        regional_temp, _ = get_regional_map(
-                            "tas", data_dir, model_dir, output_dir, ssp_scenario
-                        )
-                    temp_with_sai = regional_temp + temp_regional_delta
-                    icefrac_with_sai = predict_icefrac(temp_with_sai, model_dir)
-                    regional_delta = icefrac_with_sai - regional_map
-                    regional_sai_p_values = get_grid_level_p_values(
-                        var, data_dir, significance_reference, icefrac_with_sai
-                    )
 
-                else:
-                    # Caches the regional delta (saved under the hood)
-                    # Assumes 0 ramp up, so that means ttest is unaffected by a ramp up in the middle of the selected decade.
-                    # This simplifies the implementation drastically.
-                    regional_delta = get_regional_delta(var, data_dir, model_dir, output_dir, ssp_scenario, temp_target, 0, temp_diff, CANVAS_START_YEAR)
+def cache_no_sai(
+    var: str,
+    ssp_scenario: str,
+    global_temp: xr.DataArray,
+    data_dir: Path,
+    model_dir: Path,
+    output_dir: Path,
+    regional_temp: xr.DataArray | None = None,
+    regional_temp_no_sai_p_values: xr.DataArray | None = None,
+    regional_temp_per_model: xr.DataArray | None = None,
+) -> None:
+    """Write ``{ssp}_regional_{var}.nc``, its no-SAI p-values and (not icefrac) the per-model maps.
 
-                    # Save the p_values
-                    regional_sai_p_values = get_grid_level_p_values(var, data_dir, significance_reference, regional_map + regional_delta + historical_rebase)
-                
-                regional_delta.to_netcdf(sai_cache_paths[0])
-                regional_sai_p_values.to_netcdf(sai_cache_paths[1])
+    icefrac needs the tas maps (pass them); its map is the mean of each model's sigmoid on
+    that model's own temperature, as :func:`backend.get_outputs._load_variable_fields` builds it.
+    """
+    simple_ssp = REVERSE_FANCY_SSP_TITLES[ssp_scenario]
+    no_sai_cache_paths = [output_dir / f"{simple_ssp}_regional_{var}.nc",
+                          no_sai_p_values_cache_path(output_dir, simple_ssp, var)]
+    per_model_cache_path = output_dir / f"{simple_ssp}_regional_per_model_{var}.nc"
+    if all(cache_path.exists() for cache_path in no_sai_cache_paths) and (
+        var == "icefrac" or per_model_cache_path.exists()
+    ):
+        print("Found no sai cache for", var)
+        return
 
+    if var == "icefrac":
+        fields = _load_variable_fields(
+            var, ssp_scenario=ssp_scenario, data_dir=data_dir, model_dir=model_dir,
+            cache_dir=output_dir, regional_temp=regional_temp,
+            regional_temp_no_sai_p_values=regional_temp_no_sai_p_values,
+            regional_temp_per_model=regional_temp_per_model,
+        )
+        regional_map = fields.regional_map
+        regional_p_values = get_grid_level_p_values(
+            var, data_dir, fields.significance_reference, regional_map
+        )
+    else:
+        if "exposure" not in var:
+            variable_dir = model_dir / var
+        else:
+            variable_dir = model_dir / exposurevar2var[var]
+        fair2smip = get_regional_models(variable_dir)
+
+        # Cache regional map and historical data (the latter is saved under the hood)
+        regional_map, regional_p_values, regional_map_per_model = get_regional_map_from_global_temp(
+            global_temp, fair2smip, var, data_dir, output_dir
+        )
+        regional_map_per_model.to_netcdf(per_model_cache_path)
+
+    regional_map.to_netcdf(no_sai_cache_paths[0])
+    regional_p_values.to_netcdf(no_sai_cache_paths[1])
+
+
+def cache_sai_p_values(
+    var: str,
+    fields,
+    ssp_scenario: str,
+    temp_target: float,
+    temp_diff: xr.DataArray,
+    data_dir: Path,
+    model_dir: Path,
+    output_dir: Path,
+    regional_temp: xr.DataArray,
+    regional_temp_no_sai_p_values: xr.DataArray | None,
+    regional_temp_per_model: xr.DataArray | None,
+) -> xr.DataArray:
+    """Write the with-SAI p-values for the dashboard's DEFAULT deployment; return them.
+
+    ``get_outputs`` serves this file only for ``DEFAULT_SAI_START_YEAR`` / ``DEFAULT_RAMP_UP``
+    and computes live for anything else, so it is built from the live helpers: the same
+    delta (:func:`_compute_regional_delta`) and the same tested field
+    (:func:`_with_sai_comparison_field`).
+
+    The unramped delta for non-icefrac variables is cached under the hood by
+    :func:`backend.delta.get_regional_delta_without_rampup`; the ramped, start-sliced delta
+    returned here is NOT written back over it (every live request ramps that file itself).
+    icefrac's with-SAI delta has no such under-the-hood cache; it is written for inspection.
+    """
+    simple_ssp = REVERSE_FANCY_SSP_TITLES[ssp_scenario]
+    delta_result = _compute_regional_delta(
+        var, fields=fields, regional_temp=regional_temp, ssp_scenario=ssp_scenario,
+        temp_target=temp_target, ramp_up=DEFAULT_RAMP_UP, start_year=DEFAULT_SAI_START_YEAR,
+        temp_diff=temp_diff, variable_injection=None, data_dir=data_dir, model_dir=model_dir,
+        cache_dir=output_dir, regional_temp_per_model=regional_temp_per_model,
+    )
+    comparison = _with_sai_comparison_field(
+        var, fields=fields, regional_delta=delta_result.regional_delta,
+        icefrac_with_sai=delta_result.icefrac_with_sai,
+    )
+    regional_sai_p_values = get_grid_level_p_values(
+        var, data_dir, fields.significance_reference, comparison
+    )
+    if var == "icefrac":
+        delta_result.regional_delta.to_netcdf(
+            output_dir / f"{simple_ssp}_{temp_target:.1f}_regional_delta_{var}.nc"
+        )
+    regional_sai_p_values.to_netcdf(
+        sai_p_values_cache_path(output_dir, simple_ssp, temp_target, var)
+    )
+    return regional_sai_p_values
 
 if __name__ == "__main__":
     fire.Fire(cache)

@@ -101,10 +101,21 @@ def resolve_projection_baseline_file(variable_dir: str | Path, model: str) -> Pa
             return candidate
     return None
 NUM_EMULATORS = 100
+
+# Per-cell significance: values in ``regional_*_p_values`` at or above this are "not
+# significant" and get hatched. What the values are (raw or FDR-adjusted p-values) is
+# defined in backend/p_values.py; this is the only place the threshold lives.
+SIGNIFICANCE_THRESHOLD = 0.05
+
+# The dashboard's default SAI deployment. scripts/cache.py precomputes the with-SAI
+# p-values for exactly this deployment; any other start year / ramp-up is computed live,
+# because the with-SAI field (and so its significance) depends on both.
+DEFAULT_RAMP_UP = 10
 # CESM2-WACCM grid dimensions (all other models are regridded onto this grid)
 NUM_LAT = 192
 NUM_LON = 288
 MIN_SAI_START = 2035
+DEFAULT_SAI_START_YEAR = MIN_SAI_START
 
 # Reference periods for temperature/precipitation anomalies.
 # PREINDUSTRIAL_* is the frame the *projections* and the SAI ``temp_target`` live in (the

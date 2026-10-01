@@ -3,7 +3,15 @@
 # v1.4.0: FaIR default climate calibration switched from CESM-tuned to the AR6
 # calibrated-constrained ensemble (mean across members) — every FaIR-dependent
 # cache artifact and pregenerated golden changes; regenerate under this version.
-# v1.5.0: UKESM1-1-LL joins the regional-model roster (3-model no-SAI mean for
+# v1.5.0: multi-model uncertainty and significance rework (PR #56) -- per-model internal
+# variability for every model (P-E's from P-E, not evaporation), end-to-end per-model
+# maps/series, the dashboard band as the internal variability of the multi-model mean (the
+# model spread kept as a diagnostic), icefrac historical and centre as the mean of
+# end-to-end outcomes, a detectability z-test on pooled per-model sigma with
+# autocorrelation for the stipple, and with-SAI p-values cached for the default deployment
+# only, built through the live request path. Every FaIR-independent cache artifact changes
+# meaning; regenerate under this version (docs/pvalues-uncertainty-histograms-review.md).
+# v1.5.0 also: UKESM1-1-LL joins the regional-model roster (3-model no-SAI mean for
 # most variables, 2-model for p-e; a sixth anchor in the pooled SAI delta). The
 # cache fingerprint now also records the roster and per-variable exclusions, so
 # every pregenerated cache and verification golden regenerates under this version.

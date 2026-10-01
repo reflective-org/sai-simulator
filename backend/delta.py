@@ -56,12 +56,14 @@ def get_regional_delta_without_rampup(
 
         interpolator = get_interpolator(variable_dir / "interpolator.nc")
 
+        # One pooled slope per cell (scripts/fit_delta.py); a model dim would mean the
+        # artifact was produced by something else, so refuse rather than guess a weighting.
         slope = interpolator.sel(features='slope')
         if 'model' in slope.dims:
-            # The shipped interpolators carry one pooled slope (no model dim);
-            # tolerate a per-model variant (equal-weight mean at prediction)
-            # so either artifact format works.
-            slope = slope.mean(dim='model')
+            raise ValueError(
+                f"{variable_dir / 'interpolator.nc'} carries a model dim; the SAI slope is "
+                "one pooled fit over all models' anchors (scripts/fit_delta.py) and has none."
+            )
         regional_delta = slope * temp_diff
 
         regional_delta = regional_delta[var]

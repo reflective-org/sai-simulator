@@ -311,6 +311,32 @@ The SAI Simulator requires the ESMF (Earth System Modeling Framework) library to
    python -m pip install .
    ```
 
+> **Version pitfall.** ESMPy takes its version from the git checkout it is installed from
+> and refuses to load against an ESMF library of a different version
+> (`VersionMismatch: ESMF installation version 8.7.0 differs from ESMPy version 8.9.0`).
+> If the source tree has moved past the tag you compiled, install ESMPy from a worktree at
+> the matching tag instead of the tree head:
+>
+> ```bash
+> grep ESMF_VERSION_STRING "$ESMFMKFILE"                 # e.g. 8.7.0
+> git -C /path/to/esmf worktree add ../esmf-8.7.0 v8.7.0
+> python -m pip install ../esmf-8.7.0/src/addon/esmpy
+> ```
+
+#### Lightweight environment for tests and the backend
+
+`requirements.txt` pins the full stack (dashboard, S3 verification, pipeline). To run the
+unit tests or `backend.get_outputs` you only need `requirements-test.txt` — the same set CI
+installs — plus, for the processing scripts, `zarr fsspec s3fs dask fire rioxarray xesmf`
+(and ESMPy as above). `cf-units` and `scitools-iris` have no macOS arm64 wheels, and nothing
+in `backend/`, `fair_wrap/` or `scripts/` imports them.
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-test.txt
+pytest -q tests/test_*.py          # exactly what CI runs
+```
+
 ### B. Verify Data Access
 
 The training data lives in per-experiment Zarr stores hosted on a public

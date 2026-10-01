@@ -33,9 +33,9 @@ GeoMIP ``baseline`` run, *not* the ScenarioMIP ``ssp245`` run that the
 climate-change-only fit in ``scripts/fit_map.py`` trains on (see
 ``backend.constants.REGIONAL_MODEL2PROJECTION_BASELINE_FILES``). All anchors' fields are on the common
 CESM2-WACCM grid (MIROC is regridded by the consumer), so they stack cleanly.
-Anchors whose files are absent for a variable are silently dropped; a model
-whose anchors are all absent drops out of the ``model`` dim entirely (``so2``
-has no MIROC equivalent, so it stays GAUSS-only).
+Anchors whose files are absent for a variable are silently dropped (``so2``
+has no MIROC equivalent, so it stays GAUSS-only). The output has no ``model``
+dim: it is one pooled slope.
 
 The ``so2`` variable is handled separately because it is 1-D in latitude.
 

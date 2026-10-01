@@ -35,7 +35,9 @@ anomaly), so the emulators need no refit when the calibration changes; only
 the FaIR-dependent caches and goldens do.
 
 Same-run rule: a variable that falls back to MIROC's GeoMIP run would take its
-X from that run's tas, which is *skin* temperature (see the store attrs). As of
+X from that run's tas, whose raw source is named ``SurfT`` but is near-surface air
+temperature like CESM's ``TREFHT`` (the name is a labelling mistake by the model runner,
+per Ali; the store attrs are misleading on this point). As of
 the ssp245 QFLX fill no fit_map variable takes that fallback, but the caveat
 applies to any future one.
 

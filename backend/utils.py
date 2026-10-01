@@ -143,34 +143,44 @@ def apply_constraints(
     return smoothed
 
 
+@lru_cache(maxsize=8)
+def _land_mask_values(data_dir: Path, lat_key: tuple, lon_key: tuple) -> np.ndarray:
+    """Rasterized IPCC-WGII continental-regions mask for one lat/lon grid, as a bool array.
+
+    Reading the geojson, unioning its geometries and rasterizing them costs about a second
+    and used to happen on every clip (six times per p-value call); the grid is always the
+    same, so the result is cached on the grid's coordinates (rounded to 1e-6 degrees).
+    """
+    continental_gdf = gpd.read_file(Path(data_dir) / "geojsons" / "IPCC-WGII-continental-regions.geojson")
+    continental_gdf = gpd.GeoDataFrame(geometry=[continental_gdf.unary_union], crs=continental_gdf.crs)
+    template = xr.DataArray(
+        np.zeros((len(lat_key), len(lon_key))), dims=("lat", "lon"),
+        coords={"lat": np.array(lat_key), "lon": np.array(lon_key)},
+    )
+    return create_mask(template, continental_gdf).values
+
+
+def _land_mask(data_dir: Path, regional_map: xr.DataArray) -> xr.DataArray:
+    values = _land_mask_values(
+        Path(data_dir),
+        tuple(np.round(regional_map.lat.values.astype(float), 6)),
+        tuple(np.round(regional_map.lon.values.astype(float), 6)),
+    )
+    return xr.DataArray(values, dims=("lat", "lon"), coords={"lat": regional_map.lat, "lon": regional_map.lon})
+
+
 def clip_to_land(data_dir: Path, regional_map: xr.DataArray) -> xr.DataArray:
     """
     Mask regional_map to land areas only (continental regions included in IPCC-WGII definition).
     """
-    geojson_dir = data_dir / "geojsons"
-    continental_gdf = gpd.read_file(geojson_dir / "IPCC-WGII-continental-regions.geojson")
+    return regional_map.where(_land_mask(data_dir, regional_map), np.nan)
 
-    # Take union of all geometries
-    continental_gdf = gpd.GeoDataFrame(geometry=[continental_gdf.unary_union], crs=continental_gdf.crs)
-    land_mask = create_mask(regional_map, continental_gdf)
-    regional_map = regional_map.where(land_mask, np.nan)
-    return regional_map
 
 def clip_to_ocean(data_dir: Path, regional_map: xr.DataArray) -> xr.DataArray:
     """
     Mask regional_map to ocean areas only (everything NOT included in the IPCC-WGII continental regions).
     """
-    geojson_dir = data_dir / "geojsons"
-    continental_gdf = gpd.read_file(geojson_dir / "IPCC-WGII-continental-regions.geojson")
-
-    # Take union of all geometries
-    continental_gdf = gpd.GeoDataFrame(geometry=[continental_gdf.unary_union], crs=continental_gdf.crs)
-    # Create land mask as before
-    land_mask = create_mask(regional_map, continental_gdf)
-    # Invert the mask to get ocean (True where NOT land)
-    ocean_mask = ~land_mask
-    regional_map = regional_map.where(ocean_mask, np.nan)
-    return regional_map
+    return regional_map.where(~_land_mask(data_dir, regional_map), np.nan)
 
 
 def load_spatial_aggregation_gdfs(data_dir: Union[str, Path]) -> dict[str, gpd.GeoDataFrame]:

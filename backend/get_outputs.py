@@ -29,13 +29,20 @@ import matplotlib.pyplot as plt
 import struct
 import logging
 from dataclasses import dataclass
+from typing import Callable
 from datetime import datetime
 
 from fair_wrap.fair_utils import REVERSE_FANCY_SSP_TITLES, SIM_END_YEAR
 
 from .constants import *
-from .historical import get_historical_model, get_historical_obs_global_mean_temp, get_historical_obs_sea_ice_extent
-from .baseline import get_regional_map, validate_cache_dir
+from .historical import (
+    get_historical_model,
+    get_historical_model_per_model,
+    get_historical_obs_global_mean_temp,
+    get_historical_obs_sea_ice_extent,
+)
+from .uncertainty import Z, band_label, combine_series
+from .baseline import REBASED_VARS, get_regional_map, validate_cache_dir
 from .delta import get_regional_delta
 from .p_values import get_grid_level_p_values, sai_p_values_cache_path
 from .population import get_population_data
@@ -63,7 +70,7 @@ def get_temp_diff(
 
     Cached on the full argument tuple via :func:`functools.lru_cache` (32 entries).
     """
-    regional_temp, _ = get_regional_map("tas", data_dir, model_dir, cache_dir, ssp_scenario)
+    regional_temp, _, _ = get_regional_map("tas", data_dir, model_dir, cache_dir, ssp_scenario)
 
     global_mean = regional_temp.weighted(np.cos(np.deg2rad(regional_temp.lat))).mean(('lat', 'lon'))
     temp_diff = temp_target - global_mean
@@ -102,9 +109,16 @@ class _VariableFields:
     significance_reference: xr.DataArray | None  # current-climate mean used as the t-test reference
     display_offset: xr.DataArray | None  # current-climate mean expressed vs 1850-1900; shifts displayed anomalies
     area: xr.DataArray | None  # Cell areas, only populated when var == "icefrac"
-    # Per-climate-model sigmoid predictions (model, time, lat, lon), only
-    # populated when var == "icefrac"; regional_map is their across-model mean.
+    # End-to-end per-model sea-ice predictions (model, time, lat, lon) — each model's
+    # sigmoid on that model's own temperature pattern — only when var == "icefrac";
+    # regional_map is their across-model mean.
     icefrac_per_model: xr.DataArray | None = None
+    # Per-model projection maps (time, model, lat, lon), each rebased against its own
+    # model's 1850-1900 record; None for icefrac (see icefrac_per_model). These are the
+    # end-to-end per-model outcomes behind the combined uncertainty band.
+    regional_map_per_model: xr.DataArray | None = None
+    historical_model_per_model: xr.DataArray | None = None  # (model, time, lat, lon)
+    historical_rebase_per_model: xr.DataArray | None = None  # (model, lat, lon)
 
 
 @dataclass
@@ -127,10 +141,72 @@ class _MeanOverTimeResult:
     masked_regional_map: xr.DataArray | None
     masked_regional_delta: xr.DataArray | None
     masked_historical_model: xr.DataArray | None
-    # icefrac only, global mode only: ±2σ across-climate-model half-widths of
-    # the aggregated extent series, aligned to mean_no_sai / mean_with_sai:
-    model_spread_2sigma_no_sai: xr.DataArray | None = None
-    model_spread_2sigma_with_sai: xr.DataArray | None = None
+    # Combined uncertainty bands (backend.uncertainty) built from the end-to-end per-model
+    # series: keys band_internal_<seg> (the drawn band), sigma_model_<seg> (diagnostic),
+    # band_mean_<seg> for seg in historical/no_sai/with_sai, plus band_models,
+    # band_n_models, sigma_internal_per_model, sigma_internal_mean, band_labels and
+    # per_model_series. None when per-model inputs were not available.
+    bands: dict | None = None
+
+
+# --- The line-plot envelope -----------------------------------------------------------------
+#
+# ``mean_over_time["band"]`` is what the dashboard shades around each of the three series:
+# per-year OFFSETS ``low`` / ``high`` (``time`` DataArrays) added to the series value, plus a
+# ``label`` and the ``source`` that produced it. By default it is the members' internal
+# variability of the multi-model mean (±Z·σ_internal(mean), constant in time). A variable-
+# specific source — e.g. a stochastic emulator's members (min / max per year over the
+# line's area) — is registered in BAND_SOURCES and replaces it; it is called with keyword
+# context (see _line_band) and returns a band dict, or None to fall back to the members.
+BandSource = Callable[..., "dict | None"]
+BAND_SOURCES: dict[str, BandSource] = {}
+
+
+def make_band(low: xr.DataArray, high: xr.DataArray, *, label: str, source: str) -> dict:
+    """A ``mean_over_time["band"]`` entry: per-year offsets to add to each series."""
+    return {"low": low, "high": high, "label": label, "source": source}
+
+
+def _series_time(mot: dict) -> np.ndarray:
+    """Every year any of the three dashboard series covers."""
+    years = [mot[key].time.values for key in ("historical_model", "no_sai", "with_sai") if key in mot]
+    return np.unique(np.concatenate(years)) if years else np.array([], dtype=int)
+
+
+def _member_band(bands: dict | None, time: np.ndarray) -> dict | None:
+    """±Z·σ_internal(mean) from the per-model internal variability, constant in time."""
+    if bands is None:
+        return None
+    half = Z * float(bands["sigma_internal_mean"])
+    offset = xr.DataArray(np.full(len(time), half), dims=("time",), coords={"time": time})
+    return make_band(-offset, offset, label=bands["band_labels"]["internal"], source="members")
+
+
+def _line_band(var: str, mot: dict, bands: dict | None, **context) -> dict | None:
+    """The envelope for ``var``: a registered :data:`BAND_SOURCES` entry, else the members'."""
+    time = _series_time(mot)
+    source = BAND_SOURCES.get(var)
+    if source is not None:
+        band = source(var=var, time=time, **context)
+        if band is not None:
+            return band
+    return _member_band(bands, time)
+
+
+def _predict_icefrac_end_to_end(temp_per_model: xr.DataArray, model_dir: Path) -> xr.DataArray:
+    """Each model's sigmoid on that model's own temperature: ``(model, time, lat, lon)``.
+
+    ``predict_icefrac(per_model=True)`` evaluates every model's sigmoid on one temperature
+    field; here each model gets its own (own pattern, own historical rebase), so the spread
+    across models is the models' actual disagreement about sea ice, not just their sigmoids'
+    disagreement at a shared temperature (review doc, U8).
+    """
+    per_model = []
+    for model in temp_per_model.model.values:
+        temp_m = temp_per_model.sel(model=model, drop=True)
+        pred = predict_icefrac(temp_m, model_dir, per_model=True).sel(model=[str(model)])
+        per_model.append(pred)
+    return xr.concat(per_model, dim="model")
 
 
 def _load_variable_fields(
@@ -142,45 +218,56 @@ def _load_variable_fields(
     cache_dir: Path,
     regional_temp: xr.DataArray,
     regional_temp_no_sai_p_values: xr.DataArray | None,
+    regional_temp_per_model: xr.DataArray | None = None,
 ) -> _VariableFields:
     """Load projection map, no-SAI p-values, historical model, rebase, and (for icefrac) cell area.
 
-    For ``"tas"`` the already-loaded ``regional_temp`` is reused to avoid a redundant disk read.
-    For ``"icefrac"`` the regional map is predicted from temperature; no-SAI p-values are left
-    ``None`` here and computed later in :func:`_compute_regional_delta`. For all other variables
-    :func:`get_regional_map` is used.
+    For ``"tas"`` the already-loaded ``regional_temp`` (and its per-model counterpart) is
+    reused to avoid a redundant disk read. For ``"icefrac"`` the per-model maps are each
+    model's sigmoid on its own temperature pattern and the combined map is their mean;
+    no-SAI p-values are left ``None`` here and computed later in
+    :func:`_compute_regional_delta`. For all other variables :func:`get_regional_map` is
+    used and returns both the combined and the per-model maps.
 
-    The historical model is rebased to the 1850–1900 mean for ``tas/tasmin/tasmax/pr/p-e`` so
-    downstream code can reason in anomalies; for other variables it is returned as-is.
+    The historical model is rebased to the 1850–1900 mean for ``tas/tasmin/tasmax/pr/p-e``
+    so downstream code can reason in anomalies; the per-model historical is rebased against
+    each model's own record.
 
     Two extra references are derived from the (un-rebased) historical model when present:
     ``significance_reference`` (the current-climate ``DISPLAY_BASELINE`` mean, used as the
-    t-test reference so hatching means "different from today's climate") and ``display_offset``
-    (that same current-climate mean expressed vs 1850-1900, i.e. ``significance_reference -
-    historical_rebase``), which the caller subtracts from the pre-industrial-framed anomalies to
-    present the map against the current-climate baseline. Only the map moves; the time-series and
-    distribution outputs stay in the pre-industrial frame.
+    detectability test's reference so hatching means "different from today's climate") and
+    ``display_offset`` (that same current-climate mean expressed vs 1850-1900, i.e.
+    ``significance_reference - historical_rebase``), which the caller subtracts from the
+    pre-industrial-framed anomalies to present the map against the current-climate baseline.
+    Only the map moves; the time-series and distribution outputs stay in the pre-industrial
+    frame.
     """
     is_icefrac = var == "icefrac"
     area = get_area(data_dir) if is_icefrac else None
     icefrac_per_model = None
+    regional_map_per_model = None
 
     if var == "tas":
         regional_map = regional_temp
         regional_no_sai_p_values = regional_temp_no_sai_p_values
+        regional_map_per_model = regional_temp_per_model
     elif is_icefrac:
-        # One sigmoid prediction per climate model; everything downstream uses
-        # their mean, and the per-model fields feed the uncertainty band.
-        icefrac_per_model = predict_icefrac(regional_temp, model_dir, per_model=True)
+        if regional_temp_per_model is not None:
+            icefrac_per_model = _predict_icefrac_end_to_end(regional_temp_per_model, model_dir)
+        else:
+            # No per-model temperatures available: every sigmoid on the shared field.
+            icefrac_per_model = predict_icefrac(regional_temp, model_dir, per_model=True)
         regional_map = icefrac_per_model.mean(dim='model')
         regional_no_sai_p_values = None
     else:
-        regional_map, regional_no_sai_p_values = get_regional_map(
+        regional_map, regional_no_sai_p_values, regional_map_per_model = get_regional_map(
             var, data_dir, model_dir, cache_dir, ssp_scenario
         )
 
     historical_model = get_historical_model(var, data_dir, cache_dir)
     historical_rebase = None
+    historical_model_per_model = None
+    historical_rebase_per_model = None
     significance_reference = None
     display_offset = None
     if historical_model is not None:
@@ -191,8 +278,13 @@ def _load_variable_fields(
             time=slice(DISPLAY_BASELINE_START, DISPLAY_BASELINE_END)
         ).mean('time')
         display_offset = significance_reference - historical_rebase
-        if var in ["tas", "tasmin", "tasmax", "pr", "p-e"]:
+        historical_model_per_model = get_historical_model_per_model(var, data_dir, cache_dir)
+        historical_rebase_per_model = historical_model_per_model.sel(
+            time=slice(PREINDUSTRIAL_START, PREINDUSTRIAL_END)
+        ).mean('time')
+        if var in REBASED_VARS:
             historical_model = historical_model - historical_rebase
+            historical_model_per_model = historical_model_per_model - historical_rebase_per_model
 
     return _VariableFields(
         regional_map=regional_map,
@@ -203,6 +295,9 @@ def _load_variable_fields(
         display_offset=display_offset,
         area=area,
         icefrac_per_model=icefrac_per_model,
+        regional_map_per_model=regional_map_per_model,
+        historical_model_per_model=historical_model_per_model,
+        historical_rebase_per_model=historical_rebase_per_model,
     )
 
 
@@ -220,6 +315,7 @@ def _compute_regional_delta(
     data_dir: Path,
     model_dir: Path,
     cache_dir: Path,
+    regional_temp_per_model: xr.DataArray | None = None,
 ) -> _DeltaResult:
     """Compute the SAI ``regional_delta`` for one variable.
 
@@ -245,10 +341,17 @@ def _compute_regional_delta(
             temp_regional_delta = get_variable_regional_delta(
                 "tas", data_dir, cache_dir, variable_injection
             )
-        temp_with_sai = regional_temp + temp_regional_delta
-        icefrac_with_sai_per_model = predict_icefrac(
-            temp_with_sai, model_dir, per_model=True
-        )
+        if regional_temp_per_model is not None:
+            # End-to-end: each model's sigmoid on its own with-SAI temperature pattern.
+            temp_with_sai_per_model = regional_temp_per_model + temp_regional_delta
+            icefrac_with_sai_per_model = _predict_icefrac_end_to_end(
+                temp_with_sai_per_model, model_dir
+            )
+        else:
+            temp_with_sai = regional_temp + temp_regional_delta
+            icefrac_with_sai_per_model = predict_icefrac(
+                temp_with_sai, model_dir, per_model=True
+            )
         icefrac_with_sai = icefrac_with_sai_per_model.mean(dim='model')
         regional_delta = icefrac_with_sai - fields.regional_map
         regional_no_sai_p_values = get_grid_level_p_values(
@@ -281,6 +384,37 @@ def _compute_regional_delta(
     )
 
 
+def _with_sai_comparison_field(
+    var: str,
+    *,
+    fields: _VariableFields,
+    regional_delta: xr.DataArray,
+    icefrac_with_sai: xr.DataArray | None,
+) -> xr.DataArray:
+    """The with-SAI field the significance test compares against the reference (1995-2014).
+
+    Shared by the live path (:func:`_compute_sai_p_values`) and the precomputed cache
+    (``scripts/cache.py``), so the two cannot disagree. The field is absolute, like the
+    reference (``fields.significance_reference``, the 1995-2014 mean); the pre-industrial rebase
+    only restores absolute values:
+
+    * rebased variables (:data:`backend.baseline.REBASED_VARS`): ``map + delta + rebase``,
+      the anomaly map put back on the absolute level;
+    * icefrac: the end-to-end with-SAI fraction itself;
+    * every other variable (counts, exposure): ``map + delta``, already absolute.
+
+    Before SAI starts the with-SAI world is the no-SAI world: the delta is zero-filled (and
+    icefrac's with-SAI field falls back to its no-SAI field) over the whole projection, so
+    every decade the dashboard offers gets a p-value.
+    """
+    regional_delta = regional_delta.reindex(time=fields.regional_map.time, fill_value=0.0)
+    if var == "icefrac":
+        return icefrac_with_sai.combine_first(fields.regional_map)
+    if var in REBASED_VARS:
+        return fields.regional_map + regional_delta + fields.historical_rebase
+    return fields.regional_map + regional_delta
+
+
 def _compute_sai_p_values(
     var: str,
     *,
@@ -293,23 +427,29 @@ def _compute_sai_p_values(
     data_dir: Path,
     cache_dir: Path,
     decade_end_year: int,
+    start_year: int | None = None,
+    ramp_up: int | None = None,
 ) -> xr.DataArray | None:
     """Compute (or load from cache) the with-SAI grid-level p-values, sliced to ``decade_end_year``.
 
-    Returns ``None`` when the variable has no historical model (in which case a t-test is not
-    meaningful). When ``variable_injection`` is ``None`` we look for a per-(scenario, target)
-    cache file under ``cache_dir`` first; otherwise the values are recomputed.
-
-    For temperature/precipitation variables the regional map is rebased before comparison
-    (``map + delta + rebase``); for icefrac the absolute ``icefrac_with_sai`` is used directly;
-    other variables compare ``map + delta`` against the reference. In every case the t-test
-    reference is the current-climate ``significance_reference`` (1995-2014 mean), so significance
-    is judged against today's climate rather than pre-industrial.
+    Returns ``None`` when the variable has no historical model (in which case the test is not
+    meaningful). The with-SAI field depends on the deployment, so the per-(scenario, target)
+    cache file — written by ``scripts/cache.py`` for the dashboard's default deployment
+    (``DEFAULT_SAI_START_YEAR`` / ``DEFAULT_RAMP_UP``) — is only used when the request IS that
+    deployment; any other start year, ramp-up, or a custom injection is computed live. The
+    field tested is :func:`_with_sai_comparison_field`, the same one the cache is built from,
+    and the reference is the current-climate ``significance_reference`` (1995-2014 mean), so
+    significance is judged against today's climate rather than pre-industrial.
     """
     if fields.historical_model is None:
         return None
 
-    if variable_injection is None:
+    is_default_deployment = (
+        variable_injection is None
+        and start_year == DEFAULT_SAI_START_YEAR
+        and ramp_up == DEFAULT_RAMP_UP
+    )
+    if is_default_deployment:
         validate_cache_dir(cache_dir)
         regional_p_cache_path = sai_p_values_cache_path(cache_dir, simple_ssp, temp_target, var)
         regional_p_cache_path_exists = regional_p_cache_path.exists()
@@ -321,83 +461,51 @@ def _compute_sai_p_values(
         logger.info("Found %s", regional_p_cache_path)
         with xr.open_dataarray(regional_p_cache_path) as da:
             regional_sai_p_values = da.load()
-    elif var in ["tas", "tasmin", "tasmax", "pr", "p-e"]:
-        # The regional map is already rebased; add the historical rebase back to recover the
-        # absolute field, then compare against the current-climate reference.
-        regional_sai_p_values = get_grid_level_p_values(
-            var, data_dir, fields.significance_reference,
-            fields.regional_map + regional_delta + fields.historical_rebase,
-        )
-    elif var == "icefrac":
-        regional_sai_p_values = get_grid_level_p_values(
-            var, data_dir, fields.significance_reference, icefrac_with_sai
-        )
     else:
         regional_sai_p_values = get_grid_level_p_values(
             var, data_dir, fields.significance_reference,
-            fields.regional_map + regional_delta,
+            _with_sai_comparison_field(
+                var, fields=fields, regional_delta=regional_delta,
+                icefrac_with_sai=icefrac_with_sai,
+            ),
         )
 
     return regional_sai_p_values.sel(time=decade_end_year)
 
 
-def _compute_mean_over_time(
-    var: str,
+def _aggregate_series(
     *,
     regional_map: xr.DataArray,
     regional_delta: xr.DataArray,
     recent_regional_map: xr.DataArray,
     historical_model: xr.DataArray | None,
     area: xr.DataArray | None,
-    spatial_gdf,  # GeoDataFrame | None — untyped to avoid a module-level geopandas import
-    spatial_item: str | None,
+    weights: xr.DataArray,
+    op: str,
+    region,  # single-row GeoDataFrame, or None for global mode
+    is_above_below: bool,
+    is_icefrac: bool,
+    data_dir: Path,
     start_year: int,
     variable_injection: np.ndarray | None,
-    data_dir: Path,
-    icefrac_per_model: xr.DataArray | None = None,
-    icefrac_with_sai_per_model: xr.DataArray | None = None,
-) -> _MeanOverTimeResult:
-    """Aggregate regional fields into the historical / no-SAI / with-SAI time series shown on the dashboard.
+) -> tuple[xr.DataArray, xr.DataArray, xr.DataArray, xr.DataArray | None, xr.DataArray | None, xr.DataArray | None]:
+    """One set of historical / no-SAI / with-SAI series from one set of fields.
 
-    Operates in two modes that share the same return shape:
+    This is the aggregation the dashboard has always done, factored out so the combined
+    fields and each model's own fields go through identical steps: optional region mask,
+    area or cos-lat weighting, the historical→projection Butterworth smoothing
+    (:func:`apply_constraints`), and anchoring the with-SAI curve to no-SAI before the split.
 
-    * **Global** (``spatial_gdf`` or ``spatial_item`` is ``None``): area-weighted aggregation
-      over the full lat/lon grid. ``masked_*`` outputs are ``None``.
-    * **Regional**: the same aggregation but restricted to the region described by
-      ``spatial_gdf[spatial_gdf.name == spatial_item]``. The masked DataArrays are
-      returned so :func:`_compute_distribution` can reuse them without re-masking.
-
-    Aggregation op is ``"sum"`` for exposure / icefrac variables and ``"mean"`` otherwise;
-    the lat-weight array is uniform for sum-op variables and ``cos(lat)`` otherwise. After
-    aggregation the historical/recent/no-SAI series is smoothed via :func:`apply_constraints`
-    to give a continuous historical→projection boundary, and ``mean_with_sai`` is anchored
-    to ``mean_no_sai`` for years before SAI (or before the first nonzero ``variable_injection``
-    year) so the curves split exactly at the SAI start.
-
-    For icefrac in global mode, ``icefrac_per_model`` / ``icefrac_with_sai_per_model``
-    (per-climate-model sigmoid predictions) additionally yield the ±2σ across-model
-    half-width series of the aggregated extent — the uncertainty band around the
-    multi-model-mean curves.
+    Returns ``(historical_global_mean, mean_no_sai, mean_with_sai, masked_regional_map,
+    masked_regional_delta, masked_historical_model)``; the masked arrays are ``None`` in
+    global mode.
     """
-    is_exposure = "exposure" in var
-    is_above_below = "above" in var or "below" in var
-    is_icefrac = var == "icefrac"
-
-    op = "sum" if (is_exposure or is_icefrac) else "mean"
-    if is_exposure or is_icefrac:
-        weights = xr.DataArray(
-            np.ones_like(regional_map.lat),
-            dims=('lat'),
-            coords={'lat': regional_map.lat},
-        )
-    else:
-        weights = np.cos(np.deg2rad(regional_map.lat))
-
     masked_regional_map = None
     masked_regional_delta = None
     masked_historical_model = None
+    historical_mean = None
 
-    if spatial_gdf is None or spatial_item is None:
+    if region is None:
         if historical_model is not None:
             if is_icefrac:
                 historical_mean = regional_aggregation(
@@ -429,7 +537,6 @@ def _compute_mean_over_time(
         else:
             mean_with_sai = regional_aggregation(regional_map_with_sai, weights, op)
     else:
-        region = spatial_gdf[spatial_gdf.name == spatial_item]
         if historical_model is not None:
             historical_mask = create_mask(historical_model, region)
             masked_historical_model = historical_model.where(historical_mask, np.nan)
@@ -451,7 +558,7 @@ def _compute_mean_over_time(
             )
         mean_with_sai = regional_aggregation(masked_regional_map_with_sai, weights, op)
 
-    if historical_model is not None:
+    if historical_mean is not None:
         historical_model_global_mean = xr.concat(
             [historical_mean, recent_global_mean], dim='time'
         )
@@ -487,35 +594,199 @@ def _compute_mean_over_time(
         mean_with_sai.loc[dict(time=slice(None, start_year - 1))] = \
             mean_no_sai.loc[dict(time=slice(None, start_year - 1))]
 
-    # Across-climate-model uncertainty band for icefrac (global mode): 2σ of
-    # the per-model aggregated extent series, i.e. "2 sigmas of the mean" the
-    # dashboard shades around the multi-model-mean curves.
-    model_spread_2sigma_no_sai = None
-    model_spread_2sigma_with_sai = None
-    if (
-        is_icefrac
-        and (spatial_gdf is None or spatial_item is None)
-        and icefrac_per_model is not None
-        and icefrac_per_model.sizes.get('model', 1) >= 2
-    ):
-        no_sai_series = regional_aggregation(
-            icefrac_per_model * area.broadcast_like(icefrac_per_model), weights, op
-        )
-        model_spread_2sigma_no_sai = (
-            2 * no_sai_series.std(dim='model', ddof=1)
-        ).sel(time=mean_no_sai.time)
-        if icefrac_with_sai_per_model is not None:
-            with_sai_series = regional_aggregation(
-                icefrac_with_sai_per_model
-                * area.broadcast_like(icefrac_with_sai_per_model),
-                weights,
-                op,
+    return (
+        historical_model_global_mean,
+        mean_no_sai,
+        mean_with_sai,
+        masked_regional_map,
+        masked_regional_delta,
+        masked_historical_model,
+    )
+
+
+def _internal_variability_per_model(
+    var: str,
+    models: list[str],
+    *,
+    regional_map: xr.DataArray,
+    spatial_gdf,  # GeoDataFrame | None
+    spatial_item: str | None,
+    data_dir: Path,
+) -> dict[str, float]:
+    """Each model's internal-variability σ for ``var``, in the aggregated series' units.
+
+    Global mode reads ``model_internal_variability_<model>.npy`` (written by
+    ``scripts/variability.py``); regional mode reads the ``variability_<var>_<model>`` column
+    of the region geojson. Exposure variables are scaled by population (global total, or the
+    population inside the region) exactly as the legacy scalar is. A missing global file is
+    an error — the artifacts must be generated; a missing regional column (icefrac has none:
+    its regional aggregate is a sum of extent, not a mean) contributes 0 with a warning.
+    """
+    is_exposure = "exposure" in var
+    var_for_variability = exposurevar2var[var] if is_exposure else var
+    global_mode = spatial_gdf is None or spatial_item is None
+
+    scale = 1.0
+    if is_exposure:
+        population_np = get_population_data(data_dir)
+        if global_mode:
+            scale = float(population_np.sum() / 1e6)
+        else:
+            population_xr = xr.DataArray(
+                population_np, dims=('lon', 'lat'),
+                coords={'lat': regional_map.lat, 'lon': regional_map.lon},
             )
-            # The with-SAI curve is anchored to no-SAI before the SAI split, so
-            # anchor its band the same way where the with-SAI series has no data.
-            model_spread_2sigma_with_sai = (
-                2 * with_sai_series.std(dim='model', ddof=1)
-            ).reindex(time=mean_with_sai.time).fillna(model_spread_2sigma_no_sai)
+            population_xr = (
+                population_xr.assign_coords(lon=(((population_xr.lon + 180) % 360)))
+                .sortby('lon').transpose()
+            )
+            region_mask = create_mask(population_xr, spatial_gdf[spatial_gdf.name == spatial_item])
+            scale = float(population_xr.where(region_mask).sum() / 1e6)
+
+    sigmas: dict[str, float] = {}
+    for model in models:
+        if global_mode:
+            path = data_dir / var_for_variability / f"model_internal_variability_{model}.npy"
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"{path} is missing — run `python scripts/variability.py --var_name "
+                    f"{var_for_variability} --data_dir {data_dir} --model_dir <model_dir>`."
+                )
+            sigma = float(np.load(path))
+        else:
+            column = f"variability_{var_for_variability}_{model}"
+            row = spatial_gdf[spatial_gdf.name == spatial_item]
+            if column not in row.columns:
+                logger.warning(
+                    "No %s column in the region geojson; using 0 internal variability for %s.",
+                    column, model,
+                )
+                sigma = 0.0
+            else:
+                value = row[column].iloc[0]
+                sigma = 0.0 if value is None or pd.isna(value) else float(value)
+        sigmas[model] = sigma * scale
+    return sigmas
+
+
+def _compute_mean_over_time(
+    var: str,
+    *,
+    regional_map: xr.DataArray,
+    regional_delta: xr.DataArray,
+    recent_regional_map: xr.DataArray,
+    historical_model: xr.DataArray | None,
+    area: xr.DataArray | None,
+    spatial_gdf,  # GeoDataFrame | None — untyped to avoid a module-level geopandas import
+    spatial_item: str | None,
+    start_year: int,
+    variable_injection: np.ndarray | None,
+    data_dir: Path,
+    icefrac_per_model: xr.DataArray | None = None,
+    icefrac_with_sai_per_model: xr.DataArray | None = None,
+    regional_map_per_model: xr.DataArray | None = None,
+    historical_model_per_model: xr.DataArray | None = None,
+    sigma_internal_per_model: dict[str, float] | None = None,
+) -> _MeanOverTimeResult:
+    """Aggregate regional fields into the historical / no-SAI / with-SAI series shown on the dashboard, with bands.
+
+    Operates in two modes that share the same return shape:
+
+    * **Global** (``spatial_gdf`` or ``spatial_item`` is ``None``): area-weighted aggregation
+      over the full lat/lon grid. ``masked_*`` outputs are ``None``.
+    * **Regional**: the same aggregation restricted to
+      ``spatial_gdf[spatial_gdf.name == spatial_item]``; the masked DataArrays are returned
+      so :func:`_compute_distribution` can reuse them.
+
+    The combined fields give the plotted lines (see :func:`_aggregate_series` for the
+    aggregation, smoothing and anchoring). When the end-to-end per-model fields are supplied
+    (``regional_map_per_model`` / ``icefrac_per_model`` and ``historical_model_per_model``)
+    together with each model's internal σ, every model's own series is built by the **same**
+    steps — smoothed first — and :func:`backend.uncertainty.combine_series` returns, for each
+    segment (historical, no-SAI, with-SAI), the band drawn around the mean (internal
+    variability of the multi-model mean) and the model spread as a diagnostic.
+    """
+    is_exposure = "exposure" in var
+    is_above_below = "above" in var or "below" in var
+    is_icefrac = var == "icefrac"
+
+    op = "sum" if (is_exposure or is_icefrac) else "mean"
+    if is_exposure or is_icefrac:
+        weights = xr.DataArray(
+            np.ones_like(regional_map.lat),
+            dims=('lat'),
+            coords={'lat': regional_map.lat},
+        )
+    else:
+        weights = np.cos(np.deg2rad(regional_map.lat))
+
+    region = None
+    if spatial_gdf is not None and spatial_item is not None:
+        region = spatial_gdf[spatial_gdf.name == spatial_item]
+
+    common = dict(
+        area=area, weights=weights, op=op, region=region, is_above_below=is_above_below,
+        is_icefrac=is_icefrac, data_dir=data_dir, start_year=start_year,
+        variable_injection=variable_injection,
+    )
+    (
+        historical_model_global_mean, mean_no_sai, mean_with_sai,
+        masked_regional_map, masked_regional_delta, masked_historical_model,
+    ) = _aggregate_series(
+        regional_map=regional_map, regional_delta=regional_delta,
+        recent_regional_map=recent_regional_map, historical_model=historical_model, **common,
+    )
+
+    # --- combined uncertainty bands from the end-to-end per-model series
+    bands = None
+    per_model_field = icefrac_per_model if is_icefrac else regional_map_per_model
+    if (
+        per_model_field is not None
+        and 'model' in per_model_field.dims
+        and sigma_internal_per_model is not None
+    ):
+        models = [str(m) for m in per_model_field.model.values]
+        segments: dict[str, list[xr.DataArray]] = {"historical": [], "no_sai": [], "with_sai": []}
+        for model in models:
+            field_m = per_model_field.sel(model=model, drop=True)
+            map_m = field_m.sel(time=slice(start_year, SIM_END_YEAR))
+            recent_m = field_m.sel(time=slice(2015, start_year - 1))
+            if is_icefrac and icefrac_with_sai_per_model is not None:
+                with_sai_m = icefrac_with_sai_per_model.sel(model=model, drop=True)
+                delta_m = with_sai_m - map_m  # each model's own sigmoid, inner-aligned on time
+            else:
+                delta_m = regional_delta  # the SAI delta is one pooled fit: identical for every model
+            hist_m = None
+            if historical_model_per_model is not None:
+                hist_m = historical_model_per_model.sel(model=model, drop=True)
+                if region is not None and is_above_below:
+                    hist_m = hist_m.where(hist_m > 0, 0)  # mirrors the hoisted clip in get_outputs
+                # A year this model lacks (CESM's series starts in 1851) is all-NaN: drop it so
+                # the smoothing sees a contiguous series.
+                hist_m = hist_m.dropna("time", how="all")
+            h_m, ns_m, ws_m, *_ = _aggregate_series(
+                regional_map=map_m, regional_delta=delta_m, recent_regional_map=recent_m,
+                historical_model=hist_m, **common,
+            )
+            segments["historical"].append(h_m.expand_dims(model=[model]))
+            segments["no_sai"].append(ns_m.expand_dims(model=[model]))
+            segments["with_sai"].append(ws_m.expand_dims(model=[model]))
+
+        bands = {
+            "band_models": models,
+            "band_n_models": len(models),
+            "sigma_internal_per_model": dict(sigma_internal_per_model),
+            "per_model_series": {},
+        }
+        for name, parts in segments.items():
+            stacked = xr.concat(parts, dim="model", join="outer")
+            result = combine_series(stacked, sigma_internal_per_model)
+            bands.update(result.as_dict(name))
+            bands[f"band_mean_{name}"] = result.mean
+            bands["per_model_series"][name] = stacked
+        bands["sigma_internal_mean"] = result.sigma_internal_mean
+        bands["band_ddof"] = result.ddof
+        bands["band_labels"] = {"internal": band_label(len(models))}
 
     return _MeanOverTimeResult(
         mean_no_sai=mean_no_sai,
@@ -524,8 +795,7 @@ def _compute_mean_over_time(
         masked_regional_map=masked_regional_map,
         masked_regional_delta=masked_regional_delta,
         masked_historical_model=masked_historical_model,
-        model_spread_2sigma_no_sai=model_spread_2sigma_no_sai,
-        model_spread_2sigma_with_sai=model_spread_2sigma_with_sai,
+        bands=bands,
     )
 
 
@@ -767,7 +1037,7 @@ def get_outputs(
 
     simple_ssp = REVERSE_FANCY_SSP_TITLES[ssp_scenario]
 
-    regional_temp, regional_temp_no_sai_p_values = get_regional_map(
+    regional_temp, regional_temp_no_sai_p_values, regional_temp_per_model = get_regional_map(
         "tas", data_dir, model_dir, cache_dir, ssp_scenario
     )
     temp_diff = (
@@ -788,6 +1058,7 @@ def get_outputs(
             cache_dir=cache_dir,
             regional_temp=regional_temp,
             regional_temp_no_sai_p_values=regional_temp_no_sai_p_values,
+            regional_temp_per_model=regional_temp_per_model,
         )
         output_data[var]["regional_map"] = fields.regional_map
 
@@ -804,8 +1075,12 @@ def get_outputs(
             data_dir=data_dir,
             model_dir=model_dir,
             cache_dir=cache_dir,
+            regional_temp_per_model=regional_temp_per_model,
         )
         regional_delta = delta_result.regional_delta
+        # Zero delta before the SAI start: the decade-mean delta map and the with-SAI
+        # histogram of a pre-start decade are those of the unmodified projection.
+        regional_delta_full = regional_delta.reindex(time=fields.regional_map.time, fill_value=0.0)
         regional_no_sai_p_values = delta_result.regional_no_sai_p_values
         if regional_no_sai_p_values is not None:
             regional_no_sai_p_values = regional_no_sai_p_values.sel(time=decade_end_year)
@@ -821,6 +1096,8 @@ def get_outputs(
             data_dir=data_dir,
             cache_dir=cache_dir,
             decade_end_year=decade_end_year,
+            start_year=start_year,
+            ramp_up=ramp_up,
         )
 
         # tas/tasmin/tasmax/pr/p-e maps are pre-industrial anomalies; re-express them against the
@@ -836,7 +1113,7 @@ def get_outputs(
         ).mean('time')
         if display_offset is not None:
             regional_mean = regional_mean - display_offset
-        regional_delta_mean = regional_delta.sel(
+        regional_delta_mean = regional_delta_full.sel(
             time=slice(decade_start_year, decade_end_year)
         ).mean('time')
 
@@ -850,7 +1127,8 @@ def get_outputs(
         output_data[var]["regional_sai_p_values"] = regional_sai_p_values
 
         if output_config.get("create_geotiffs", False):
-            output_data["geotiff_paths"] = create_geotiff_files(
+            # Merge, not assign: a multi-variable call keeps every variable's paths.
+            output_data["geotiff_paths"].update(create_geotiff_files(
                 var=var,
                 regional_mean=regional_mean,
                 regional_delta_mean=regional_delta_mean,
@@ -864,9 +1142,9 @@ def get_outputs(
                 ramp_up=ramp_up,
                 variable_injection=variable_injection,
                 output_config=output_config,
-            )
+            ))
         if output_config.get("create_pngs", False) or output_config.get("create_svgs", False):
-            output_data["image_paths"] = create_vectorized_files(
+            output_data["image_paths"].update(create_vectorized_files(
                 var=var,
                 regional_mean=regional_mean,
                 regional_delta_mean=regional_delta_mean,
@@ -880,7 +1158,7 @@ def get_outputs(
                 ramp_up=ramp_up,
                 variable_injection=variable_injection,
                 output_config=output_config,
-            )
+            ))
 
         # Validation-only: GeoTIFFs (and core regional fields above) are enough; skip
         # mean-over-time, PDFs, NetCDF export, and per-variable plotting work.
@@ -906,6 +1184,15 @@ def get_outputs(
         ):
             historical_model = historical_model.where(historical_model > 0, 0)
 
+        per_model_field = fields.icefrac_per_model if var == "icefrac" else fields.regional_map_per_model
+        sigma_internal_per_model = None
+        if per_model_field is not None and "model" in per_model_field.dims:
+            sigma_internal_per_model = _internal_variability_per_model(
+                var, [str(m) for m in per_model_field.model.values],
+                regional_map=regional_map_post, spatial_gdf=spatial_gdf,
+                spatial_item=spatial_item, data_dir=data_dir,
+            )
+
         mot_result = _compute_mean_over_time(
             var,
             regional_map=regional_map_post,
@@ -920,6 +1207,9 @@ def get_outputs(
             data_dir=data_dir,
             icefrac_per_model=fields.icefrac_per_model,
             icefrac_with_sai_per_model=delta_result.icefrac_with_sai_per_model,
+            regional_map_per_model=fields.regional_map_per_model,
+            historical_model_per_model=fields.historical_model_per_model,
+            sigma_internal_per_model=sigma_internal_per_model,
         )
 
         output_data[var]["mean_over_time"] = {
@@ -931,15 +1221,17 @@ def get_outputs(
             output_data[var]["mean_over_time"]["historical_obs"] = historical_obs_data
         elif var == 'icefrac':
             output_data[var]["mean_over_time"]["historical_obs"] = historical_obs_sea_ice
-        if mot_result.model_spread_2sigma_no_sai is not None:
-            # icefrac, global mode: ±2σ across-model band half-widths, one value
-            # per year of the corresponding mean-over-time series.
-            output_data[var]["mean_over_time"]["model_spread_2sigma_no_sai"] = (
-                mot_result.model_spread_2sigma_no_sai
-            )
-            output_data[var]["mean_over_time"]["model_spread_2sigma_with_sai"] = (
-                mot_result.model_spread_2sigma_with_sai
-            )
+        if mot_result.bands is not None:
+            # Per-segment band components (backend.uncertainty), the model spread as a
+            # diagnostic, and the per-model series behind them.
+            output_data[var]["mean_over_time"].update(mot_result.bands)
+        band = _line_band(
+            var, output_data[var]["mean_over_time"], mot_result.bands,
+            data_dir=data_dir, regional_map=regional_map_post,
+            spatial_gdf=spatial_gdf, spatial_item=spatial_item,
+        )
+        if band is not None:
+            output_data[var]["mean_over_time"]["band"] = band
 
         output_data[var]["mean_over_time"]["model_internal_variability"] = (
             _compute_internal_variability(
@@ -951,13 +1243,22 @@ def get_outputs(
             )
         )
 
+        # The histogram slices the requested decade itself, so give it the FULL projection
+        # (2015 onwards) rather than the post-start slice: a decade before the SAI start is
+        # then the unmodified projection instead of an empty selection. Identical for every
+        # decade after the start. Regional mode masks the full maps with the region mask.
+        if spatial_gdf is not None and spatial_item is not None:
+            masked_regional_map_full = fields.regional_map.where(mask, np.nan)
+            masked_regional_delta_full = regional_delta_full.where(mask, np.nan)
+        else:
+            masked_regional_map_full = masked_regional_delta_full = None
         output_data[var]["distribution"] = _compute_distribution(
             var,
-            regional_map=regional_map_post,
-            regional_delta=regional_delta,
+            regional_map=fields.regional_map,
+            regional_delta=regional_delta_full,
             historical_model=historical_model,
-            masked_regional_map=mot_result.masked_regional_map,
-            masked_regional_delta=mot_result.masked_regional_delta,
+            masked_regional_map=masked_regional_map_full,
+            masked_regional_delta=masked_regional_delta_full,
             masked_historical_model=mot_result.masked_historical_model,
             decade_start_year=decade_start_year,
             decade_end_year=decade_end_year,
@@ -1320,14 +1621,14 @@ def _significance_mask(p_values_da: xr.DataArray | None) -> np.ndarray | None:
     """Build a float32 mask from a p-values DataArray for hatching non-significant regions.
 
     The input is reprojected with :func:`_adjust_polar_lonlat` so the mask aligns with
-    polar-stereographic data fields. Returns ``1.0`` where ``p >= 0.05`` (not significant)
+    polar-stereographic data fields. Returns ``1.0`` where ``p >= SIGNIFICANCE_THRESHOLD`` (not significant)
     and ``NaN`` elsewhere, or ``None`` when ``p_values_da`` is ``None``.
     """
     if p_values_da is None:
         return None
     pv = _adjust_polar_lonlat(p_values_da).values
     return np.where(
-        (~np.isnan(pv)) & (pv >= 0.05),
+        (~np.isnan(pv)) & (pv >= SIGNIFICANCE_THRESHOLD),
         1.0,
         np.nan,
     ).astype(np.float32)

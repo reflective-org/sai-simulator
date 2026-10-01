@@ -16,7 +16,7 @@ from sklearn.linear_model import LinearRegression
 
 from fair_wrap.fair_utils import *
 from .constants import *
-from .historical import get_historical_model
+from .historical import get_historical_model, get_historical_model_per_model
 from .utils import clip_to_land
 from .population import get_population_exposure
 from .p_values import get_grid_level_p_values, no_sai_p_values_cache_path
@@ -154,24 +154,30 @@ def get_global_temp(
 
 @lru_cache(maxsize=32)  # Caches the last 32 unique calls
 def get_regional_models(variable_dir: Path) -> LinearRegression:
-    """Load and concatenate the per-model, per-emulator ``FaIR → SMIP`` linear regressors.
+    """Load the per-model ``FaIR → SMIP`` regressors, one emulator-averaged regression per model.
 
-    For every ``(model, emulator)`` pair in ``regional_models_for_var(var) ×
-    range(NUM_EMULATORS)`` loads ``fair_to_smip_{model}_{i}.joblib`` from
-    ``variable_dir`` and concatenates the coefficients and intercepts into a single
-    :class:`sklearn.linear_model.LinearRegression` instance whose ``.predict``
-    returns stacked outputs for all emulators at once. Cached on ``variable_dir``
-    via :func:`functools.lru_cache` (32 entries) since the load is I/O-heavy.
+    Each model has ``NUM_EMULATORS`` bootstrap regressors ``fair_to_smip_{model}_{i}.joblib``.
+    They are linear, so the mean of their predictions IS the prediction of their mean
+    coefficients and intercepts: ``mean_i(X·a_i + b_i) = X·mean_i(a_i) + mean_i(b_i)``. The
+    emulators are therefore averaged here, per model, and the returned
+    :class:`sklearn.linear_model.LinearRegression` stacks one regression per model in
+    ``regional_models_for_var(var)`` order. Predicting every emulator separately and averaging
+    afterwards gives the same maps but needs ``NUM_EMULATORS`` times the memory — about
+    23 GB per scenario with three models, which is what froze parallel cache runs. Cached on
+    ``variable_dir`` via :func:`functools.lru_cache` (32 entries) since the load is I/O-heavy.
     """
     var = variable_dir.name
 
     fair2smip_coefs, fair2smip_intercepts = [], []
 
     for model in regional_models_for_var(var):
+        coefs, intercepts = [], []
         for i in range(NUM_EMULATORS):
             fair2smip = joblib.load(variable_dir / f"fair_to_smip_{model}_{i}.joblib")
-            fair2smip_coefs.append(fair2smip.coef_)
-            fair2smip_intercepts.append(fair2smip.intercept_)
+            coefs.append(fair2smip.coef_)
+            intercepts.append(fair2smip.intercept_)
+        fair2smip_coefs.append(np.mean(coefs, axis=0))
+        fair2smip_intercepts.append(np.mean(intercepts, axis=0))
 
     fair2smip_coefs = np.concatenate(fair2smip_coefs)
     fair2smip_intercepts = np.concatenate(fair2smip_intercepts)
@@ -185,21 +191,22 @@ def get_regional_models(variable_dir: Path) -> LinearRegression:
 def get_smip(
     global_temp: xr.DataArray, fair2smip: LinearRegression, models: list[str]
 ) -> np.ndarray:
-    """Run the concatenated ``FaIR → SMIP`` regressor and reshape its output into a 5-D array.
+    """Run the stacked ``FaIR → SMIP`` regressor and reshape its output into a 4-D array.
 
     Slices ``global_temp`` to ``[2015, …]`` (the emulator's training range), predicts the
-    stacked per-emulator regional fields, then reshapes the flat output into
-    ``(time, model, emulator, lat, lon)`` using ``NUM_LAT`` / ``NUM_LON`` / ``NUM_EMULATORS``
-    and ``models`` — the variable's participating model list
+    stacked per-model (emulator-averaged, see :func:`get_regional_models`) regional fields,
+    then reshapes the flat output into ``(time, model, lat, lon)`` using ``NUM_LAT`` /
+    ``NUM_LON`` and ``models`` — the variable's participating model list
     (:func:`backend.constants.regional_models_for_var`), which must match the list the
     regressor was concatenated over.
     """
     # Get regional projections for each model
     smip = fair2smip.predict(global_temp.sel(timebounds=slice(2015, None)))
 
-    smip = smip.reshape((smip.shape[0], len(models), NUM_EMULATORS, NUM_LAT, NUM_LON))
+    smip = smip.reshape((smip.shape[0], len(models), NUM_LAT, NUM_LON))
 
     return smip
+
 
 def get_regional_map_from_global_temp(
     global_temp: xr.DataArray,
@@ -207,47 +214,43 @@ def get_regional_map_from_global_temp(
     var: str,
     data_dir: Path,
     cache_dir: Path,
-) -> tuple[xr.DataArray, xr.DataArray | None]:
-    """Convert FaIR global temperature into a labelled regional map plus its no-SAI p-values.
+) -> tuple[xr.DataArray, xr.DataArray | None, xr.DataArray]:
+    """Convert FaIR global temperature into a labelled regional map, its no-SAI p-values, and the per-model maps.
 
-    Runs :func:`get_smip` to get the raw emulator output, wraps it as an :class:`xr.DataArray`
-    with the canonical ``time / model / emulator / lat / lon`` coords (loading ``correct_lat.npy``
-    for the latitude axis), takes the equal-weight mean over models and emulators, then applies the
-    variable-specific post-processing: floors at zero for ``"above"``/``"below"`` count variables,
-    clips to land for precipitation/water-availability variables, and converts to population
-    exposure for exposure variables.
+    Runs :func:`get_smip` to get each model's emulator-mean output, wraps it as an
+    :class:`xr.DataArray` with the canonical ``time / model / lat / lon`` coords (loading
+    ``correct_lat.npy`` for the latitude axis), then keeps two views of it:
 
-    Finally rebases temperature/precipitation variables to the 1850-1900 historical mean and
-    returns ``(regional_map, regional_p_values)``. The p-values are ``None`` when no historical
-    model exists for this variable (see :func:`get_historical_model`).
+    * the **combined** map — equal-weight mean over models (each already the mean of its
+      emulators), rebased against the multi-model historical mean; this is what the dashboard
+      draws;
+    * the **per-model** maps ``(time, model, lat, lon)`` — each model's emulator mean,
+      rebased against **its own** model's historical mean. These are the end-to-end
+      per-model outcomes behind the combined uncertainty band (:mod:`backend.uncertainty`).
+
+    Both get the same variable-specific post-processing (floor at zero for ``above``/``below``
+    counts, land clip for precipitation/water availability, population exposure). Returns
+    ``(regional_map, regional_p_values, regional_map_per_model)``; the p-values are ``None``
+    when no historical model exists for this variable (see :func:`get_historical_model`).
     """
     # Get regional map from global temperature
     models = regional_models_for_var(var)
     smip = get_smip(global_temp, fair2smip, models)
-    regional_map = xr.DataArray(smip, dims=('time', 'model', 'emulator', 'lat', 'lon'))
+    regional_map = xr.DataArray(smip, dims=('time', 'model', 'lat', 'lon'))
     regional_map.coords['time'] = np.arange(2015, SIM_END_YEAR+1)
     regional_map.coords['model'] = models
-    regional_map.coords['emulator'] = np.arange(NUM_EMULATORS)
     correct_lat = np.load(data_dir / "correct_lat.npy")
     regional_map.coords['lat'] = correct_lat
     regional_map.coords['lon'] = np.linspace(0, 360, NUM_LON, endpoint=False)
     regional_map = xr.Dataset({var: regional_map})
-    # Equal-weight multi-model mean: every model has NUM_EMULATORS members, so
-    # averaging over both dims gives each model identical weight.
-    regional_map = regional_map.mean(dim=['model', 'emulator'])[var]
+    # Per-model maps: each model's emulator mean (averaged in get_regional_models).
+    # Equal-weight multi-model mean on top: every model has NUM_EMULATORS members, so
+    # averaging the per-model means gives each model identical weight.
+    regional_map_per_model = regional_map[var]
+    regional_map = regional_map_per_model.mean(dim='model')
 
-    is_above_below = "above" in var or "below" in var
-    is_exposure = "exposure" in var
-
-    # Floor the values to 0 if the variable counts number of days
-    if is_above_below:
-        regional_map = regional_map.where(regional_map > 0, 0)
-
-    # Clip pr and days to land only
-    if is_above_below or var in ["pr", "p-e"]:
-        regional_map = clip_to_land(data_dir, regional_map)
-        if is_exposure:
-            regional_map = get_population_exposure(data_dir, regional_map)
+    regional_map = _postprocess_map(var, data_dir, regional_map)
+    regional_map_per_model = _postprocess_map(var, data_dir, regional_map_per_model)
 
     ### Get historical temperature data ###
     historical_map = get_historical_model(var, data_dir, cache_dir)
@@ -261,14 +264,37 @@ def get_regional_map_from_global_temp(
     else:
         regional_p_values = None
 
-    ### Rebase the regional map ###
+    ### Rebase the regional maps: the combined map against the multi-model historical mean,
+    ### each per-model map against its own model's historical record. ###
     # The projection stays in the pre-industrial frame here: the SAI temp_target, the icefrac
     # model, and get_temp_diff all assume anomalies vs 1850-1900. The dashboard re-expresses the
     # map against the current-climate baseline at display time (see get_outputs._load_variable_fields).
-    if var in ["tas", "tasmin", "tasmax", "pr", "p-e"]:
+    if var in REBASED_VARS:
         regional_map = regional_map - historical_rebase
+        historical_per_model = get_historical_model_per_model(var, data_dir, cache_dir)
+        rebase_per_model = historical_per_model.sel(time=slice(1850, 1900)).mean('time')
+        regional_map_per_model = regional_map_per_model - rebase_per_model
 
-    return regional_map, regional_p_values
+    return regional_map, regional_p_values, regional_map_per_model
+
+
+# Variables whose maps are shown as anomalies from the 1850-1900 historical mean.
+REBASED_VARS = ("tas", "tasmin", "tasmax", "pr", "p-e")
+
+
+def _postprocess_map(var: str, data_dir: Path, regional_map: xr.DataArray) -> xr.DataArray:
+    """Floor / land-clip / population-scale a map; broadcasts over any leading dims (e.g. ``model``)."""
+    is_above_below = "above" in var or "below" in var
+    is_exposure = "exposure" in var
+    # Floor the values to 0 if the variable counts number of days
+    if is_above_below:
+        regional_map = regional_map.where(regional_map > 0, 0)
+    # Clip pr and days to land only
+    if is_above_below or var in ["pr", "p-e"]:
+        regional_map = clip_to_land(data_dir, regional_map)
+        if is_exposure:
+            regional_map = get_population_exposure(data_dir, regional_map)
+    return regional_map
 
 
 @lru_cache(maxsize=32)  # Caches the last 32 unique calls
@@ -278,20 +304,27 @@ def get_regional_map(
     model_dir: Path,
     cache_dir: Path,
     ssp_scenario: str,
-) -> tuple[xr.DataArray, xr.DataArray | None]:
-    """Returns the regional map for the given variable, SSP scenario, and temperature target."""
+) -> tuple[xr.DataArray, xr.DataArray | None, xr.DataArray]:
+    """Returns ``(regional_map, no-SAI p-values, per-model maps)`` for the variable and scenario.
+
+    Served from ``cache_dir`` when all three cache files exist (``scripts/cache.py`` writes
+    them); otherwise computed via :func:`get_regional_map_from_global_temp`.
+    """
     validate_cache_dir(cache_dir)
     simple_ssp = REVERSE_FANCY_SSP_TITLES[ssp_scenario]
 
     regional_cache_path = cache_dir / f"{simple_ssp}_regional_{var}.nc"
     regional_p_cache_path = no_sai_p_values_cache_path(cache_dir, simple_ssp, var)
+    regional_per_model_cache_path = cache_dir / f"{simple_ssp}_regional_per_model_{var}.nc"
 
-    if regional_cache_path.exists() and regional_p_cache_path.exists():
-        print(f"Found {regional_cache_path} and {regional_p_cache_path}")
+    if all(p.exists() for p in (regional_cache_path, regional_p_cache_path, regional_per_model_cache_path)):
+        print(f"Found {regional_cache_path}, {regional_p_cache_path} and {regional_per_model_cache_path}")
         with xr.open_dataarray(regional_cache_path) as da:
             regional_map = da.load()
         with xr.open_dataarray(regional_p_cache_path) as da:
             regional_p_values = da.load()
+        with xr.open_dataarray(regional_per_model_cache_path) as da:
+            regional_map_per_model = da.load()
     else:
         # First get FaIR global temperature
         global_temp = get_global_temp(ssp_scenario)
@@ -306,6 +339,8 @@ def get_regional_map(
         fair2smip = get_regional_models(variable_dir)
 
         # Get regional map
-        regional_map, regional_p_values = get_regional_map_from_global_temp(global_temp, fair2smip, var, data_dir, cache_dir)
+        regional_map, regional_p_values, regional_map_per_model = get_regional_map_from_global_temp(
+            global_temp, fair2smip, var, data_dir, cache_dir
+        )
 
-    return regional_map, regional_p_values
+    return regional_map, regional_p_values, regional_map_per_model

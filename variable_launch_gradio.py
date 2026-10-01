@@ -132,7 +132,7 @@ def generate_gradio_plots(
             if spatial_gdf is not None and spatial_item is not None:
                 mask = output_data[var]["mask"]
 
-                hatches = np.where((~mask) & (regional_no_sai_p_values >= 0.05), 1, np.nan)
+                hatches = np.where((~mask) & (regional_no_sai_p_values >= SIGNIFICANCE_THRESHOLD), 1, np.nan)
                 masked_hatches = np.ma.masked_where(np.isnan(hatches), hatches)
                 regional_axs.contourf(
                     regional_mean['lon'], regional_mean['lat'], masked_hatches,
@@ -142,7 +142,7 @@ def generate_gradio_plots(
                     transform=ccrs.PlateCarree()
                 )
 
-                hatches = np.where((~mask) & (regional_sai_p_values >= 0.05), 1, np.nan)
+                hatches = np.where((~mask) & (regional_sai_p_values >= SIGNIFICANCE_THRESHOLD), 1, np.nan)
                 masked_hatches = np.ma.masked_where(np.isnan(hatches), hatches)
                 sai_axs.contourf(
                     regional_mean['lon'], regional_mean['lat'], masked_hatches,
@@ -152,7 +152,7 @@ def generate_gradio_plots(
                     transform=ccrs.PlateCarree()
                 )
             else:
-                hatches = np.where((~np.isnan(regional_no_sai_p_values)) & (regional_no_sai_p_values >= 0.05), 1, np.nan)
+                hatches = np.where((~np.isnan(regional_no_sai_p_values)) & (regional_no_sai_p_values >= SIGNIFICANCE_THRESHOLD), 1, np.nan)
                 masked_hatches = np.ma.masked_where(np.isnan(hatches), hatches)
                 regional_axs.contourf(
                     regional_no_sai_p_values['lon'], regional_no_sai_p_values['lat'], masked_hatches,
@@ -162,7 +162,7 @@ def generate_gradio_plots(
                     transform=ccrs.PlateCarree()
                 )
 
-                hatches = np.where((~np.isnan(regional_sai_p_values)) & (regional_sai_p_values >= 0.05), 1, np.nan)
+                hatches = np.where((~np.isnan(regional_sai_p_values)) & (regional_sai_p_values >= SIGNIFICANCE_THRESHOLD), 1, np.nan)
                 masked_hatches = np.ma.masked_where(np.isnan(hatches), hatches)
                 sai_axs.contourf(
                     regional_sai_p_values['lon'], regional_sai_p_values['lat'], masked_hatches,
@@ -231,9 +231,9 @@ def generate_gradio_plots(
         historical_model_global_mean = output_data[var]["mean_over_time"]["historical_model"]
 
         if global_mean_ax is not None:
-            global_mean_ax.plot(mean_no_sai.time.values, mean_no_sai.values, label='No SAI', color='tab:red', linestyle='--')
-            global_mean_ax.plot(mean_with_sai.time.values, mean_with_sai.values, label='With SAI', color='tab:blue', linestyle='--')
-            global_mean_ax.plot(historical_model_global_mean.time.values, historical_model_global_mean.values, label='Historical CESM2-WACCM', color='tab:red')
+            global_mean_ax.plot(mean_no_sai.time.values, mean_no_sai.values, label='No SAI (multi-model mean)', color='tab:red', linestyle='--')
+            global_mean_ax.plot(mean_with_sai.time.values, mean_with_sai.values, label='With SAI (multi-model mean)', color='tab:blue', linestyle='--')
+            global_mean_ax.plot(historical_model_global_mean.time.values, historical_model_global_mean.values, label='Historical (multi-model mean)', color='tab:red')
 
             # Sea-ice extent cannot be negative; clip the shaded band's lower
             # edge at 0 whichever band source is in play (the internal-
@@ -241,16 +241,20 @@ def generate_gradio_plots(
             def _band_floor(values):
                 return np.maximum(values, 0.0) if var == 'icefrac' else values
 
-            if "model_spread_2sigma_no_sai" in output_data[var]["mean_over_time"]:
-                # icefrac: across-climate-model ±2σ band around the multi-model-mean
-                # projection curves (per-year half-widths, already ×2).
-                band_no_sai = output_data[var]["mean_over_time"]["model_spread_2sigma_no_sai"].sel(time=mean_no_sai.time).values
-                band_with_sai = output_data[var]["mean_over_time"]["model_spread_2sigma_with_sai"].sel(time=mean_with_sai.time).values
-                global_mean_ax.fill_between(mean_no_sai.time.values, _band_floor(mean_no_sai.values - band_no_sai), mean_no_sai.values + band_no_sai, color='tab:red', alpha=0.3)
-                global_mean_ax.fill_between(mean_with_sai.time.values, _band_floor(mean_with_sai.values - band_with_sai), mean_with_sai.values + band_with_sai, color='tab:blue', alpha=0.3)
-                if "model_internal_variability" in output_data[var]["mean_over_time"]:
-                    model_internal_variability = output_data[var]["mean_over_time"]["model_internal_variability"]
-                    global_mean_ax.fill_between(historical_model_global_mean.time.values, _band_floor(historical_model_global_mean.values - model_internal_variability*2), historical_model_global_mean.values + model_internal_variability*2, color='tab:red', alpha=0.3)
+            mot = output_data[var]["mean_over_time"]
+            if "band" in mot:
+                # The line-plot envelope (backend.get_outputs, "band"): per-year offsets
+                # added to each series, from whichever source produced it. Legend names it once.
+                band_label = mot["band"]["label"]
+                for series, color in (
+                    (mean_no_sai, 'tab:red'),
+                    (mean_with_sai, 'tab:blue'),
+                    (historical_model_global_mean, 'tab:red'),
+                ):
+                    low = mot["band"]["low"].reindex(time=series.time).values
+                    high = mot["band"]["high"].reindex(time=series.time).values
+                    global_mean_ax.fill_between(series.time.values, _band_floor(series.values + low), series.values + high, color=color, alpha=0.3, linewidth=0, label=band_label)
+                    band_label = None  # label the band once
             elif "model_internal_variability" in output_data[var]["mean_over_time"]:
                 # Add shading of model_internal variability around each of the above 3 lines
                 model_internal_variability = output_data[var]["mean_over_time"]["model_internal_variability"]
@@ -305,7 +309,7 @@ def generate_gradio_plots(
             pdf_ax.set_xticks(index + bar_width)
             pdf_ax.set_xticklabels(no_sai_bins)
             # ylabel = 'Log Frequency'
-            ylabel = 'Frequency'
+            ylabel = 'Fraction of grid cells'
         else:
             no_sai_bins = no_sai_bins[:-1]
             with_sai_bins = with_sai_bins[:-1]
@@ -314,7 +318,7 @@ def generate_gradio_plots(
             if "historical" in output_data[var]["distribution"]:
                 historical_bins = historical_bins[:-1]
                 pdf_ax.hist(historical_bins, bins=historical_bins, weights=historical_counts, alpha=0.5, label='Historical Observations', color='black', density=False)
-            ylabel = 'Frequency'
+            ylabel = 'Fraction of grid cells'
 
         pdf_ax.set_xlabel(title.replace("Delta", "Delta from Preindustrial"), fontsize=FONTSIZE)
         pdf_ax.set_ylabel(ylabel, fontsize=FONTSIZE)

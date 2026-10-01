@@ -142,20 +142,17 @@ def _temp_diff() -> xr.DataArray:
     )
 
 
-def test_delta_averages_models_equally(tmp_path) -> None:
+def test_delta_refuses_a_per_model_interpolator(tmp_path) -> None:
+    """The SAI slope is one pooled fit; an artifact with a model dim is not silently averaged."""
     model_dir = tmp_path / "models"
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
     _write_interpolator(model_dir, "tas", {"CESM2-WACCM": 1.0, "MIROC-ES2H": 3.0})
 
-    delta = get_regional_delta_without_rampup(
-        "tas", tmp_path, model_dir, cache_dir, "SSP2-4.5", 1.5, _temp_diff()
-    )
-    # Equal-weight mean slope = 2.0; no residual model dim.
-    assert "model" not in delta.dims
-    np.testing.assert_allclose(
-        delta.isel(lat=0, lon=0).values, 2.0 * _temp_diff().values
-    )
+    with pytest.raises(ValueError, match="model dim"):
+        get_regional_delta_without_rampup(
+            "tas", tmp_path, model_dir, cache_dir, "SSP2-4.5", 1.5, _temp_diff()
+        )
 
 
 def test_delta_handles_legacy_single_slope_interpolator(tmp_path) -> None:
