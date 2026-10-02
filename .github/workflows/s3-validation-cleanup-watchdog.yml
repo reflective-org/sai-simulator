@@ -51,6 +51,16 @@ jobs:
             exit 0
           fi
 
+          HOLD="$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].Tags[?Key=='gh_validation_hold_until'] | [0].Value" \
+            --output text)"
+          NOW="$(date -u +%s)"
+          if [ -n "$HOLD" ] && [ "$HOLD" != "None" ] && [ "$NOW" -lt "$HOLD" ]; then
+            echo "::notice::gh_validation_hold_until=${HOLD} is still in the future (now ${NOW}); leaving the instance running."
+            exit 0
+          fi
+
           EVENT_NAME="${{ github.event_name }}"
 
           if [ "$EVENT_NAME" = "workflow_run" ]; then

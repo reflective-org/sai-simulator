@@ -4,6 +4,20 @@
 # online, runs validation, then stops the instance in a final cleanup job. That makes it work
 # both before and after merge without cross-workflow dispatch.
 #
+# Holding the instance open
+# -------------------------
+# Both this workflow's stop-runner job and the cleanup watchdog skip stopping the instance
+# while the EC2 tag `gh_validation_hold_until` holds a future Unix timestamp. Set it before
+# any long job on the box -- a cache rebuild or a pregeneration run -- or the next pull
+# request anyone opens will stop the instance out from under it:
+#
+#   aws ec2 create-tags --resources <instance-id> \
+#     --tags "Key=gh_validation_hold_until,Value=$(date -u -d '+12 hours' +%s)"
+#
+# The hold self-expires, so a forgotten tag cannot leave the instance running indefinitely.
+# Note the watchdog resolves its workflow file from the DEFAULT BRANCH, so a change to its
+# guard only takes effect once merged.
+#
 # Why self-hosted?
 # GitHub-hosted runners do not have your ~140GB simulator data tree. Validation must run
 # on a machine that already has data/processed, data/models, and data/cache (or you set
@@ -441,4 +455,15 @@ jobs:
             echo "::error::Set repository variable VALIDATION_RUNNER_INSTANCE_ID."
             exit 1
           fi
+
+          HOLD="$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].Tags[?Key=='gh_validation_hold_until'] | [0].Value" \
+            --output text)"
+          NOW="$(date -u +%s)"
+          if [ -n "$HOLD" ] && [ "$HOLD" != "None" ] && [ "$NOW" -lt "$HOLD" ]; then
+            echo "::notice::gh_validation_hold_until=${HOLD} is still in the future (now ${NOW}); leaving the instance running."
+            exit 0
+          fi
+
           aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null
