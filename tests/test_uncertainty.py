@@ -99,4 +99,4 @@ def test_as_dict_and_label_name_the_model_count():
     res = combine_series(per_model, {"A": 0.0, "B": 0.0})
     d = res.as_dict("no_sai")
     assert set(d) == {"band_internal_no_sai", "sigma_model_no_sai"}
-    assert "M=2" in band_label(2) and "internal variability" in band_label(2)
+    assert "M=2" in band_label(2) and band_label(2).startswith("Natural variability")

@@ -41,6 +41,7 @@ from .historical import (
     get_historical_obs_global_mean_temp,
     get_historical_obs_sea_ice_extent,
 )
+from .invert_variability import INVERT_PROXIES, INVERT_VARIABLES, get_area_mean_variability
 from .uncertainty import Z, band_label, combine_series
 from .baseline import REBASED_VARS, get_regional_map, validate_cache_dir
 from .delta import get_regional_delta
@@ -191,6 +192,57 @@ def _line_band(var: str, mot: dict, bands: dict | None, **context) -> dict | Non
         if band is not None:
             return band
     return _member_band(bands, time)
+
+
+def _invert_band(
+    *,
+    var: str,
+    time: np.ndarray,
+    data_dir: Path | None = None,
+    cache_dir: Path | None = None,
+    regional_map: xr.DataArray | None = None,
+    spatial_gdf=None,
+    spatial_item: str | None = None,
+    **_,
+) -> dict | None:
+    """InVERT band source: the lowest and highest of the 20 members' area-mean anomaly, per year.
+
+    The area mean uses the same mask and cos(lat) weights as the line (globe, or the selected
+    region). For tasmin/tasmax each member's year is its coldest/warmest month, centred per
+    grid cell so the offsets still average zero; p-e borrows the pr envelope
+    (:data:`INVERT_PROXIES`). Served from the pre-built caches under ``<cache_dir>/invert/``
+    only: ``None`` when they are missing or stale, so the members' band is drawn instead and
+    nothing is built inside a request (see ``backend.invert_variability.build_caches``).
+    InVERT starts in 1851; a series year before that (tasmin/tasmax history starts in 1850)
+    reuses 1851's offsets. A call without the context to look the caches up (no data_dir,
+    cache_dir or template) also returns ``None``.
+    """
+    if data_dir is None or cache_dir is None or regional_map is None:
+        return None
+    invert_var = INVERT_PROXIES.get(var, var)
+    region_mask = None
+    if spatial_gdf is not None and spatial_item is not None:
+        region_mask = create_mask(
+            regional_map.isel(time=0, drop=True), spatial_gdf[spatial_gdf.name == spatial_item]
+        )
+    area_mean = get_area_mean_variability(
+        invert_var, data_dir, cache_dir, template=regional_map, region_mask=region_mask
+    )
+    if area_mean is None:
+        return None
+    return make_band(
+        area_mean.min("ensemble").reindex(time=time, method="nearest"),
+        area_mean.max("ensemble").reindex(time=time, method="nearest"),
+        label=INVERT_BAND_LABEL,
+        source="invert",
+    )
+
+
+# Both envelopes are presented to users as natural variability: the members' ±Z·σ band for
+# variables without an InVERT emulation, the InVERT members' range for these.
+INVERT_BAND_LABEL = "Natural variability (InVERT, range of 20 members)"
+for _var in (*INVERT_VARIABLES, *INVERT_PROXIES):
+    BAND_SOURCES[_var] = _invert_band
 
 
 def _predict_icefrac_end_to_end(temp_per_model: xr.DataArray, model_dir: Path) -> xr.DataArray:
@@ -1227,7 +1279,7 @@ def get_outputs(
             output_data[var]["mean_over_time"].update(mot_result.bands)
         band = _line_band(
             var, output_data[var]["mean_over_time"], mot_result.bands,
-            data_dir=data_dir, regional_map=regional_map_post,
+            data_dir=data_dir, cache_dir=cache_dir, regional_map=regional_map_post,
             spatial_gdf=spatial_gdf, spatial_item=spatial_item,
         )
         if band is not None:
@@ -1242,7 +1294,6 @@ def get_outputs(
                 data_dir=data_dir,
             )
         )
-
         # The histogram slices the requested decade itself, so give it the FULL projection
         # (2015 onwards) rather than the post-start slice: a decade before the SAI start is
         # then the unmodified projection instead of an empty selection. Identical for every

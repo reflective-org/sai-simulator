@@ -12,6 +12,7 @@ import uuid
 import numpy as np
 import xarray as xr
 import geopandas as gpd
+import rioxarray  # noqa: F401 -- registers the .rio accessor used in create_mask
 from functools import lru_cache
 from scipy.signal import butter, filtfilt
 from pathlib import Path

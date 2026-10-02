@@ -106,6 +106,19 @@ cache_data() {
     print_success "Data caching complete!"
 }
 
+# F2. InVERT variability caches (line-plot envelope). Built here, never inside a
+# dashboard request. The InVERT ensembles are read from the public R2 Zarr store
+# (backend.invert_variability.INVERT_STORE, ~15 GB read once for all four variables;
+# up-to-date caches are not rebuilt). netCDFs under $PROCESSED_DATA_DIR/invert/, if
+# present, are used instead. A variable whose source cannot be read is reported as
+# skipped, and the dashboard falls back to the legacy band for it.
+build_invert_caches() {
+    print_header "Step F2: InVERT Variability Caches"
+
+    python -m backend.invert_variability --data-dir "$PROCESSED_DATA_DIR" --cache-dir "$CACHE_DIR"
+    print_success "InVERT caches step finished (see the per-variable status above)."
+}
+
 # G. Optional API cache pregeneration via a prebuilt Docker image. Skipped
 # unless RUN_API_PREGENERATION_DOCKER=yes (typically via AUTO_PROFILE=ec2).
 run_api_pregeneration_in_docker() {

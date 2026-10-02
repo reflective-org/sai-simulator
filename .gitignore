@@ -184,6 +184,9 @@ model_internal_variability.npy
 # ...except the README's banner, which is committed. Generated figures
 # (e.g. scripts/plot_icefrac_fit.py output) stay ignored.
 !img/preview.png
+# ...and plots living under analysis/ are branch documentation and should be committed.
+!analysis/**/*.png
+!analysis/**/*.svg
 
 # so2 csv generated
 so2_by_latitude_*.csv

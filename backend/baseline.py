@@ -17,6 +17,7 @@ from sklearn.linear_model import LinearRegression
 from fair_wrap.fair_utils import *
 from .constants import *
 from .historical import get_historical_model, get_historical_model_per_model
+from .invert_variability import OUTPUT_START_YEAR, add_variability_to_mean, build_annual_ensemble
 from .utils import clip_to_land
 from .population import get_population_exposure
 from .p_values import get_grid_level_p_values, no_sai_p_values_cache_path
@@ -344,3 +345,62 @@ def get_regional_map(
         )
 
     return regional_map, regional_p_values, regional_map_per_model
+
+
+def get_regional_map_with_variability(
+    var: str,
+    data_dir: Path,
+    model_dir: Path,
+    cache_dir: Path,
+    ssp_scenario: str,
+) -> tuple[xr.DataArray, xr.DataArray]:
+    """Return the full 1851-2100 mean for ``var`` plus the 20-member InVERT variability ensemble.
+
+    ``var`` must be one of :data:`backend.invert_variability.INVERT_VARIABLES` (currently
+    ``"tas"`` and ``"pr"``).
+
+    The mean is built by concatenating the historical CESM ensemble-mean field (1851-2014,
+    from ``output_gauss-baseline.nc``, rebased to the 1850-1900 pre-industrial mean) with
+    the FaIR->SMIP emulator output (2015-2100), giving a smooth ``(time, lat, lon)``
+    trajectory of length 250 in the pre-industrial anomaly frame. For ``pr`` the emulator
+    output is land-only (NaN over ocean), so the ensemble is land-only too.
+
+    The ensemble is ``(ensemble=20, time=250, lat, lon)`` -- the smooth mean broadcast against
+    the InVERT variability ensemble assembled by
+    :func:`backend.invert_variability.build_annual_ensemble`.
+
+    This is the entry point downstream code (e.g. climate-velocity analysis) should call when
+    it needs realized noise trajectories instead of the smooth mean.
+    """
+    regional_map, _, _ = get_regional_map(var, data_dir, model_dir, cache_dir, ssp_scenario)
+
+    historical_model = get_historical_model(var, data_dir, cache_dir)
+    if historical_model is None:
+        raise RuntimeError(
+            f"Historical {var} model is required to build the full 1851-2100 mean but was not found."
+        )
+    historical_rebase = historical_model.sel(time=slice(1850, 1900)).mean("time")
+    historical_rebased = historical_model - historical_rebase
+    # The tasmin/tasmax historical fields start in 1850; InVERT coverage starts in 1851.
+    historical_rebased = historical_rebased.sel(time=slice(OUTPUT_START_YEAR, 2014))
+    field_mean = xr.concat([historical_rebased, regional_map], dim="time")
+
+    variability = build_annual_ensemble(
+        data_dir=data_dir,
+        cache_dir=cache_dir,
+        target_lat=field_mean["lat"].values,
+        target_lon=field_mean["lon"].values,
+        var=var,
+    )
+    field_ensemble = add_variability_to_mean(field_mean, variability)
+    return field_mean, field_ensemble
+
+
+def get_regional_tas_with_variability(
+    data_dir: Path,
+    model_dir: Path,
+    cache_dir: Path,
+    ssp_scenario: str,
+) -> tuple[xr.DataArray, xr.DataArray]:
+    """tas-only alias of :func:`get_regional_map_with_variability` (kept for existing callers)."""
+    return get_regional_map_with_variability("tas", data_dir, model_dir, cache_dir, ssp_scenario)

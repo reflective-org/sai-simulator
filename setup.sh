@@ -80,6 +80,7 @@ main() {
 
     if [ "$USER_CACHE_DATA" = "yes" ]; then
         cache_data
+        build_invert_caches
     else
         print_warning "Skipping data caching."
     fi

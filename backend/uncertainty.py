@@ -110,5 +110,9 @@ def combine_series(
 
 
 def band_label(n_models: int) -> str:
-    """Legend text naming what the band is and how many models are in it."""
-    return f"±2σ internal variability of the multi-model mean, M={n_models}"
+    """Legend text naming what the band is and how many models are in it.
+
+    Presented as "natural variability", the same wording as the InVERT band that replaces
+    it for the variables InVERT emulates (see ``get_outputs.INVERT_BAND_LABEL``).
+    """
+    return f"Natural variability (±2σ internal variability of the multi-model mean, M={n_models})"
