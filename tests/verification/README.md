@@ -1,5 +1,9 @@
 # S3 verification testing (beginner guide)
 
+> Looking for how the reference objects in S3 are produced, rather than how to run against
+> them? See [REGENERATING_GOLDENS.md](REGENERATING_GOLDENS.md). Nothing in this repo creates
+> them — they come from `sai-simulator-api`'s pregeneration run.
+
 This guide shows exactly how to run verification tests with **Celery parallel workers**.
 It includes all required setup steps, including **how to install/start Redis**.
 
@@ -344,3 +348,4 @@ Fork PRs are skipped (secrets are unavailable); only PRs from the same repositor
 | [run_verification_celery.py](run_verification_celery.py) | CLI dispatcher and JSON report |
 | [validate_outputs.py](validate_outputs.py) | `get_outputs`, S3 download, GeoTIFF comparison |
 | [conftest.py](conftest.py) | Pytest fixtures and env documentation |
+| [REGENERATING_GOLDENS.md](REGENERATING_GOLDENS.md) | Where the S3 reference objects come from and how to rebuild them |
