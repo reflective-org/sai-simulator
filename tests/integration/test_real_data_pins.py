@@ -68,8 +68,10 @@ def test_anchor_leverage_split(data_dir):
 
 
 def test_icefrac_historical_is_the_mean_of_the_models(data_dir, scratch_cache):
-    """X1: 1985-2014 September extent CESM 5.55, MIROC 6.11, UKESM 4.89 -> combined 5.52
-    million km^2 (MIROC from the rebuilt ICEFRAC stores; two-model 5.83 before UKESM)."""
+    """X1: 1985-2014 September extent CESM 5.02, MIROC 6.11, UKESM 4.89 -> combined 5.34
+    million km^2 (MIROC from the rebuilt ICEFRAC stores; two-model 5.83 before UKESM).
+    CESM was 5.55 (combined 5.52) while its CAM end-of-interval stamps went uncorrected
+    and its "September" was really August."""
     area = get_area(data_dir)
     combined = get_historical_model("icefrac", data_dir, scratch_cache)
     per_model = get_historical_model_per_model("icefrac", data_dir, scratch_cache)
@@ -78,17 +80,18 @@ def test_icefrac_historical_is_the_mean_of_the_models(data_dir, scratch_cache):
         return float((da.sel(time=slice(1985, 2014)).mean("time").fillna(0) * area).sum())
 
     assert list(per_model.model.values) == MODELS
-    assert extent(per_model.sel(model="CESM2-WACCM")) == pytest.approx(5.55, abs=0.1)
+    assert extent(per_model.sel(model="CESM2-WACCM")) == pytest.approx(5.02, abs=0.1)
     assert extent(per_model.sel(model="MIROC-ES2H")) == pytest.approx(6.11, abs=0.1)
     assert extent(per_model.sel(model="UKESM1-1-LL")) == pytest.approx(4.89, abs=0.1)
-    assert extent(combined) == pytest.approx(5.52, abs=0.1)
+    assert extent(combined) == pytest.approx(5.34, abs=0.1)
 
 
-def test_per_model_historical_windows_differ_by_one_year(data_dir, scratch_cache):
-    """X5: CESM's annual series starts 1851, MIROC's and UKESM's 1850."""
+def test_per_model_historical_windows_all_start_in_1850(data_dir, scratch_cache):
+    """X5, resolved: every model's annual series starts 1850. CESM's used to start 1851,
+    because its uncorrected CAM end-of-interval stamps left 1850 with 11 months."""
     per_model = get_historical_model_per_model("tas", data_dir, scratch_cache)
     years = {m: int(per_model.sel(model=m).dropna("time", how="all").time.min()) for m in MODELS}
-    assert years == {"CESM2-WACCM": 1851, "MIROC-ES2H": 1850, "UKESM1-1-LL": 1850}
+    assert years == {"CESM2-WACCM": 1850, "MIROC-ES2H": 1850, "UKESM1-1-LL": 1850}
 
 
 def test_combined_band_on_real_icefrac_series(data_dir, scratch_cache):

@@ -160,3 +160,164 @@ def test_process_monthly_rejects_unknown_model() -> None:
         pmg.process_monthly(
             var="tas", model="NOPE", output_dir="/tmp/should-not-be-created"
         )
+
+
+# --- CAM end-of-interval time stamps ---------------------------------------
+
+
+def _monthly_da(stamps, *, cam_housekeeping: bool):
+    """Two-year (member-less) monthly DataArray inside a Dataset, CESM-style."""
+    import numpy as np
+    import xarray as xr
+
+    n = len(stamps)
+    ds = xr.Dataset(
+        {"ICEFRAC": (("time", "lat", "lon"), np.arange(n, dtype=float).reshape(n, 1, 1))},
+        coords={"time": stamps, "lat": [80.0], "lon": [0.0]},
+    )
+    if cam_housekeeping:
+        ds["datesec"] = ("time", np.zeros(n, dtype=int))
+    return ds
+
+
+def _cftime_stamps(first_year, first_month, n):
+    import cftime
+
+    out, y, m = [], first_year, first_month
+    for _ in range(n):
+        out.append(cftime.datetime(y, m, 1, calendar="proleptic_gregorian"))
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return out
+
+
+def test_cesm_opts_into_cam_time_fix_and_others_do_not() -> None:
+    assert pmg.MODELS["CESM2-WACCM-MA"]["cam_history_time"] is True
+    assert not pmg.MODELS["MIROC-ES2H"].get("cam_history_time", False)
+    assert not pmg.MODELS["UKESM1-1-LL"].get("cam_history_time", False)
+
+
+def test_cam_stamping_detected_only_with_housekeeping_and_first_of_month() -> None:
+    import cftime
+
+    stamps = _cftime_stamps(2015, 2, 24)  # Jan 2015 stamped 2015-02-01, CAM-style
+    assert pmg._is_cam_end_of_interval_stamping(_monthly_da(stamps, cam_housekeeping=True))
+    # Same stamps without CAM's datesec (e.g. the derived day-count group): no shift.
+    assert not pmg._is_cam_end_of_interval_stamping(_monthly_da(stamps, cam_housekeeping=False))
+    # Mid-month stamps (CESM's CMOR-style historical tasminmax): no shift.
+    mid = [cftime.datetime(t.year, t.month, 16, 12, calendar=t.calendar) for t in stamps]
+    assert not pmg._is_cam_end_of_interval_stamping(_monthly_da(mid, cam_housekeeping=True))
+
+
+def test_store_corrected_at_the_source_is_not_shifted_twice() -> None:
+    # Re-stamped to the month itself but still carrying CAM's datesec: Jan 2015 .. Dec 2016.
+    ds = _monthly_da(_cftime_stamps(2015, 1, 24), cam_housekeeping=True)
+    assert not pmg._is_cam_end_of_interval_stamping(ds)
+    out = pmg._process_member_data(
+        ds["ICEFRAC"], "ICEFRAC", "baseline",
+        shift_back_one_month=pmg._is_cam_end_of_interval_stamping(ds),
+    )
+    # Same true-September values (8 and 20) as the shifted CAM store gives.
+    assert out.dropna("time").values.ravel().tolist() == [8.0, 20.0]
+
+
+def test_cam_stamps_with_an_unexpected_span_raise() -> None:
+    # Starts in March: neither CAM's Feb-Jan nor a corrected Jan-Dec.
+    ds = _monthly_da(_cftime_stamps(2015, 3, 24), cam_housekeeping=True)
+    with pytest.raises(ValueError, match="Cannot tell whether"):
+        pmg._is_cam_end_of_interval_stamping(ds)
+
+
+def test_shifted_cam_baseline_keeps_2015_and_masks_true_september() -> None:
+    # Jan 2015 .. Dec 2016, stamped one month late as the CESM stores are.
+    ds = _monthly_da(_cftime_stamps(2015, 2, 24), cam_housekeeping=True)
+    out = pmg._process_member_data(ds["ICEFRAC"], "ICEFRAC", "baseline", shift_back_one_month=True)
+    years = out.time.dt.year.values
+    assert (years == 2015).sum() == 12 and (years == 2016).sum() == 12
+    # Value i is calendar month i (0 = Jan 2015), so the surviving September values
+    # must be 8 and 20; without the shift they would be 7 and 19 (August).
+    assert out.dropna("time").values.ravel().tolist() == [8.0, 20.0]
+
+
+def test_unshifted_cam_baseline_reproduces_the_old_bug() -> None:
+    ds = _monthly_da(_cftime_stamps(2015, 2, 24), cam_housekeeping=True)
+    out = pmg._process_member_data(ds["ICEFRAC"], "ICEFRAC", "baseline")
+    assert out.dropna("time").values.ravel().tolist() == [7.0, 19.0]
+    assert (out.time.dt.year.values == 2015).sum() == 11
+
+
+# --- Store opening: retry transient errors, never skip a store silently -----
+
+
+class _HTTPError(Exception):
+    """Stand-in for aiohttp.ClientResponseError, which carries ``.status``."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(f"{status}, message='...'")
+        self.status = status
+
+
+def _wrapped(status: int) -> ValueError:
+    # open_xarray_datasets re-raises every failure as ValueError from the original.
+    try:
+        raise ValueError("Failed to open zarr store") from _HTTPError(status)
+    except ValueError as e:
+        return e
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+def test_transient_http_statuses_are_retried(status: int) -> None:
+    assert pmg._is_transient_open_error(_wrapped(status))
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_permanent_http_statuses_are_not_retried(status: int) -> None:
+    assert not pmg._is_transient_open_error(_wrapped(status))
+
+
+def test_open_retries_with_backoff_then_succeeds(monkeypatch) -> None:
+    calls, sleeps = [], []
+
+    def fake_open(url, group=None):
+        calls.append(url)
+        if len(calls) < 3:
+            raise _wrapped(429)
+        return "dataset"
+
+    monkeypatch.setattr(pmg, "open_xarray_datasets", fake_open)
+    out = pmg._open_store_with_retry("u", "g", attempts=5, first_delay_s=2, sleep=sleeps.append)
+    assert out == "dataset"
+    assert len(calls) == 3 and sleeps == [2, 4]
+
+
+def test_open_gives_up_after_last_attempt(monkeypatch) -> None:
+    sleeps = []
+    monkeypatch.setattr(pmg, "open_xarray_datasets", lambda url, group=None: (_ for _ in ()).throw(_wrapped(429)))
+    with pytest.raises(RuntimeError, match="after 3 attempt"):
+        pmg._open_store_with_retry("u", "g", attempts=3, first_delay_s=1, sleep=sleeps.append)
+    assert sleeps == [1, 2]
+
+
+def test_open_does_not_retry_a_permanent_error(monkeypatch) -> None:
+    sleeps = []
+    monkeypatch.setattr(pmg, "open_xarray_datasets", lambda url, group=None: (_ for _ in ()).throw(_wrapped(404)))
+    with pytest.raises(RuntimeError, match="after 1 attempt"):
+        pmg._open_store_with_retry("u", "g", sleep=sleeps.append)
+    assert sleeps == []
+
+
+def test_unopenable_store_fails_the_run_instead_of_being_skipped(monkeypatch, tmp_path) -> None:
+    # The old loop printed "failed to open" and carried on, writing outputs that
+    # silently lacked that experiment.
+    monkeypatch.setattr(pmg, "STORE_OPEN_ATTEMPTS", 2)
+    monkeypatch.setattr(pmg, "STORE_OPEN_FIRST_DELAY_S", 0.0)
+    monkeypatch.setattr(pmg, "open_xarray_datasets", lambda url, group=None: (_ for _ in ()).throw(_wrapped(429)))
+    with pytest.raises(RuntimeError, match="Could not open"):
+        pmg.process_monthly(var="tas", model="CESM2-WACCM-MA", output_dir=tmp_path)
+
+
+def test_store_missing_the_variable_fails_the_run(monkeypatch, tmp_path) -> None:
+    import xarray as xr
+
+    monkeypatch.setattr(pmg, "open_xarray_datasets", lambda url, group=None: xr.Dataset())
+    with pytest.raises(ValueError, match="experiment_missing_vars"):
+        pmg.process_monthly(var="tas", model="CESM2-WACCM-MA", output_dir=tmp_path)

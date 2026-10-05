@@ -6,8 +6,12 @@ Usage:
     mx = open_store("CESM2-WACCM-MA", "baseline", "tasminmax")
 
 What it fixes on read:
-  * CESM stamps each month with the first day of the NEXT month (Jan 2015 is
-    labelled 2015-02-01). We relabel so every model's stamp is the month itself.
+  * CESM groups that are raw CAM history output (Mon/atmos_2d in every
+    experiment, Mon/atmos_2d_tasminmax in baseline and SAI) stamp each month with
+    the first day of the NEXT month (Jan 2015 is labelled 2015-02-01). Those are
+    relabelled so every stamp is the month itself. CESM's Mon/atmos_2d_derived and
+    historical tasminmax are already stamped correctly and are left alone; the
+    rule (see _cam_end_of_interval) is the one scripts/process_monthly_gauss.py uses.
   * Calendars differ (CESM/MIROC mostly proleptic_gregorian, MIROC G6-1.5K noleap,
     UKESM 360_day). For monthly data the day is meaningless, so time is rebuilt
     as numpy datetime64 first-of-month — stores from different models then align
@@ -42,6 +46,25 @@ def store_url(model: str, experiment: str) -> str:
     return f"{BASE}/{model}_{experiment}.zarr"
 
 
+def _cam_end_of_interval(ds: xr.Dataset) -> bool:
+    """True for raw CAM history stamps: CAM's ``datesec`` present, every stamp the
+    1st at 00:00, and the series running Feb-Jan (CESM runs start in January).
+    A Jan-Dec series was corrected at the source and is not shifted again; any
+    other span raises, as in scripts/process_monthly_gauss.py."""
+    if "datesec" not in ds.variables:
+        return False
+    t = ds.time
+    if not bool((t.dt.day == 1).all() and (t.dt.hour == 0).all() and (t.dt.minute == 0).all()):
+        return False
+    span = (int(t.dt.month[0]), int(t.dt.month[-1]))
+    if span == (2, 1):
+        return True
+    if span == (1, 12):
+        return False
+    raise ValueError(f"CAM first-of-month stamps run month {span[0]} to {span[1]}; "
+                     "cannot tell whether they are end-of-interval")
+
+
 def open_store(model: str, experiment: str, group: str = "atmos_2d",
                raw: bool = False) -> xr.Dataset:
     """Lazily open one store/group. raw=True skips all normalization."""
@@ -49,13 +72,15 @@ def open_store(model: str, experiment: str, group: str = "atmos_2d",
                       consolidated=True, use_cftime=True)
     if raw:
         return ds
+    shift = model.startswith("CESM") and _cam_end_of_interval(ds)
     ds = ds[[v for v in ds.data_vars if ds[v].dims == ("member", "time", "lat", "lon")]]
     year = ds.time.dt.year.values
     month = ds.time.dt.month.values
-    if model.startswith("CESM"):  # end-of-month stamping -> step back one month
+    if shift:  # end-of-interval stamping -> step back one month
         month = month - 1
         year = np.where(month == 0, year - 1, year)
         month = np.where(month == 0, 12, month)
     ds = ds.assign_coords(time=pd.to_datetime({"year": year, "month": month, "day": 1}).values)
-    ds.attrs["time_normalized"] = "first-of-month datetime64; CESM shifted back one month"
+    ds.attrs["time_normalized"] = ("first-of-month datetime64; CAM end-of-interval stamps "
+                                   "shifted back one month" if shift else "first-of-month datetime64")
     return ds

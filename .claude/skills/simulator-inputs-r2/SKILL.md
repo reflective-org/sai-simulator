@@ -100,8 +100,18 @@ Each store has three groups, all dims `(member, time, lat, lon)` on the model's
    first day of the *next* month (Jan 2015 → `2015-02-01`, Dec 2099 →
    `2100-01-01`). Verified: raw CESM Arctic sea ice bottoms out on the
    "October" label. With raw stamps, `groupby("time.year")` gives Feb–Jan years
-   and "September" is really August. `simstores.open_store` fixes this; if you
-   use raw `xr.open_zarr`, shift CESM back one month yourself.
+   and "September" is really August. **This is per group, not per model.**
+   Shifted: `Mon/atmos_2d` (every experiment) and `Mon/atmos_2d_tasminmax`
+   (baseline and SAI), which are raw CAM history and still carry CAM's
+   `datesec` variable. Correct as stored: `Mon/atmos_2d_derived` (every
+   experiment) and historical `tasminmax` (mid-month stamps). Verified
+   2026-10-02 by lagged anomaly correlation against TREFHT. `simstores.open_store`
+   applies the same rule as `scripts/process_monthly_gauss.py` (CAM `datesec`
+   present, every stamp the 1st at 00:00, and the series running Feb→Jan — a
+   store corrected at the source would run Jan→Dec and is not shifted again).
+   If you use raw `xr.open_zarr`, shift only those groups back one month yourself.
+   CESM baseline `derived` also ends in a `2100-01` entry that holds a single
+   day (its count maxes at 1); drop it rather than treating it as a month.
 
 2. **Calendars differ across stores.** CESM/most MIROC: proleptic_gregorian.
    MIROC `G6-1.5K-SAI`: noleap. UKESM: 360_day (cftime objects). Raw time coords

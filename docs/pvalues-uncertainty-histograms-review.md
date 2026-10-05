@@ -448,7 +448,7 @@ no-SAI `miroc-only` 0.854 K, `combined` 0.371 K.
 | X2 | `scripts/fit_delta.py` docstring references a `model` dim the pooled fit no longer writes; `backend/delta.py:56-62` carries matching dead code. | **Fixed** (`c03b3f8`). |
 | X3 | `output_data["geotiff_paths"]` / `["image_paths"]` are *assigned* per variable in the loop (`get_outputs.py`), so a multi-variable call keeps only the last variable's paths. The API calls one variable at a time, so it is latent. | **Fixed** (`de7060f`): merged. |
 | X4 | The S3 verification harness has **no numeric tolerance gate** — it passes on any drift (only crashes and shape changes fail). | Documented; out of scope. |
-| X5 | CESM's annual series starts 1851, MIROC's 1850: the "1850–1900" reference is 50 vs 51 years, and the combined rebase drops MIROC's 1850 (≤ 0.07 K at Arctic cells). | Documented; design follow-up. |
+| X5 | CESM's annual series starts 1851, MIROC's 1850: the "1850–1900" reference is 50 vs 51 years, and the combined rebase drops MIROC's 1850 (≤ 0.07 K at Arctic cells). | **Fixed** upstream (#65): CESM's time stamps are corrected on load, so every model starts 1850. |
 | X6 | Artifacts carry latitudes from different sources (`area.nc` vs `correct_lat.npy`) that differ in the last digits; xarray arithmetic between them inner-joins to 125 of 192 latitudes. The backend works in `.values`; the harness pins coordinates. | Documented; a normalization at write time would remove the hazard. |
 
 ### Follow-ups recorded, not done
@@ -476,6 +476,11 @@ the month, so its 1850 has only 11 months and is dropped by the yearly aggregati
 
 Severity: low (single Arctic cells, ~0 in the global mean). Design question for later: pin
 the reference window to years both models have, or fix the CESM 1850 aggregation upstream.
+
+**Resolved (#65).** The root cause was upstream: `process_monthly_gauss` read CESM's CAM
+end-of-interval stamps as-is, which also put CESM's "September" sea ice in August and
+dropped 2015 and each SAI run's 2035. The stamps are now corrected on load, so CESM's
+series runs 1850–2099 like the others and every model's reference window is 1850–1900.
 
 ## Harness
 

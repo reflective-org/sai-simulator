@@ -126,10 +126,11 @@ def reshape_icefrac_data(
     # to maintain separation of concerns.
     subset = dataset[var_name].sel(time=slice(start_year, end_year))
     # No year is dropped here. This used to remove 2015 unconditionally, which
-    # was a compensation for CESM2-WACCM (its processed tas has no 2015 while its
-    # icefrac does). For a model carrying 2015 in BOTH files the drop shifted ice
-    # one year against tas for every later year. _fit_one_model now pairs the two
-    # on their common years instead, which handles CESM without special-casing it.
+    # was a compensation for CESM2-WACCM, whose processed tas lacked 2015 while its
+    # icefrac had it. The root cause was CESM's end-of-interval time stamps, now
+    # corrected on load in process_monthly_gauss, so both files carry 2015. For a
+    # model carrying 2015 in BOTH files the drop shifted ice one year against tas
+    # for every later year. _fit_one_model pairs the two on their common years.
     
     # print(f"Subset shape: {subset.shape}")
     # print(f"Subset time range: {subset.time.values}")
@@ -458,8 +459,8 @@ def _fit_one_model(
         )
 
         # Pair the two on the years BOTH files actually provide. A model's tas and
-        # icefrac files need not cover the same years: CESM2-WACCM's processed tas
-        # has no 2015 while its icefrac does. Aligning explicitly keeps each year's
+        # icefrac files need not cover the same years (incomplete-year drops apply
+        # to tas but not to Sept-only icefrac). Aligning explicitly keeps each year's
         # ice with its own year's temperature; relying on index position would
         # silently regress ice on the previous year's anomaly wherever they differ.
         temp_years = _window_years(

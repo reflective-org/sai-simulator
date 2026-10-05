@@ -22,6 +22,15 @@
 # not shipped, so this folds into it rather than taking a version of its own; the
 # regeneration it requires was already on the list. Merging main also brings
 # the 1995-2014 map display baseline (#53) under this version.
+# Also under v1.5.0: CESM2-WACCM's monthly stamps are corrected on load. Its CAM
+# history groups (Mon/atmos_2d, and Mon/atmos_2d_tasminmax outside historical)
+# stamp each month at the END of its interval, so processing read August as
+# September and built every yearly aggregate over Feb-Jan, which also dropped
+# 1850, 2015 and each SAI run's 2035 as 11-month years. Corrected, CESM's
+# processed Arctic September sea ice falls 1.06 -> 0.45 million km^2 over
+# 2050-2069 (baseline) and the multi-model sigmoid area at +4 K falls
+# 3.27 -> 3.02. Every CESM processed file, fit, cache and golden regenerates;
+# that folds into the v1.5.0 regeneration already pending.
 SIMULATOR_VERSION = "v1.5.0"
 
 # Public Cloudflare R2 location of the per-experiment Zarr training-data

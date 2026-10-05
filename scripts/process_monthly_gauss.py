@@ -12,6 +12,8 @@ merged into the canonical ``output_gauss-*.nc`` files and the model internal var
 
 CLI entry: ``python scripts/process_monthly_gauss.py <var> <data_dir> <output_dir> [--overwrite]``.
 """
+import time
+
 import numpy as np
 import xarray as xr
 import pandas as pd
@@ -123,6 +125,11 @@ var2esm_var = {
 #                     variance where the coverage changes.
 #   compute_variability  whether to emit the dashboard variability artifacts
 #                     (single set, from the primary model only).
+#   cam_history_time  whether the model's stores may carry raw CAM history time
+#                     stamps, which mark the END of each monthly averaging
+#                     interval (January is stamped the first of February). Only
+#                     groups that :func:`_is_cam_end_of_interval_stamping` detects
+#                     are shifted back a month; see that function for the rule.
 MODELS = {
     "CESM2-WACCM-MA": {
         "experiments": [
@@ -139,6 +146,10 @@ MODELS = {
         # ScenarioMIP SSP2-4.5 projection baseline.
         "no_sai_experiments": ("baseline",),
         "experiment_missing_vars": {},
+        # Mon/atmos_2d (every experiment) and Mon/atmos_2d_tasminmax (baseline
+        # and SAI) are CAM history output. Mon/atmos_2d_derived and the
+        # historical tasminmax group are already stamped on the month itself.
+        "cam_history_time": True,
         "compute_variability": True,
     },
     "MIROC-ES2H": {
@@ -264,18 +275,140 @@ def _group_for_var(var: str) -> str:
 _NETCDF_RESERVED_ATTRS = frozenset({"_FillValue", "_ARRAY_DIMENSIONS"})
 
 
+# HTTP statuses worth retrying when opening a store: R2 answers bursts of
+# requests (several processing runs at once) with 429 Too Many Requests.
+_TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+STORE_OPEN_ATTEMPTS = 5
+STORE_OPEN_FIRST_DELAY_S = 15.0
+
+
+def _is_transient_open_error(exc: BaseException) -> bool:
+    """Return ``True`` if ``exc`` (or anything in its cause chain) is worth retrying.
+
+    ``open_xarray_datasets`` re-raises as ``ValueError`` from the original
+    error, so the chain is walked: an aiohttp response error carries
+    ``.status``; timeouts and dropped connections are retried as well.
+    """
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if getattr(exc, "status", None) in _TRANSIENT_HTTP_STATUSES:
+            return True
+        if isinstance(exc, (TimeoutError, ConnectionError)):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+def _open_store_with_retry(
+    zarr_url: str,
+    group: str,
+    attempts: int | None = None,
+    first_delay_s: float | None = None,
+    sleep=None,
+) -> xr.Dataset:
+    """Open one store group, retrying transient errors with exponential backoff.
+
+    Non-transient errors (a 404, a corrupt store) raise at once; a transient
+    one that outlasts every attempt raises too. Either way the caller's run
+    stops rather than carrying on without the experiment. Defaults are read at
+    call time from the module constants so they can be tuned or patched.
+    """
+    attempts = STORE_OPEN_ATTEMPTS if attempts is None else attempts
+    delay = STORE_OPEN_FIRST_DELAY_S if first_delay_s is None else first_delay_s
+    sleep = time.sleep if sleep is None else sleep
+    for attempt in range(1, attempts + 1):
+        try:
+            return open_xarray_datasets(zarr_url, group=group)
+        except Exception as e:
+            if attempt == attempts or not _is_transient_open_error(e):
+                raise RuntimeError(
+                    f"Could not open {zarr_url} (group={group}) after {attempt} "
+                    f"attempt(s): {e}"
+                ) from e
+            print(f"\033[93m   transient error opening store (attempt {attempt}/{attempts}); "
+                  f"retrying in {delay:.0f}s\033[0m")
+            sleep(delay)
+            delay *= 2
+    raise AssertionError("unreachable")
+
+
+def _is_cam_end_of_interval_stamping(ds: xr.Dataset) -> bool:
+    """Return ``True`` if ``ds`` carries raw CAM history monthly time stamps.
+
+    CAM writes each monthly mean at the END of its averaging interval, so
+    January is stamped ``YYYY-02-01 00:00`` and December ``(YYYY+1)-01-01``.
+    A group is a candidate when it still carries CAM's ``datesec`` housekeeping
+    variable and every stamp is midnight on the first of a month. Groups rebuilt
+    from daily data or from CMOR files (CESM's ``Mon/atmos_2d_derived`` and its
+    historical ``Mon/atmos_2d_tasminmax``) are neither and are stamped on the
+    month itself.
+
+    A candidate is shifted only if its stamps also run February to January.
+    Every CESM run starts in January, so that is CAM's signature; a store whose
+    stamps were corrected at the source keeps ``datesec`` and its first-of-month
+    stamps but runs January to December, and must not be shifted a second time.
+    A candidate that runs neither way raises rather than guessing.
+    """
+    if "datesec" not in ds.variables or "time" not in ds.coords:
+        return False
+    t = ds["time"]
+    if not bool(
+        (t.dt.day == 1).all() and (t.dt.hour == 0).all() and (t.dt.minute == 0).all()
+    ):
+        return False
+    first, last = int(t.dt.month[0]), int(t.dt.month[-1])
+    if (first, last) == (2, 1):
+        return True
+    if (first, last) == (1, 12):
+        print("\033[93m   CAM housekeeping present but stamps already run Jan-Dec "
+              "(corrected at the source?) — not shifting\033[0m")
+        return False
+    raise ValueError(
+        f"Cannot tell whether these CAM first-of-month stamps are end-of-interval: they "
+        f"run from month {first} to month {last}, neither Feb-Jan (CAM, shift back one "
+        f"month) nor Jan-Dec (already corrected). Check the store's time axis before "
+        f"processing; see _is_cam_end_of_interval_stamping."
+    )
+
+
+def _shift_time_back_one_month(x: xr.DataArray) -> xr.DataArray:
+    """Relabel every stamp as the first of the previous month (cftime or datetime64)."""
+    year = x.time.dt.year.values
+    month = x.time.dt.month.values - 1
+    year = np.where(month == 0, year - 1, year)
+    month = np.where(month == 0, 12, month)
+    first = x.time.values[0]
+    if x.time.dtype == object:  # cftime stamps: keep the store's own calendar
+        import cftime  # lazy: not in the minimal CI test requirements
+        new_time = [
+            cftime.datetime(int(y), int(m), 1, calendar=first.calendar)
+            for y, m in zip(year, month)
+        ]
+    else:
+        new_time = pd.to_datetime({"year": year, "month": month, "day": 1}).values
+    return x.assign_coords(time=new_time)
+
+
 def _process_member_data(
-    x: xr.DataArray, esm_var: str, exp: str
+    x: xr.DataArray, esm_var: str, exp: str, shift_back_one_month: bool = False
 ) -> xr.DataArray:
-    """Apply per-member processing — time slice, ICEFRAC NH-September mask,
-    unit scaling, ``height`` drop, cftime→datetime64, NetCDF-reserved-attr
-    strip — to one DataArray.
+    """Apply per-member processing — optional CAM end-of-interval time fix,
+    time slice, ICEFRAC NH-September mask, unit scaling, ``height`` drop,
+    cftime→datetime64, NetCDF-reserved-attr strip — to one DataArray.
 
     Used by the Zarr-loading path in :func:`process_monthly`; callers slice
     ``ds[esm_var].sel(member=...)`` and pass the resulting DataArray here.
     Mirrors the per-file branch of :func:`process_file` so downstream
     aggregation and validation see the same shape regardless of source.
+
+    ``shift_back_one_month`` relabels the stamps before anything reads the
+    calendar, so the time slice, the September mask and the yearly resample
+    all see the month the data actually covers.
     """
+    if shift_back_one_month:
+        x = _shift_time_back_one_month(x)
+
     time_range = slice("1850", "2014") if "historical" in exp else slice("2015", "2099")
     x = x.sel(time=time_range)
 
@@ -793,15 +926,20 @@ def _process_model(
             print(f"\033[93m   {exp_label}: {var} not published for this experiment — skipping\033[0m")
             continue
         print(f"   {zarr_url} (group={group})")
-        try:
-            ds = open_xarray_datasets(zarr_url, group=group)
-        except Exception as e:
-            print(f"\033[91m   failed to open: {e}\033[0m")
-            continue
+        # A store that cannot be read is fatal: skipping it would still write the
+        # outputs, silently missing that experiment (a baseline without its
+        # historical merge, or no SAI files at all).
+        ds = _open_store_with_retry(zarr_url, group)
 
         if esm_var not in ds.data_vars:
-            print(f"\033[93m   {esm_var} not present in this store/group — skipping\033[0m")
-            continue
+            raise ValueError(
+                f"{esm_var} is not in {zarr_url} (group={group}). Declare a deliberate "
+                f"absence in experiment_missing_vars for {model_name}/{exp_label}."
+            )
+
+        shift_back = model_cfg.get("cam_history_time", False) and _is_cam_end_of_interval_stamping(ds)
+        if shift_back:
+            print(f"\033[93m   {exp_label}: CAM end-of-interval stamps — shifting back one month\033[0m")
 
         for m_value in ds["member"].values:
             m = str(m_value)
@@ -815,7 +953,9 @@ def _process_model(
                 "member", errors="ignore"
             )
             try:
-                processed = _process_member_data(member_da, esm_var, exp_label)
+                processed = _process_member_data(
+                    member_da, esm_var, exp_label, shift_back_one_month=shift_back
+                )
             except Exception as e:
                 print(f"\033[91m   error processing {exp_label}/{m}: {e}\033[0m")
                 continue
