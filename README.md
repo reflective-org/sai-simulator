@@ -130,6 +130,12 @@ Notes:
   2015 stitch, then confirmed independently by Matthew Henry on 2026-09-24. It
   is documented in the stores' note attrs and is what `--historical-map`
   expects.
+  Cite Mulcahy et al., *UKESM1.1: development and evaluation of an updated
+  configuration of the UK Earth System Model*, Geoscientific Model Development
+  16, 1569–1600 (2023), [doi:10.5194/gmd-16-1569-2023](https://doi.org/10.5194/gmd-16-1569-2023).
+  The [MACLOUD dataset README](https://gws-access.jasmin.ac.uk/public/macloud/README.txt)
+  describes the het-chem variant and related experiment publications; the
+  Mulcahy paper describes the configuration without injected-aerosol het-chem.
 - **UKESM historical sea ice comes from ESGF, for one member.** MACLOUD
   publishes none, but CMIP6 ESGF carries `siconca` for UKESM1-1-LL historical
   `r1i1p1f2` (CEDA node, `v20220512`, atmosphere grid, no regridding needed).

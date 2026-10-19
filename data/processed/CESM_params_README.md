@@ -20,6 +20,13 @@ The file the backend loads is set by `CESM_PARAMS_FILE` in `backend/variable.py`
 `CESM_PARAMS_SHA1` next to it. Update both together: the sha1 keys the saved custom-injection
 outputs, and a unit test checks it matches the file.
 
+## Attribution
+
+Cite Farley et al., *A Climate Intervention Dynamical Emulator (CIDER) for scenario
+space exploration*, Geoscientific Model Development 19, 1809–1831 (2026),
+[doi:10.5194/gmd-19-1809-2026](https://doi.org/10.5194/gmd-19-1809-2026).
+This citation applies to both the original parameters and the September 2026 refit.
+
 ## Layout
 
 - `param_AOD_all` (7, 3): AOD impulse parameters `[beta, alpha, gamma]`, one row per injection
