@@ -1204,9 +1204,10 @@ def _process_model(
         # experiment(s) -- the standalone variability step (scripts/variability.py) derives
         # each model's internal variability from these regridded members -- and tas/icefrac
         # additionally write their SAI experiments, which the icefrac hindcast in that
-        # script trains on.
+        # script trains on. tasmin/tasmax/pr/p-e also write their SAI experiments for the
+        # validation website's SAI-delta SNR stippling (model-validation/build_website.py).
         ds_members_renamed = None
-        if var in ["icefrac", "tas"] or exp in no_sai_experiments:
+        if var in ["icefrac", "tas", "tasmin", "tasmax", "pr", "p-e"] or exp in no_sai_experiments:
             ds_members_renamed = ds_ensemble.rename_vars({esm_var: var})
             if var == "p-e":
                 # Per-member P-E = pr - evap from the matching pr all-members file, so the
