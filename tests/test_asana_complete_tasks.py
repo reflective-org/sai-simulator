@@ -5,6 +5,8 @@ formats and the per-task outcome handling. No network: the HTTP call is
 replaced with a fake.
 """
 
+from pathlib import Path
+
 import pytest
 
 import scripts.asana_complete_tasks as act
@@ -41,6 +43,11 @@ def test_parses_task_links(text, expected):
 )
 def test_ignores_non_task_text(text):
     assert act.find_task_gids(text) == []
+
+
+def test_pr_template_placeholder_is_not_a_task():
+    template = Path(__file__).resolve().parents[1] / ".github" / "pull_request_template.md"
+    assert act.find_task_gids(template.read_text()) == []
 
 
 def test_dedupes_in_order():
