@@ -40,9 +40,8 @@
 #      ./config.sh --url https://github.com/ORG/REPO --token TOKEN --labels sai-simulator-validation
 # 3. Attach an IAM instance profile to EC2 with s3:GetObject on the validation reference prefix
 #    (or configure AWS credentials another way boto3 understands).
-# 4. VALIDATION_S3_PREFIX: most recently created git tag if any; otherwise
-#    .github/validation/self-hosted.env -> VALIDATION_S3_PREFIX_FALLBACK
-#    (set it to match your S3 layout). Optional
+# 4. VALIDATION_S3_PREFIX: .github/validation/self-hosted.env (set it to the golden set the
+#    code should match); only if that is empty, the most recently created git tag. Optional
 #    repository variables: VALIDATION_S3_FILETYPE, VALIDATION_DATA_DIR,
 #    VALIDATION_MODEL_DIR, VALIDATION_CACHE_DIR, VALIDATION_SEED, VALIDATION_DECADE,
 #    VALIDATION_RAMP_UP, VALIDATION_VARIABLES, VALIDATION_EPSILON,
@@ -328,27 +327,25 @@ jobs:
           sys.exit(1)
           PY
 
-      - name: Set VALIDATION_S3_PREFIX from latest git tag or config fallback
+      - name: Set VALIDATION_S3_PREFIX from config or latest git tag
         run: |
           set -euo pipefail
+          # The config file wins: release tags (v1.3.0, ...) can predate the goldens the
+          # code is meant to match, and goldens are regenerated before the next tag.
+          if [ -n "${VALIDATION_S3_PREFIX:-}" ]; then
+            echo "Using VALIDATION_S3_PREFIX=${VALIDATION_S3_PREFIX} (from .github/validation/self-hosted.env)."
+            exit 0
+          fi
           TAG=""
           if [ -d "${GITHUB_WORKSPACE}/.git" ]; then
             TAG="$(git -C "${GITHUB_WORKSPACE}" for-each-ref --sort=-creatordate --format '%(refname:short)' refs/tags | head -n1)"
-          else
-            echo "No .git directory under ${GITHUB_WORKSPACE}; using VALIDATION_S3_PREFIX_FALLBACK if set."
           fi
-          if [ -n "$TAG" ]; then
-            echo "VALIDATION_S3_PREFIX=${TAG}" >> "${GITHUB_ENV}"
-            echo "Using VALIDATION_S3_PREFIX=${TAG} (most recently created tag)."
-            exit 0
-          fi
-          FALLBACK="${VALIDATION_S3_PREFIX_FALLBACK:-}"
-          if [ -z "$FALLBACK" ]; then
-            echo "::error::No git tags and VALIDATION_S3_PREFIX_FALLBACK is empty. Set it in .github/validation/self-hosted.env."
+          if [ -z "$TAG" ]; then
+            echo "::error::VALIDATION_S3_PREFIX is empty and there are no git tags. Set it in .github/validation/self-hosted.env."
             exit 1
           fi
-          echo "VALIDATION_S3_PREFIX=${FALLBACK}" >> "${GITHUB_ENV}"
-          echo "Using VALIDATION_S3_PREFIX=${FALLBACK} (VALIDATION_S3_PREFIX_FALLBACK from .github/validation/self-hosted.env; no tags)."
+          echo "VALIDATION_S3_PREFIX=${TAG}" >> "${GITHUB_ENV}"
+          echo "Using VALIDATION_S3_PREFIX=${TAG} (most recently created tag; self-hosted.env has none)."
 
       - name: Canary Celery validation (1 case)
         env:

@@ -13,10 +13,10 @@ here regenerates them, which is why it is easy to forget where they come from.
 | Consumer | [validate_outputs.py](validate_outputs.py) → `default_s3_key` | `{VALIDATION_S3_PREFIX}/{filetype}/{var}_{no_sai\|with_sai}_{hash}.tif` |
 
 `S3_CACHE_VERSION` has **no** leading `v` (the producer prepends it); `VALIDATION_S3_PREFIX`
-does. The prefix resolves to the most recently created git tag, falling back to
-`VALIDATION_S3_PREFIX_FALLBACK` in [.github/validation/self-hosted.env](../../.github/validation/self-hosted.env).
-The repo normally has no tags, so **the fallback is what actually runs** — and if a tag is
-ever pushed, the newest by `creatordate` silently wins, whatever it is called.
+does. The prefix comes from `VALIDATION_S3_PREFIX` in
+[.github/validation/self-hosted.env](../../.github/validation/self-hosted.env). Only if that is
+empty does the workflow fall back to the most recently created git tag. The config file wins
+because release tags (`v1.3.0`, ...) can predate the goldens the code is meant to match.
 
 The filename hash covers `ssp_scenario`, `temp_target`, both decade years, `start_year`,
 `ramp_up`, and the display baseline period (`base_{DISPLAY_BASELINE_START}_{DISPLAY_BASELINE_END}`).
@@ -79,7 +79,7 @@ SSH. Target bucket: the `VALIDATION_S3_BUCKET` repository secret.
    fork-safe, so parallelism comes from separate processes), then
    `python -m api.scripts.pregenerate_cache`.
 10. **Verify** before believing it — see below.
-11. **Point the harness at the new prefix** via `VALIDATION_S3_PREFIX_FALLBACK`.
+11. **Point the harness at the new prefix** via `VALIDATION_S3_PREFIX` in `self-hosted.env`.
 
 ## Scale and resources
 
