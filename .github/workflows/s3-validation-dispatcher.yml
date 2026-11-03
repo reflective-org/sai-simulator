@@ -1,0 +1,98 @@
+# Deprecated helper workflow. The main self-hosted validation workflow now starts/stops the EC2
+# runner itself on pull requests, which works both before and after merge without cross-workflow
+# dispatch. Keep this file only for ad-hoc manual debugging if needed.
+#
+# Required: repository variable VALIDATION_RUNNER_INSTANCE_ID, secrets VALIDATION_AWS_ROLE_ARN
+# (OIDC) and VALIDATION_GH_TOKEN (for `gh api` / `gh workflow run`). IAM needs
+# ec2:StartInstances, StopInstances, DescribeInstances, DescribeInstanceStatus, CreateTags.
+
+name: S3 validation dispatcher
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  actions: write
+
+concurrency:
+  group: s3-validation-dispatch-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-west-2' }}
+  RUNNER_LABEL: sai-simulator-validation
+  LEASE_MINUTES: "240"
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    env:
+      PR_NUMBER: manual
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.VALIDATION_AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Start runner EC2 and set lease tag
+        env:
+          INSTANCE_ID: ${{ vars.VALIDATION_RUNNER_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$INSTANCE_ID" ]; then
+            echo "::error::Set repository variable VALIDATION_RUNNER_INSTANCE_ID."
+            exit 1
+          fi
+
+          aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null
+          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+          aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
+
+          EXPIRES_AT="$(date -u -d "+${LEASE_MINUTES} minutes" +%s)"
+          aws ec2 create-tags \
+            --resources "$INSTANCE_ID" \
+            --tags \
+              "Key=gh_validation_lease_expires_at,Value=${EXPIRES_AT}" \
+              "Key=gh_validation_repo,Value=${GITHUB_REPOSITORY}" \
+              "Key=gh_validation_pr,Value=${PR_NUMBER}"
+
+      - name: Wait for self-hosted runner online
+        env:
+          GH_TOKEN: ${{ secrets.VALIDATION_GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 36); do
+            RUNNERS_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runners?per_page=100")"
+            ONLINE_COUNT="$(echo "$RUNNERS_JSON" | jq --arg lbl "$RUNNER_LABEL" '[.runners[]? | select(.status == "online") | select([.labels[]?.name] | index($lbl) != null)] | length')"
+            if [ "$ONLINE_COUNT" -ge 1 ]; then
+              echo "Runner with label ${RUNNER_LABEL} is online."
+              exit 0
+            fi
+            echo "Waiting for runner online... attempt ${i}/36"
+            sleep 10
+          done
+          echo "::error::Runner did not come online in time."
+          exit 1
+
+      - name: Trigger validation workflow
+        env:
+          GH_TOKEN: ${{ secrets.VALIDATION_GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh workflow run ".github/workflows/s3-validation-self-hosted.yml" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref "${GITHUB_REF_NAME}"
+
+      - name: Stop EC2 if dispatcher failed after start
+        if: failure()
+        env:
+          INSTANCE_ID: ${{ vars.VALIDATION_RUNNER_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$INSTANCE_ID" ]; then
+            exit 0
+          fi
+          aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null || true

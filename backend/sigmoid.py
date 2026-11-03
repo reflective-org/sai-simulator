@@ -1,18 +1,43 @@
+"""Decreasing-logistic fitting utilities for the icefrac response model.
+
+Provides :func:`logistic` (the four-parameter decreasing logistic used to relate Arctic
+temperature anomalies to sea-ice fraction) together with the :class:`LogisticFitter` driver
+that fits one curve per ``(lon, lat, cell)`` triple and the :class:`LogisticFitResult`
+container used to ship per-cell fit diagnostics back to the orchestrator.
+"""
 import numpy as np
 from scipy.optimize import curve_fit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from dataclasses import dataclass
-from scipy.optimize import curve_fit
 from scipy.special import expit
 
 
-def logistic(x, L, x0, k, b):
+def logistic(
+    x: np.ndarray | float,
+    L: float,
+    x0: float,
+    k: float,
+    b: float,
+) -> np.ndarray | float:
+    """Evaluate the four-parameter decreasing logistic ``b + L * sigmoid(-(x - x0) * k)``.
+
+    Uses :func:`scipy.special.expit` so the sigmoid remains numerically stable for large
+    ``|x - x0| * k``. The minus sign on the exponent makes the curve decreasing for ``k > 0``,
+    matching the temperature → ice-fraction relationship.
+    """
     # expit(z) = 1/(1+exp(-z)) is stable for large |z|
     return b + L * expit(-(x - x0) * k) # minus gives decreasing curve for k>0
 
 @dataclass
 class LogisticFitResult:
+    """Per-cell logistic-fit outcome returned by :meth:`LogisticFitter._fit_one`.
+
+    Carries the grid indices ``(i, j, c)``, the fitted ``params`` (``[L, x0, k, b]``), the
+    error metrics (``rmse``, ``mae``, ``r2``), an ``ok`` flag, and an optional ``error``
+    description when the fit failed (e.g., ``"insufficient_points"`` or a stringified
+    exception).
+    """
     i: int
     j: int
     c: int
@@ -24,7 +49,19 @@ class LogisticFitResult:
     error: str | None = None
 
 class LogisticFitter:
-    def __init__(self, X, Y, dtype=np.float64):
+    """Driver that fits a decreasing logistic to every ``(lon, lat, cell)`` slot in a 4-D grid.
+
+    Owns the input arrays plus pre-allocated output buffers (``params``, ``rmse``, ``mae``,
+    ``r2``) and runs the fits either serially or via a thread pool. Designed so the per-cell
+    work (:meth:`_fit_one`) is trivially parallelizable since each cell is independent.
+    """
+
+    def __init__(
+        self,
+        X: np.ndarray,
+        Y: np.ndarray,
+        dtype: np.dtype = np.float64,
+    ) -> None:
         """
         X: (n_lon, n_lat, n_time)
         Y: (n_lon, n_lat, n_time, n_cells)
@@ -44,7 +81,13 @@ class LogisticFitter:
         self.r2     = np.full((self.n_lon, self.n_lat, self.n_cells), np.nan, dtype=dtype)
 
     @staticmethod
-    def _initial_guess(x, y):
+    def _initial_guess(x: np.ndarray, y: np.ndarray) -> list[float]:
+        """Build a robust starting point ``[L, x0, k, b]`` for :func:`scipy.optimize.curve_fit`.
+
+        ``b`` starts at ``min(y)``, ``L`` at the y-range (floored at ``1e-6`` so the fit isn't
+        born stuck at zero amplitude), ``x0`` at the median of ``x``, and ``k`` at the inverse
+        of ``std(x)`` so the sigmoid's transition width matches the data's x-spread.
+        """
         y_min = float(np.nanmin(y))
         y_max = float(np.nanmax(y))
         b0 = y_min
@@ -54,7 +97,15 @@ class LogisticFitter:
         k0 = 1.0 / (x_std + 1e-6)
         return [L0, x00, k0, b0]
 
-    def _fit_one(self, i, j, c):
+    def _fit_one(self, i: int, j: int, c: int) -> LogisticFitResult:
+        """Fit the logistic for a single ``(i, j, c)`` grid cell and return its diagnostics.
+
+        NaN-masks the per-cell time series, falls back to a no-fit result tagged
+        ``"insufficient_points"`` when fewer than 10 valid samples remain, and otherwise
+        runs a bounded :func:`scipy.optimize.curve_fit` (L ∈ [0, 1], x0 ∈ [min(x), max(x)],
+        k ≥ 0, b ∈ [0, 1]). The ``ok=False`` branch also catches generic exceptions and
+        stores their stringified message so the caller can decide how to surface failures.
+        """
         try:
             y = self.Y[i, j, :, c]
             x = self.X[i, j, :]
@@ -92,7 +143,17 @@ class LogisticFitter:
         except Exception as e:
             return LogisticFitResult(i, j, c, np.full(4, np.nan), np.nan, np.nan, np.nan, False, str(e))
 
-    def fit_all(self, n_jobs=0):
+    def fit_all(
+        self,
+        n_jobs: int = 0,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Fit every ``(i, j, c)`` cell and return the populated ``(params, rmse, mae, r2)`` arrays.
+
+        ``n_jobs == 1`` (or ``0``) runs serially; any other value uses a
+        :class:`concurrent.futures.ThreadPoolExecutor` with ``max_workers=n_jobs`` (or
+        ``None`` for the default when ``n_jobs < 0``). A :mod:`tqdm` progress bar tracks
+        completion in both modes.
+        """
         tasks = [(i, j, c)
                  for i in range(self.n_lon)
                  for j in range(self.n_lat)
@@ -111,7 +172,13 @@ class LogisticFitter:
 
         return self.params, self.rmse, self.mae, self.r2
 
-    def _store_result(self, res: LogisticFitResult):
+    def _store_result(self, res: LogisticFitResult) -> None:
+        """Write a successful fit's params and error metrics into the pre-allocated output buffers.
+
+        Failed fits (``res.ok is False``) are silently dropped so the corresponding cells
+        keep their initial ``NaN`` values; the commented-out ``print`` is retained as a
+        debugging hook.
+        """
         if res.ok:
             self.params[:, res.i, res.j, res.c] = res.params
             self.rmse[res.i, res.j, res.c] = res.rmse

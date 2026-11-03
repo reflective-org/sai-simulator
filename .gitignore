@@ -178,12 +178,62 @@ model_internal_variability.npy
 *.zip
 
 # plots
-*png
+*.png
 *.tif
 *.svg
+# ...except the README's banner, which is committed. Generated figures
+# (e.g. scripts/plot_icefrac_fit.py output) stay ignored.
+!img/preview.png
+# ...and plots living under analysis/ are branch documentation and should be committed.
+!analysis/**/*.png
+!analysis/**/*.svg
 
 # so2 csv generated
 so2_by_latitude_*.csv
 
 # esmf
 esmf/
+
+#terraform/opentofu
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+terraform.tfvars
+terraform.tfvars.json
+terraform.tfvars.json.backup
+terraform.tfvars.json.backup.*
+backend.hcl
+
+#pytest
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.hypothesis/
+.mypy_cache/
+.pytype/
+.pyre/
+.dmypy.json
+dmypy.json
+.pytest_cache/
+
+validation_celery_report.json
+
+# data dirs
+data/raw/
+data/cache/
+data/processed_new/
+data/models/
+# pipeline outputs under data/processed/<var>/ (static inputs at the top level and in
+# geojsons/ and so2/ stay tracked)
+data/processed/*/
+!data/processed/geojsons/
+!data/processed/so2/
+# audit outputs
+figs/
+harness/
+
+# Claude Code: per-user settings and session worktrees (shared skills stay tracked)
+.claude/settings.local.json
+.claude/worktrees/

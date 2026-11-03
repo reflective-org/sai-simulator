@@ -1,0 +1,36 @@
+name: Complete Asana Tasks
+
+on:
+  issues:
+    types: [closed]
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  complete-asana-task:
+    # Merged PRs, and issues closed as completed (not "not planned" / duplicate)
+    if: >-
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true) ||
+      (github.event_name == 'issues' && github.event.issue.state_reason == 'completed')
+    runs-on: ubuntu-24.04
+    steps:
+      # Script comes from the default branch, so only reviewed code sees the token
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: scripts/asana_complete_tasks.py
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Complete linked Asana tasks
+        env:
+          ASANA_PAT: ${{ secrets.ASANA_PAT }}
+          # Passed via env, never interpolated into the command
+          BODY: ${{ github.event.issue.body || github.event.pull_request.body }}
+        run: python scripts/asana_complete_tasks.py

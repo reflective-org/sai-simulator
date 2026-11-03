@@ -16,6 +16,9 @@ botocore==1.41.5
 brotli==1.2.0
 Cartopy==0.25.0
 certifi==2026.1.4
+celery
+# redis-py: Celery 5.x Redis backend imports CredentialProvider (needs redis-py >= ~4.2; pin 5+ for compatibility)
+redis>=5.0.0
 cf-units==3.3.0
 cf_xarray==0.10.10
 cftime==1.6.5
@@ -31,7 +34,10 @@ decorator==5.2.1
 docutils==0.19
 donfig==0.8.1.post1
 executing==2.2.1
+# FaIR climate model: pinned to the exact version previously vendored in fair_wrap/custom_fair
+fair==2.1.3
 fastapi==0.128.0
+ffmpy==1.0.0
 filelock==3.20.2
 fire==0.7.1
 fonttools==4.61.1
@@ -39,6 +45,9 @@ frozenlist==1.8.0
 fsspec==2025.12.0
 geopandas==1.1.2
 google-crc32c==1.8.0
+gradio==5.37.0
+gradio_client==1.10.4
+gradio_imageslider==0.0.20
 groovy==0.1.2
 h11==0.16.0
 hf-xet==1.2.0
@@ -81,10 +90,12 @@ pure_eval==0.2.3
 pyasn1==0.6.1
 pydantic==2.11.10
 pydantic_core==2.33.2
+pydub==0.25.1
 Pygments==2.19.2
 pyogrio==0.12.1
 pyparsing==3.3.1
 pyproj==3.7.2
+pytest==8.4.2
 pyshp==3.0.3
 python-dateutil==2.9.0.post0
 python-multipart==0.0.21
@@ -97,6 +108,7 @@ rioxarray==0.20.0
 rsa==4.7.2
 s3fs==2025.12.0
 s3transfer==0.15.0
+safehttpx==0.1.7
 scikit-learn==1.8.0
 scipy==1.16.3
 scitools-iris==3.14.1
