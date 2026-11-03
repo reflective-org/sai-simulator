@@ -22,8 +22,6 @@ data "aws_ec2_managed_prefix_list" "ec2_instance_connect" {
   name  = "com.amazonaws.${var.aws_region}.ec2-instance-connect"
 }
 
-data "aws_caller_identity" "current" {}
-
 data "aws_vpc" "default" {
   count   = var.vpc_id == null ? 1 : 0
   default = true
@@ -212,11 +210,16 @@ resource "aws_iam_role" "github_actions" {
         }
         Action = "sts:AssumeRoleWithWebIdentity"
         Condition = {
+          # Only the subjects the validation workflows run under: PRs, plus main/public
+          # for the watchdog (schedule/workflow_run) and manual dispatch. Workflows on any
+          # other branch or tag cannot assume this role.
           StringEquals = {
             "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-          }
-          StringLike = {
-            "token.actions.githubusercontent.com:sub" = "repo:${local.github_repo_full_name}:*"
+            "token.actions.githubusercontent.com:sub" = [
+              "repo:${local.github_repo_full_name}:pull_request",
+              "repo:${local.github_repo_full_name}:ref:refs/heads/main",
+              "repo:${local.github_repo_full_name}:ref:refs/heads/public",
+            ]
           }
         }
       }
@@ -267,14 +270,7 @@ resource "aws_iam_role_policy" "github_actions_ec2_control" {
           "ec2:StartInstances",
           "ec2:StopInstances",
         ]
-        Resource = [
-          "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/*",
-        ]
-        Condition = {
-          StringEquals = {
-            "aws:ResourceTag/Project" = local.base_tags["Project"]
-          }
-        }
+        Resource = [aws_instance.runner.arn]
       },
       {
         Sid    = "TagValidationRunner"
@@ -282,13 +278,8 @@ resource "aws_iam_role_policy" "github_actions_ec2_control" {
         Action = [
           "ec2:CreateTags",
         ]
-        Resource = [
-          "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/*",
-        ]
+        Resource = [aws_instance.runner.arn]
         Condition = {
-          StringEquals = {
-            "aws:ResourceTag/Project" = local.base_tags["Project"]
-          }
           "ForAllValues:StringEquals" = {
             "aws:TagKeys" = [
               "gh_validation_lease_expires_at",
