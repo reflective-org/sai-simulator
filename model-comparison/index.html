@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Model Comparison</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  body { margin: 20px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; }
+  h1 { margin: 0 0 16px; font-size: 22px; }
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid #ccc; margin-bottom: 14px; }
+  .tab { background: none; border: 1px solid transparent; border-bottom: none; padding: 8px 16px; font-size: 14px;
+         color: #555; cursor: pointer; margin-bottom: -1px; border-radius: 4px 4px 0 0; }
+  .tab.active { color: #000; font-weight: 600; background: #fff; border-color: #ccc; }
+  .controls { margin-bottom: 10px; display: flex; flex-wrap: wrap; gap: 6px 20px; align-items: center; }
+  .controls label { font-weight: 600; font-size: 14px; }
+  .controls select { padding: 4px 8px; font-size: 14px; margin-left: 6px; }
+  #ts { width: 100%; height: 560px; }
+  #s-note { font-style: italic; }
+  #map.polar { aspect-ratio: 1 / 1; max-width: 760px; }
+  #map { width: 100%; max-width: 1300px; aspect-ratio: 2 / 1; }
+</style>
+</head>
+<body>
+<h1>Model Comparison</h1>
+
+<div class="tabs">
+  <button class="tab" data-tab="global">Global Mean</button>
+  <button class="tab" data-tab="spatial">Spatial Comparison</button>
+</div>
+
+<section id="tab-global" hidden>
+  <div class="controls">
+    <label>Variable:<select id="g-var"></select></label>
+    <label><input type="checkbox" id="g-bands" checked> Uncertainty bands</label>
+    <label><input type="checkbox" id="g-members"> Ensemble members</label>
+    <span id="g-series"></span>
+  </div>
+  <div id="ts"></div>
+</section>
+
+<section id="tab-spatial" hidden>
+  <div class="controls">
+    <label>Variable:<select id="s-var"></select></label>
+    <label>Difference in<select id="s-a" style="margin-right: 6px"></select>compared to<select id="s-b"></select></label>
+  </div>
+  <p id="s-note" hidden></p>
+  <div id="map"></div>
+</section>
+
+<script>
+const MODELS = ['CESM2-WACCM', 'MIROC-ES2H', 'UKESM1-1-LL'];
+// One colour per line (Okabe-Ito, colour-blind safe).
+const MODEL_COLOR = { mmm: '#0072B2', 'CESM2-WACCM': '#D55E00', 'MIROC-ES2H': '#CC79A7', 'UKESM1-1-LL': '#009E73' };
+const C = { obs: '#222222' };
+// Plotted as anomalies against each model's own 1850–1900 mean; the others are absolute values.
+const ANOMALY_VARS = ['tas', 'tasmin', 'tasmax', 'p-e'];
+let SERIES, COAST; const MAPS = {};
+
+const $ = (id) => document.getElementById(id);
+const rgba = (hex, a) => { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; };
+
+function showTab(name) {
+  if (!['global', 'spatial'].includes(name)) name = 'global';
+  document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === name));
+  $('tab-global').hidden = name !== 'global';
+  $('tab-spatial').hidden = name !== 'spatial';
+  if (name === 'global') drawGlobal(); else drawMap();
+}
+
+// ---------- Global Mean ----------
+// Band between lo and hi, split wherever either is missing so gaps stay gaps.
+function bandTraces(time, lo, hi, color, group) {
+  const out = []; let seg = [];
+  const flush = () => {
+    if (seg.length) out.push({ x: [...seg.map((i) => time[i]), ...seg.map((i) => time[i]).reverse()],
+                               y: [...seg.map((i) => hi[i]), ...seg.map((i) => lo[i]).reverse()], fill: 'toself',
+                               fillcolor: rgba(color, 0.15), line: { width: 0 }, hoverinfo: 'skip',
+                               legendgroup: group, showlegend: false });
+    seg = [];
+  };
+  time.forEach((_, i) => { if (lo[i] == null || hi[i] == null) flush(); else seg.push(i); });
+  flush();
+  return out;
+}
+function drawGlobal() {
+  const v = $('g-var').value, s = SERIES.vars[v], T = SERIES.time;
+  const showBands = $('g-bands').checked, showMembers = $('g-members').checked, show = (k) => $(`g-show-${k}`).checked;
+  const traces = [];
+  const LINE_WIDTH = 1.5;
+  // Legend order: models, then the multi-model mean, with observations last.
+  const RANK = { 'CESM2-WACCM': 1, 'MIROC-ES2H': 2, 'UKESM1-1-LL': 3, mmm: 4, obs: 5 };
+  if (s.obs) traces.push({ x: s.obs.time, y: s.obs.values, mode: 'lines', line: { color: C.obs, width: LINE_WIDTH },
+                           name: 'Observations', legendgroup: 'obs', legendrank: RANK.obs });
+  for (const m of MODELS) {
+    const d = s.models[m]; if (!d || !show(m)) continue;
+    // Band: ensemble mean ± 2σ across the model's members (only where it has two or more).
+    if (showBands)
+      traces.push(...bandTraces(T, d.mean.map((y, i) => (y == null || d.sigma[i] == null ? null : y - 2 * d.sigma[i])),
+                                d.mean.map((y, i) => (y == null || d.sigma[i] == null ? null : y + 2 * d.sigma[i])),
+                                MODEL_COLOR[m], m));
+    if (showMembers)
+      for (const vals of Object.values(d.members))
+        traces.push({ x: T, y: vals, mode: 'lines', line: { color: rgba(MODEL_COLOR[m], 0.3), width: LINE_WIDTH },
+                      hoverinfo: 'skip', legendgroup: m, showlegend: false });
+    traces.push({ x: T, y: d.mean, mode: 'lines', line: { color: MODEL_COLOR[m], width: LINE_WIDTH },
+                  name: m, legendgroup: m, legendrank: RANK[m], hovertemplate: `${m}: %{y:.3f}<extra></extra>` });
+  }
+  // Multi-model mean, drawn after the models so it sits on top where they overlap. It only
+  // exists in years every model has; its band is ±2·sqrt(Σσ²)/3 where every model has a σ.
+  if (show('mmm')) {
+    const d = s.mmm;
+    if (showBands)
+      traces.push(...bandTraces(T, d.mean.map((y, i) => (y == null || d.half_band[i] == null ? null : y - d.half_band[i])),
+                                d.mean.map((y, i) => (y == null || d.half_band[i] == null ? null : y + d.half_band[i])),
+                                MODEL_COLOR.mmm, 'mmm'));
+    traces.push({ x: T, y: d.mean, mode: 'lines', line: { color: MODEL_COLOR.mmm, width: LINE_WIDTH },
+                  name: 'Multi-model mean', legendgroup: 'mmm', legendrank: RANK.mmm,
+                  hovertemplate: 'Multi-model mean: %{y:.3f}<extra></extra>' });
+  }
+  const [d0, d1] = s.decade;
+  // The sea-ice line is September Arctic ice area in million km² (fraction × cell area, summed),
+  // labelled as the simulator labels its time series (sai-simulator-fe VAR2INFO.icefrac.full).
+  const label = v === 'icefrac' ? 'Arctic Sea Ice Extent (Million km²)' : s.label;
+  Plotly.react('ts', traces, {
+    margin: { t: 30, r: 10, b: 40, l: 70 }, hovermode: 'x unified',
+    yaxis: { title: label + (ANOMALY_VARS.includes(v) ? ' (vs 1850–1900)' : '') }, xaxis: { title: 'Year' },
+    legend: { orientation: 'h', y: -0.15 }, title: { text: label, font: { size: 15 } },
+    shapes: [
+      { type: 'rect', x0: d0, x1: d1, yref: 'paper', y0: 0, y1: 1, fillcolor: 'rgba(0,0,0,0.05)', line: { width: 0 } },
+    ],
+  }, { responsive: true });
+}
+
+// ---------- Spatial Comparison ----------
+async function loadMap(v) {
+  if (!MAPS[v]) MAPS[v] = await (await fetch(`data/maps_${v}.json`)).json();
+  return MAPS[v];
+}
+// Variable menus: the validation site's order and labels, "name (its variable key)"
+// (model-validation/build_website.py). Its exposure keys are the day-count variables.
+const VAR_MENU = [
+  ['tas', 'Temperature', 'tas'], ['tasmax', 'Max Temperature', 'tasmax'], ['tasmin', 'Min Temperature', 'tasmin'],
+  ['exposure_above_40', 'Extreme Heat Exposure', 'tas_above_40'], ['exposure_above_35', 'Heat Exposure', 'tas_above_35'],
+  ['exposure_below_0', 'Freezing Exposure', 'tas_below_0'], ['p-e', 'Water Availability', 'p-e'],
+  ['exposure_above_20', 'Heavy Rain Exposure', 'pr_above_20'], ['exposure_above_10', 'Rain Exposure', 'pr_above_10'],
+  ['icefrac', 'Sea Ice Extent', 'icefrac'],
+];
+const field = (M, resp) => (resp === 'mmm' ? M.mmm : M.models[resp]);
+// Maps that can't use the last decade, because a model's run stops early.
+const DECADE_NOTES = {
+  'p-e': 'Note: Water availability uses 2075–2084: MIROC-ES2H has no evaporation data after 2084.',
+  tasmin: 'Note: Minimum temperature uses 2060–2069: CESM2-WACCM has no minimum temperature data after 2069.',
+  tasmax: 'Note: Maximum temperature uses 2060–2069: CESM2-WACCM has no maximum temperature data after 2069.',
+};
+function rollLon(lon, Z) { // 0..360 -> -180..180
+  const k = lon.findIndex((x) => x >= 180);
+  return { lon: [...lon.slice(k).map((x) => x - 360), ...lon.slice(0, k)], Z: Z.map((r) => [...r.slice(k), ...r.slice(0, k)]) };
+}
+function areaMean(Z, lat) {
+  let s = 0, w = 0;
+  Z.forEach((row, i) => { const c = Math.cos(lat[i] * Math.PI / 180); row.forEach((x) => { if (x != null) { s += x * c; w += c; } }); });
+  return w ? s / w : NaN;
+}
+function pct(vals, p) {
+  const a = vals.filter((x) => x != null).sort((x, y) => x - y);
+  return a.length ? a[Math.floor(p * (a.length - 1))] : 0;
+}
+const nm = (r) => (r === 'mmm' ? 'Multi-model mean' : r);
+
+// Sea ice is drawn as the simulator draws it: a north polar stereographic disc reaching
+// ≈57°N with 0° longitude at the bottom (sai-simulator-fe features/map/projections.js:
+// +proj=stere +lat_0=90 +lon_0=0, ARCTIC_EXTENT = 3.8e6 m). Spherical formulas.
+const R_EARTH = 6371000, ARCTIC_EXTENT = 3.8e6, POLAR_N = 360;
+const toStereo = (lat, lon) => {
+  const rho = 2 * R_EARTH * Math.tan((90 - lat) * Math.PI / 360), l = lon * Math.PI / 180;
+  return [rho * Math.sin(l), -rho * Math.cos(l)];
+};
+const fromStereo = (x, y) => [90 - (360 / Math.PI) * Math.atan(Math.hypot(x, y) / (2 * R_EARTH)),
+                              ((Math.atan2(x, -y) * 180) / Math.PI + 360) % 360];
+// Resample the lat/lon grid onto a regular grid in projected metres (nearest cell).
+function polarTraces(M, Z, heat) {
+  const xs = Array.from({ length: POLAR_N }, (_, i) => -ARCTIC_EXTENT + ((i + 0.5) * 2 * ARCTIC_EXTENT) / POLAR_N);
+  const dlon = M.lon[1] - M.lon[0], nlon = M.lon.length;
+  const latIdx = (lat) => {
+    let lo = 0, hi = M.lat.length - 1;
+    while (hi - lo > 1) { const m = (lo + hi) >> 1; if (M.lat[m] < lat) lo = m; else hi = m; }
+    return lat - M.lat[lo] < M.lat[hi] - lat ? lo : hi;
+  };
+  const z = [], cd = [];
+  for (const y of xs) {
+    const zr = [], cr = [];
+    for (const x of xs) {
+      if (Math.hypot(x, y) > ARCTIC_EXTENT) { zr.push(null); cr.push(null); continue; }
+      const [lat, lon] = fromStereo(x, y);
+      zr.push(Z[latIdx(lat)][Math.round(lon / dlon) % nlon]);
+      cr.push([lat, lon > 180 ? lon - 360 : lon]);
+    }
+    z.push(zr); cd.push(cr);
+  }
+  const cx = [], cy = [];
+  COAST.lon.forEach((lon, i) => {
+    const lat = COAST.lat[i];
+    const xy = lon == null || lat == null || lat < 50 ? null : toStereo(lat, lon);
+    const inside = xy && Math.hypot(...xy) <= ARCTIC_EXTENT;
+    cx.push(inside ? xy[0] : null); cy.push(inside ? xy[1] : null);
+  });
+  const ring = Array.from({ length: 361 }, (_, k) => (k * Math.PI) / 180);
+  return [
+    { ...heat, x: xs, y: xs, z, customdata: cd,
+      hovertemplate: '%{customdata[0]:.1f}°N, %{customdata[1]:.1f}°E: %{z:.3f}<extra></extra>' },
+    { type: 'scatter', mode: 'lines', x: cx, y: cy, line: { color: '#333', width: 0.7 }, hoverinfo: 'skip', showlegend: false },
+    { type: 'scatter', mode: 'lines', x: ring.map((t) => ARCTIC_EXTENT * Math.cos(t)), y: ring.map((t) => ARCTIC_EXTENT * Math.sin(t)),
+      line: { color: '#999', width: 0.7 }, hoverinfo: 'skip', showlegend: false },
+  ];
+}
+
+// Map colours from the simulator (sai-simulator-fe lib/domain/constants.js, light theme).
+// Temperature: blue = colder, red = warmer. Water availability: brown = drier, blue = wetter.
+const SIM_TAS = ['#053061', '#2166ac', '#4393c3', '#92c5de', '#d1e5f0', '#f7f7f7',
+                 '#fddbc7', '#f4a582', '#d6604d', '#b2182b', '#67001f'];
+const SIM_PE = ['#0006C6', '#0031D7', '#0068E6', '#009FF6', '#22C9FB', '#69DBFF', '#B6EDFC', '#FAFEFB',
+                '#FBF6E1', '#F6F1BF', '#F5EB9A', '#E8CB7E', '#CF9660', '#B55B43', '#A42E2D'].reverse();
+// Colours from negative to positive difference, per variable.
+const DIFF_COLORS = {
+  tas: SIM_TAS, tasmin: SIM_TAS, tasmax: SIM_TAS,
+  exposure_above_35: SIM_TAS, exposure_above_40: SIM_TAS,       // more heat exposure = red
+  exposure_below_0: SIM_TAS.slice().reverse(),                   // more freezing exposure = blue
+  'p-e': SIM_PE, exposure_above_10: SIM_PE, exposure_above_20: SIM_PE,  // wetter = blue
+  icefrac: SIM_TAS.slice().reverse(),                            // more sea ice = blue
+};
+const toColorscale = (cs) => cs.map((c, i) => [i / (cs.length - 1), c]);
+
+async function drawMap() {
+  const v = $('s-var').value, a = $('s-a').value, b = $('s-b').value, scen = 'no_sai';
+  $('s-note').textContent = DECADE_NOTES[v] || '';
+  $('s-note').hidden = !DECADE_NOTES[v];
+  const M = await loadMap(v);
+  const ZA = field(M, a), ZB = field(M, b);
+  const Z = ZA.map((row, i) => row.map((x, j) => (x == null || ZB[i][j] == null ? null : x - ZB[i][j])));
+  // Symmetric scale around zero, sized to the difference itself so disagreements stand out.
+  const zmax = pct(Z.flat().map((x) => (x == null ? null : Math.abs(x))), 0.98) || 1;
+  const scenName = scen === 'no_sai' ? 'No SAI' : 'SAI-1.5';
+  const polar = v === 'icefrac';
+  $('map').classList.toggle('polar', polar);
+  const r = rollLon(M.lon, Z);
+  const heat = { type: 'heatmap', x: r.lon, y: M.lat, z: r.Z, hoverongaps: false,
+                 colorscale: toColorscale(DIFF_COLORS[v]), zmin: -zmax, zmax,
+                 // Sea ice uses the simulator's map legend label (sai-simulator-fe VAR2INFO.icefrac.legendLabel).
+                 colorbar: { title: { text: `Difference: ${v === 'icefrac' ? 'Fraction of ocean covered by ice' : M.label}`, side: 'right' } },
+                 hovertemplate: 'lat %{y:.1f}, lon %{x:.1f}: %{z:.3f}<extra></extra>' };
+  const coast = { type: 'scatter', mode: 'lines', x: COAST.lon, y: COAST.lat, line: { color: '#333', width: 0.7 },
+                  hoverinfo: 'skip', showlegend: false };
+  const E = ARCTIC_EXTENT;
+  const axes = polar ? {
+    xaxis: { visible: false, range: [-E, E], minallowed: -E, maxallowed: E, constrain: 'domain' },
+    yaxis: { visible: false, range: [-E, E], minallowed: -E, maxallowed: E, scaleanchor: 'x', constrain: 'domain' },
+  } : {
+    // min/maxallowed keep panning and zooming out inside the map's edges.
+    xaxis: { title: 'Longitude (°)', range: [-180, 180], minallowed: -180, maxallowed: 180, showgrid: false, zeroline: false },
+    yaxis: { title: 'Latitude (°)', range: [-90, 90], minallowed: -90, maxallowed: 90, showgrid: false, zeroline: false },
+  };
+  await Plotly.react('map', polar ? polarTraces(M, Z, heat) : [heat, coast], {
+    margin: { t: 40, r: 10, b: 50, l: 60 },
+    // Pinch / scroll zooms (scrollZoom below); dragging pans instead of drawing a zoom box.
+    dragmode: 'pan',
+    title: { text: `${nm(a)} − ${nm(b)} (${scenName}): ${M.decade[0]}–${M.decade[1]} mean · area-weighted mean ${areaMean(Z, M.lat).toFixed(3)}`, font: { size: 15 } },
+    ...axes,
+  }, { responsive: true, scrollZoom: true });
+  Plotly.Plots.resize('map'); // the container's shape changes between the world and polar views
+
+}
+
+async function init() {
+  [SERIES, COAST] = await Promise.all(['data/series.json', 'data/coastlines.json'].map(async (u) => (await fetch(u)).json()));
+  for (const id of ['g-var', 's-var'])
+    for (const [k, name, key] of VAR_MENU) $(id).add(new Option(`${name} (${key})`, k));
+  for (const id of ['s-a', 's-b'])
+    for (const [k, t] of [['mmm', 'Multi-model mean'], ...MODELS.map((m) => [m, m])]) $(id).add(new Option(t, k));
+  $('s-a').value = 'CESM2-WACCM'; $('s-b').value = 'mmm';
+  for (const [k, t] of [...MODELS.map((m) => [m, m]), ['mmm', 'Multi-model mean']]) {
+    const l = document.createElement('label');
+    l.innerHTML = `<input type="checkbox" id="g-show-${k}" checked> ${t}`;
+    l.style.marginRight = '14px';
+    $('g-series').append(l);
+    l.querySelector('input').addEventListener('change', drawGlobal);
+  }
+  ['g-var', 'g-bands', 'g-members'].forEach((id) => $(id).addEventListener('change', drawGlobal));
+  ['s-var', 's-a', 's-b'].forEach((id) => $(id).addEventListener('change', drawMap));
+  document.querySelectorAll('.tab').forEach((b) => b.addEventListener('click', () => { location.hash = b.dataset.tab; }));
+  window.addEventListener('hashchange', () => showTab(location.hash.slice(1)));
+  showTab(location.hash.slice(1));
+}
+init();
+</script>
+</body>
+</html>

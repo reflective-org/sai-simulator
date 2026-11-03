@@ -1,36 +1,71 @@
-import fire
+"""Convert raw monthly CESM/GAUSS NetCDF files into the simulator's processed inputs.
+
+Walks the input ``data_dir``, parses each filename into ``(member, experiment)`` via
+:func:`identify_file`, applies variable-specific preprocessing (unit conversion, ICEFRAC
+Sept-only masking, PRECC+PRECL → PRECT pre-step, etc.), bilinearly regrids to the
+1.25°×0.9375° CESM2-WACCM target grid, runs the preprocessing sanity checks from
+:mod:`preprocessing_sanity`, and aggregates monthly data to yearly using the right method
+per variable (sum for cumulative exposure variables, min/max for tasmin/tasmax,
+1850-1900-rebased mean otherwise). The final per-experiment, per-member yearly Datasets are
+merged into the canonical ``output_gauss-*.nc`` files and the model internal variability
+(both global and grid-level) is computed and saved.
+
+CLI entry: ``python scripts/process_monthly_gauss.py <var> <data_dir> <output_dir> [--overwrite]``.
+"""
+import time
+
 import numpy as np
-import xesmf as xe
 import xarray as xr
 import pandas as pd
+# NOTE: ``xesmf`` (and its compiled ESMF/ESMPy backend) is imported lazily
+# inside the two regridding functions below, not at module top. This keeps the
+# module importable — for its ``MODELS`` table, ``var2esm_var`` map, and the
+# ``_group_for_var`` helper — in environments without a compiled ESMF library
+# (e.g. CI unit tests), since regridding is only needed for an actual run.
+# ``fire`` is similarly imported lazily inside the ``__main__`` block below so
+# that unit tests of ``MODELS`` / ``var2esm_var`` / ``_group_for_var`` don't
+# require ``fire`` in the CI environment.
 from tqdm import tqdm
 from pathlib import Path
 from collections import defaultdict
-import re
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Only seen by type checkers, never executed at runtime — keeps the
+    # ``xe.Regridder`` return annotation on ``get_robust_regridder`` valid
+    # without forcing the heavy compiled ESMF dependency at import time.
+    import xesmf as xe
 
 import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from backend.utils import open_xarray_datasets, save_processed_data
+from version import ZARR_STORES_URI
+from scripts.preprocessing_sanity import (
+    SanityCheckError,
+    build_monthly_cell_bounds,
+    validate_monthly_cell_bounds,
+    validate_no_nans,
+    validate_no_negative_values,
+    validate_year_continuity_strict,
+    validate_year_continuity_with_max_gap,
+    validate_variable_specific_ranges,
+    validate_year_count_for_experiment,
+)
 from scripts.variability import process_geojson_variability
 
 
 # --- Configuration --- #
-# Define patterns once for efficiency
-PATTERNS = {
-    # Regex : Experiment Name
-    r"hist": "historical",
-    r"SSP.*DEFAULT": "1.5",
-    r"SSP.*LOWER-0.5": "1.0",
-    r"SSP.*LOWER-1.0": "0.5",
-    r"SSP": "baseline" # Catch-all for SSP if other tags missing
-}
 
 # Define unit conversion factors here for easy maintenance
 UNIT_SCALERS = {
     "PRECT": 86400 * 1000,   # m/s -> mm/day
     "QFLX": 86400,         # kg/m2/s -> mm/day
 }
+
+# Largest allowed jump in calendar ``time`` (years) after hist + SSP245 merge.
+# Incomplete-year drops can leave multi-year holes at the 2014/2015 seam (e.g. gap 7).
+MERGED_HIST_BASELINE_MAX_YEAR_GAP = 10
 
 # Map user variables to aggregation methods
 AGGREGATION_RULES = {
@@ -56,194 +91,356 @@ var2esm_var = {
         "icefrac": "ICEFRAC",
     }
 
+# Per-model processing config. Each model is processed independently (see
+# process_monthly / _process_model) so its quirks stay isolated.
+#
+# Per model:
+#   experiments       (store URL, internal label) tuples. Internal labels stay
+#                     model-agnostic ("baseline", "historical", "1.5", ...) so
+#                     the baseline-keyed variability/merge logic and the
+#                     experiment-aware validators work the same for every model.
+#                     SAI labels that aren't in EXPECTED_YEARS_BY_EXPERIMENT
+#                     (e.g. "g6-1.5") simply skip the year-count check.
+#   model_coord       value written to the output `model` coord.
+#   output_suffix     appended to output filenames so models don't collide
+#                     (empty for CESM so its filenames are unchanged).
+#   has_historical    whether a historical experiment exists — gates the
+#                     hist+baseline merge and the historical-derived cell bounds.
+#   no_sai_experiments  the model's no-SAI reference experiment label(s). The
+#                     historical run is stitched into each of them, and each
+#                     supplies the upper cell bound. A model can publish two:
+#                     MIROC's GeoMIP ``baseline`` is the run its G6 experiments
+#                     branched from (the SAI-delta rebase reference, pinned in
+#                     fit_delta.ANCHORS), while ``ssp245`` is the ScenarioMIP run
+#                     the climate-change-only emulator trains on (pinned in
+#                     backend.constants.REGIONAL_MODEL2PROJECTION_BASELINE_FILES).
+#   experiment_missing_vars  per-experiment variables the store does not publish,
+#                     skipped up front rather than failing member-by-member.
+#                     Nothing uses it at present: UKESM's historical QFLX and
+#                     ICEFRAC, the one live case, now come from CMIP6 ESGF.
+#   variable_members  per-VARIABLE member restriction, applied in every
+#                     experiment. Used where a variable is backed by a source
+#                     that covers fewer members than the store, so that the
+#                     series stays on one realization instead of stepping its
+#                     variance where the coverage changes.
+#   compute_variability  whether to emit the dashboard variability artifacts
+#                     (single set, from the primary model only).
+#   cam_history_time  whether the model's stores may carry raw CAM history time
+#                     stamps, which mark the END of each monthly averaging
+#                     interval (January is stamped the first of February). Only
+#                     groups that :func:`_is_cam_end_of_interval_stamping` detects
+#                     are shifted back a month; see that function for the rule.
+MODELS = {
+    "CESM2-WACCM-MA": {
+        "experiments": [
+            (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_baseline.zarr",   "baseline"),
+            (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_historical.zarr", "historical"),
+            (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_1.5K-SAI.zarr",   "1.5"),
+            (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_1.0K-SAI.zarr",   "1.0"),
+            (f"{ZARR_STORES_URI}/CESM2-WACCM-MA_0.5K-SAI.zarr",   "0.5"),
+        ],
+        "model_coord": "CESM2-WACCM",
+        "output_suffix": "",
+        "has_historical": True,
+        # CESM's single baseline run is both the GAUSS branch point and the
+        # ScenarioMIP SSP2-4.5 projection baseline.
+        "no_sai_experiments": ("baseline",),
+        "experiment_missing_vars": {},
+        # Mon/atmos_2d (every experiment) and Mon/atmos_2d_tasminmax (baseline
+        # and SAI) are CAM history output. Mon/atmos_2d_derived and the
+        # historical tasminmax group are already stamped on the month itself.
+        "cam_history_time": True,
+        "compute_variability": True,
+    },
+    "MIROC-ES2H": {
+        "experiments": [
+            (f"{ZARR_STORES_URI}/MIROC-ES2H_baseline.zarr",    "baseline"),
+            (f"{ZARR_STORES_URI}/MIROC-ES2H_ssp245.zarr",      "ssp245"),
+            (f"{ZARR_STORES_URI}/MIROC-ES2H_historical.zarr",  "historical"),
+            (f"{ZARR_STORES_URI}/MIROC-ES2H_G6-1.5K-SAI.zarr", "g6-1.5"),
+            (f"{ZARR_STORES_URI}/MIROC-ES2H_G6-0.5K-SAI.zarr", "g6-0.5"),
+        ],
+        "model_coord": "MIROC-ES2H",
+        "output_suffix": "-miroc",
+        "has_historical": True,
+        # Two distinct SSP2-4.5 realizations: the GeoMIP ``baseline`` the G6 runs
+        # branched from (SAI-delta rebase reference) and the ScenarioMIP ``ssp245``
+        # run (projection baseline; 2015-2100, continuous with historical). The
+        # ssp245 store's QFLX is filled from the G6 baseline run's hfls over
+        # 2020-2084 only (NaN elsewhere — see the array's note attr), so ssp245
+        # p-e covers 65 years; its ICEFRAC is regridded from the run's own CMOR
+        # siconc (full 2015-2100 — see that array's note attr).
+        "no_sai_experiments": ("baseline", "ssp245"),
+        "experiment_missing_vars": {},
+        "compute_variability": False,
+    },
+    "UKESM1-1-LL": {
+        "experiments": [
+            (f"{ZARR_STORES_URI}/UKESM1-1-LL_baseline.zarr",    "baseline"),
+            (f"{ZARR_STORES_URI}/UKESM1-1-LL_historical.zarr",  "historical"),
+            (f"{ZARR_STORES_URI}/UKESM1-1-LL_G6-1.5K-SAI.zarr", "g6-1.5"),
+        ],
+        "model_coord": "UKESM1-1-LL",
+        "output_suffix": "-ukesm",
+        "has_historical": True,
+        # One het-chem SSP2-4.5 run (2015-2100, MACLOUD) is both the G6 branch
+        # point and the projection baseline — CESM-style single no-SAI run.
+        "no_sai_experiments": ("baseline",),
+        # MACLOUD publishes neither sea ice nor evaporative flux for the
+        # historical suites, but CMIP6 ESGF publishes both (siconca and hfls; see
+        # the store's PARTIAL note attrs), so nothing is missing for any
+        # experiment and both series stitch like any other variable.
+        "experiment_missing_vars": {},
+        # ESGF publishes both for ONE member, the run this store calls r3. Using
+        # r3 alone in every experiment keeps each series on a single realization:
+        # a three-member mean after 2015 and a one-member series before it would
+        # step the variance at the stitch, and the sea-ice sigmoid trains on
+        # exactly that series. tas stays a three-member mean, so the fit pairs a
+        # single-member record against an ensemble-mean temperature — the forced
+        # response both sides share is what it fits.
+        #
+        # For p-e this restricts the QFLX term ONLY. p-e is assembled below as
+        # (this model's pr output) - QFLX, and that pr file stays a three-member
+        # mean, so p-e pairs ensemble-mean precipitation with single-member
+        # evaporation. That is deliberate rather than an oversight: both terms are
+        # uniform across the 2015 stitch so there is no seam, and the three-member
+        # mean is the better estimate of forced pr. It does mean p-e is not
+        # "r3 throughout" in the way icefrac is.
+        "variable_members": {"icefrac": ("r3",), "p-e": ("r3",)},
+        "compute_variability": False,
+    },
+}
+
+# Zarr group per variable family: cumulative exposure counts live under
+# atmos_2d_derived; daily extremes under atmos_2d_tasminmax; everything else
+# in the main atmos_2d group.
+_VAR_TO_GROUP = {
+    "tasmin":       "Mon/atmos_2d_tasminmax",
+    "tasmax":       "Mon/atmos_2d_tasminmax",
+    "tas_above_35": "Mon/atmos_2d_derived",
+    "tas_above_40": "Mon/atmos_2d_derived",
+    "tas_below_0":  "Mon/atmos_2d_derived",
+    "pr_above_10":  "Mon/atmos_2d_derived",
+    "pr_above_20":  "Mon/atmos_2d_derived",
+}
+
 # --- Helper Functions --- #
 
+
+def _dataarray_to_single_var_dataset(da: xr.DataArray, name: str) -> xr.Dataset:
+    """Wrap a DataArray as a single-variable Dataset, renaming to ``name`` if needed.
+
+    Used at the boundary between :mod:`xarray` operations that strip variable names (e.g.
+    arithmetic) and downstream code that addresses the variable by name.
+    """
+    if da.name != name:
+        da = da.rename(name)
+    return da.to_dataset()
+
+
+def _ensure_regridded_ensemble_dataset(
+    obj: xr.DataArray | xr.Dataset, esm_var: str
+) -> xr.Dataset:
+    """``xr.concat`` on DataArrays can return a DataArray; downstream expects a Dataset."""
+    if isinstance(obj, xr.Dataset):
+        return obj
+    return _dataarray_to_single_var_dataset(obj, esm_var)
+
+
 # Helper to check if a variable is cumulative (like "days above 30C")
-def is_cumulative(var_name):
+def is_cumulative(var_name: str) -> bool:
+    """Return ``True`` for cumulative exposure variables (``*_above_*`` / ``*_below_*``).
+
+    These are summed across the year in :func:`get_yearly_aggregate`; everything else
+    falls through to the mean/min/max rules.
+    """
     return "above" in var_name or "below" in var_name
 
-def identify_file(filename):
-    """Parses a filename to find member ID and experiment type."""
-    
-    # Extract Member ID
-    member_match = re.search(r'\.(\d{3})\.', filename)
-    if not member_match:
-        return None, None
-    member = member_match.group(1)
+def _group_for_var(var: str) -> str:
+    """Return the Zarr group path for ``var``.
 
-    # Identify Experiment
-    # Iterate through patterns; return the first one that matches
-    for pattern, exp_name in PATTERNS.items():
-        if re.search(pattern, filename, re.IGNORECASE):
-            return member, exp_name
-            
-    return member, None
-
-
-def process_file(path: Path, var_name: str, exp: str):
+    Variable families live in different subgroups of each store: cumulative
+    exposure counts (``tas_above_*``, ``pr_above_*``, ``tas_below_*``) in
+    ``Mon/atmos_2d_derived``; sub-daily extremes (``tasmin``/``tasmax``) in
+    ``Mon/atmos_2d_tasminmax``; the main monthly fields in ``Mon/atmos_2d``.
     """
-    Loads a file, slices time, converts units, and applies masks.
-    Returns the processed DataArray or None if error.
+    return _VAR_TO_GROUP.get(var, "Mon/atmos_2d")
+
+
+# Attrs that the Zarr stores carry (xarray reads them straight into .attrs)
+# but that NetCDF treats as reserved or as a zarr-only convention. Leaving
+# them in place causes ``to_netcdf`` to fail with
+# ``NetCDF: String match to name in use`` because ``_FillValue`` collides
+# with xarray's own encoding-driven handling.
+_NETCDF_RESERVED_ATTRS = frozenset({"_FillValue", "_ARRAY_DIMENSIONS"})
+
+
+# HTTP statuses worth retrying when opening a store: R2 answers bursts of
+# requests (several processing runs at once) with 429 Too Many Requests.
+_TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+STORE_OPEN_ATTEMPTS = 5
+STORE_OPEN_FIRST_DELAY_S = 15.0
+
+
+def _is_transient_open_error(exc: BaseException) -> bool:
+    """Return ``True`` if ``exc`` (or anything in its cause chain) is worth retrying.
+
+    ``open_xarray_datasets`` re-raises as ``ValueError`` from the original
+    error, so the chain is walked: an aiohttp response error carries
+    ``.status``; timeouts and dropped connections are retried as well.
     """
-    try:
-        # Load Data
-        ds = open_xarray_datasets(path, decode_times=True)
-        x = ds[var_name]
-
-        # Time Slicing
-        # Select date range based on experiment type
-        time_range = slice("1850", "2014") if "historical" in exp else slice("2015", "2099")
-        x = x.sel(time=time_range)
-
-        # Special Logic: ICEFRAC (Northern Hemisphere September)
-        if var_name == "ICEFRAC":
-            # Mask data: Keep North & Sept, set others to NaN
-            # Note: drop=False maintains the original time index shape
-            is_sept_north = (x.lat > 0) & (x.time.dt.month == 9)
-            x = x.where(is_sept_north, np.nan)
-
-        # Unit Conversion
-        if var_name in UNIT_SCALERS:
-            x = x * UNIT_SCALERS[var_name]
-
-        # Cleanup
-        if 'height' in x.coords:
-            x = x.drop_vars('height')
-            
-        # Standardize Time Format (cftime -> datetime64)
-        # Using a safe cast that handles the 'noleap' calendar within pandas range
-        if x.indexes['time'].dtype == 'O': # Check if object/cftime
-            x['time'] = x['time'].values.astype("datetime64[s]").astype("datetime64[ns]")
-             
-        return x
-
-    except Exception as e:
-        print(f"\n\033[91mError processing {path.name}: {e}\033[0m")
-        return None
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if getattr(exc, "status", None) in _TRANSIENT_HTTP_STATUSES:
+            return True
+        if isinstance(exc, (TimeoutError, ConnectionError)):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
 
 
-def pair_precc_precl_files(data_dir, prect_member2paths):
+def _open_store_with_retry(
+    zarr_url: str,
+    group: str,
+    attempts: int | None = None,
+    first_delay_s: float | None = None,
+    sleep=None,
+) -> xr.Dataset:
+    """Open one store group, retrying transient errors with exponential backoff.
+
+    Non-transient errors (a 404, a corrupt store) raise at once; a transient
+    one that outlasts every attempt raises too. Either way the caller's run
+    stops rather than carrying on without the experiment. Defaults are read at
+    call time from the module constants so they can be tuned or patched.
     """
-    Pairs PRECC and PRECL files from data_dir and populates prect_member2paths.
-    
-    Args:
-        data_dir (Path): The directory containing the NetCDF files.
-        prect_member2paths (dict): A dictionary (preferably defaultdict(list)) to store the pairs.
-                                   Structure: {member_id: [(path_c, path_l), ...]}
+    attempts = STORE_OPEN_ATTEMPTS if attempts is None else attempts
+    delay = STORE_OPEN_FIRST_DELAY_S if first_delay_s is None else first_delay_s
+    sleep = time.sleep if sleep is None else sleep
+    for attempt in range(1, attempts + 1):
+        try:
+            return open_xarray_datasets(zarr_url, group=group)
+        except Exception as e:
+            if attempt == attempts or not _is_transient_open_error(e):
+                raise RuntimeError(
+                    f"Could not open {zarr_url} (group={group}) after {attempt} "
+                    f"attempt(s): {e}"
+                ) from e
+            print(f"\033[93m   transient error opening store (attempt {attempt}/{attempts}); "
+                  f"retrying in {delay:.0f}s\033[0m")
+            sleep(delay)
+            delay *= 2
+    raise AssertionError("unreachable")
+
+
+def _is_cam_end_of_interval_stamping(ds: xr.Dataset) -> bool:
+    """Return ``True`` if ``ds`` carries raw CAM history monthly time stamps.
+
+    CAM writes each monthly mean at the END of its averaging interval, so
+    January is stamped ``YYYY-02-01 00:00`` and December ``(YYYY+1)-01-01``.
+    A group is a candidate when it still carries CAM's ``datesec`` housekeeping
+    variable and every stamp is midnight on the first of a month. Groups rebuilt
+    from daily data or from CMOR files (CESM's ``Mon/atmos_2d_derived`` and its
+    historical ``Mon/atmos_2d_tasminmax``) are neither and are stamped on the
+    month itself.
+
+    A candidate is shifted only if its stamps also run February to January.
+    Every CESM run starts in January, so that is CAM's signature; a store whose
+    stamps were corrected at the source keeps ``datesec`` and its first-of-month
+    stamps but runs January to December, and must not be shifted a second time.
+    A candidate that runs neither way raises rather than guessing.
     """
-    print(f"Scanning {data_dir} for file pairs...")
-
-    # 1. Gather files and create "Canonical Keys"
-    # The key is the filename with the variable removed, e.g., 'case.h0..2000-01.nc'
-    files_c = {f.name.replace('PRECC', ''): f for f in data_dir.glob("*.h0.PRECC*.nc")}
-    files_l = {f.name.replace('PRECL', ''): f for f in data_dir.glob("*.h0.PRECL*.nc")}
-
-    # 2. Use Sets to find matches and orphans
-    keys_c = set(files_c.keys())
-    keys_l = set(files_l.keys())
-
-    valid_keys = sorted(list(keys_c & keys_l)) # Intersection (Both exist)
-    missing_l = keys_c - keys_l                # In C but not L
-    missing_c = keys_l - keys_c                # In L but not C
-
-    # 3. Process the Valid Pairs
-    pattern_member = re.compile(r'\.(\d{3})\.')
-    
-    for key in valid_keys:
-        file_c = files_c[key]
-        file_l = files_l[key]
-        
-        # Extract member ID
-        match = pattern_member.search(file_c.name)
-        if match:
-            member = match.group(1)
-            # Append tuple pair
-            prect_member2paths[member].append((file_c, file_l))
-        else:
-            print(f"Skipping {file_c.name}: Could not extract member ID.")
-
-    # 4. Report Results
-    print("-" * 40)
-    print(f"Processing Complete.")
-    print(f"  Valid Pairs Found: {len(valid_keys)}")
-    
-    if missing_l:
-        print(f"\n  [WARNING] {len(missing_l)} files have PRECC but are MISSING PRECL:")
-        for key in sorted(list(missing_l)):
-            print(f"    - {files_c[key].name}")
-
-    if missing_c:
-        print(f"\n  [WARNING] {len(missing_c)} files have PRECL but are MISSING PRECC:")
-        for key in sorted(list(missing_c)):
-            print(f"    - {files_l[key].name}")
-    print("-" * 40)
-
-    return prect_member2paths
+    if "datesec" not in ds.variables or "time" not in ds.coords:
+        return False
+    t = ds["time"]
+    if not bool(
+        (t.dt.day == 1).all() and (t.dt.hour == 0).all() and (t.dt.minute == 0).all()
+    ):
+        return False
+    first, last = int(t.dt.month[0]), int(t.dt.month[-1])
+    if (first, last) == (2, 1):
+        return True
+    if (first, last) == (1, 12):
+        print("\033[93m   CAM housekeeping present but stamps already run Jan-Dec "
+              "(corrected at the source?) — not shifting\033[0m")
+        return False
+    raise ValueError(
+        f"Cannot tell whether these CAM first-of-month stamps are end-of-interval: they "
+        f"run from month {first} to month {last}, neither Feb-Jan (CAM, shift back one "
+        f"month) nor Jan-Dec (already corrected). Check the store's time axis before "
+        f"processing; see _is_cam_end_of_interval_stamping."
+    )
 
 
-def process_and_export_prect_per_file(prect_member2paths, output_dir, overwrite=False):
+def _shift_time_back_one_month(x: xr.DataArray) -> xr.DataArray:
+    """Relabel every stamp as the first of the previous month (cftime or datetime64)."""
+    year = x.time.dt.year.values
+    month = x.time.dt.month.values - 1
+    year = np.where(month == 0, year - 1, year)
+    month = np.where(month == 0, 12, month)
+    first = x.time.values[0]
+    if x.time.dtype == object:  # cftime stamps: keep the store's own calendar
+        import cftime  # lazy: not in the minimal CI test requirements
+        new_time = [
+            cftime.datetime(int(y), int(m), 1, calendar=first.calendar)
+            for y, m in zip(year, month)
+        ]
+    else:
+        new_time = pd.to_datetime({"year": year, "month": month, "day": 1}).values
+    return x.assign_coords(time=new_time)
+
+
+def _process_member_data(
+    x: xr.DataArray, esm_var: str, exp: str, shift_back_one_month: bool = False
+) -> xr.DataArray:
+    """Apply per-member processing — optional CAM end-of-interval time fix,
+    time slice, ICEFRAC NH-September mask, unit scaling, ``height`` drop,
+    cftime→datetime64, NetCDF-reserved-attr strip — to one DataArray.
+
+    Used by the Zarr-loading path in :func:`process_monthly`; callers slice
+    ``ds[esm_var].sel(member=...)`` and pass the resulting DataArray here.
+    Mirrors the per-file branch of :func:`process_file` so downstream
+    aggregation and validation see the same shape regardless of source.
+
+    ``shift_back_one_month`` relabels the stamps before anything reads the
+    calendar, so the time slice, the September mask and the yearly resample
+    all see the month the data actually covers.
     """
-    Reads pairs of PRECC/PRECL files, sums them to PRECT,
-    and exports a SEPARATE file for each pair immediately.
-    If overwrite is False, skip export if file already exists.
-    """
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    
-    for member, file_pairs in prect_member2paths.items():
-        print(f"Processing Member: {member} ({len(file_pairs)} pairs)")
-        
-        for file_c, file_l in file_pairs:
-            try:
-                # Generate Filename before processing, so we can check for existence
-                new_name = file_c.name.replace('PRECC', 'PRECT')
-                final_out_path = output_path / new_name
+    if shift_back_one_month:
+        x = _shift_time_back_one_month(x)
 
-                if final_out_path.exists() and not overwrite:
-                    print(f"  Skipping: {final_out_path.name} (already exists, use overwrite=True to replace)")
-                    continue
+    time_range = slice("1850", "2014") if "historical" in exp else slice("2015", "2099")
+    x = x.sel(time=time_range)
 
-                # Open individual datasets
-                ds_c = open_xarray_datasets(file_c)
-                ds_l = open_xarray_datasets(file_l)
-                
-                # Calculate PRECT
-                prect_sum = ds_c['PRECC'] + ds_l['PRECL']
+    if esm_var == "ICEFRAC":
+        is_sept_north = (x.lat > 0) & (x.time.dt.month == 9)
+        x = x.where(is_sept_north, np.nan)
 
-                # Float32 Optimization
-                if prect_sum.dtype == 'float64':
-                    prect_sum = prect_sum.astype('float32')
+    if esm_var in UNIT_SCALERS:
+        x = x * UNIT_SCALERS[esm_var]
 
-                # Construct Output Dataset
-                ds_total = ds_c.copy()
-                ds_total['PRECT'] = prect_sum
-                
-                # Update attributes
-                ds_total['PRECT'].attrs = ds_c['PRECC'].attrs
-                ds_total['PRECT'].attrs['long_name'] = 'Total Precipitation (PRECC + PRECL)'
-                
-                # Drop original variables
-                ds_total = ds_total.drop_vars(['PRECC', 'PRECL'], errors='ignore')
+    if "height" in x.coords:
+        x = x.drop_vars("height")
 
-                # Export
-                print(f"  Exporting: {final_out_path.name}")
-                
-                encoding = {var: {'zlib': True, 'complevel': 5} for var in ds_total.data_vars}
-                ds_total.to_netcdf(final_out_path, encoding=encoding)
-                
-                # Cleanup immediate memory
-                ds_total.close()
-                ds_c.close()
-                ds_l.close()
-                
-            except Exception as e:
-                print(f"  Error processing pair {file_c.name}: {e}")
-                continue
+    if x.indexes["time"].dtype == "O":
+        x["time"] = x["time"].values.astype("datetime64[s]").astype("datetime64[ns]")
 
-    print("\nAll individual file exports complete.")
+    x.attrs = {k: v for k, v in x.attrs.items() if k not in _NETCDF_RESERVED_ATTRS}
+    for coord_name in x.coords:
+        x[coord_name].attrs = {
+            k: v
+            for k, v in x[coord_name].attrs.items()
+            if k not in _NETCDF_RESERVED_ATTRS
+        }
+
+    return x
 
 
-def get_yearly_aggregate(ds, var_name, esm_var):
+def get_yearly_aggregate(
+    ds: xr.Dataset | xr.DataArray,
+    var_name: str,
+    esm_var: str,
+) -> xr.Dataset | xr.DataArray:
     """
     Resamples data to yearly, applies the correct aggregation, 
     and REPLACES years that do not have full 12-month coverage with NaN.
@@ -323,33 +520,70 @@ def get_yearly_aggregate(ds, var_name, esm_var):
     return filtered_agg
 
 
-def validate_continuity(ds):
+def validate_continuity(ds: xr.Dataset | xr.DataArray) -> None:
     """Asserts that monthly data is continuous (diff is exactly 1 month)."""
     time_diffs = np.diff(ds.time.values.astype("datetime64[M]"))
     one_month = np.timedelta64(1, 'M')
     if not np.all(time_diffs == one_month):
         raise ValueError("\033[91mData is not temporally continuous (missing months detected).\033[0m")
 
-def merge_historical_and_baseline(exp2member2data_combined):
+
+def _combined_monthly_to_dataarray(
+    combined: xr.DataArray | xr.Dataset, esm_var: str
+) -> xr.DataArray:
+    """``combine_by_coords`` on DataArrays often returns a Dataset; downstream expects one variable."""
+    if isinstance(combined, xr.Dataset):
+        if esm_var not in combined.data_vars:
+            names = ", ".join(sorted(combined.data_vars))
+            raise ValueError(
+                f"Combined monthly data is a Dataset but does not contain {esm_var}. "
+                f"Variables present: {names}"
+            )
+        return combined[esm_var]
+    return combined
+
+
+def merge_historical_into(
+    exp2member2data_combined: dict[str, dict[str, xr.Dataset | xr.DataArray]],
+    no_sai_experiments: tuple[str, ...] = ("baseline",),
+) -> None:
     """
-    Merges 'historical' and 'baseline' into a single superset of members.
+    Merges 'historical' into each no-SAI reference experiment, as a superset of members.
+
+    A model can publish more than one no-SAI run — MIROC ships both the GeoMIP
+    ``baseline`` its G6 experiments branched from and the ScenarioMIP ``ssp245`` run —
+    and each needs the full 1850-onwards series its consumer expects (the delta fit
+    rebases against ``baseline``; the projection emulator and the dashboard's historical
+    series read ``ssp245``). The same historical members are therefore stitched into
+    every entry of ``no_sai_experiments``. 'historical' is removed once all are merged.
+    """
+    print("Merging Historical into no-SAI experiments (Superset Mode)...")
+
+    historical_data = exp2member2data_combined.pop('historical', {})
+    if not historical_data:
+        print("  Note: No historical data found. Keeping no-SAI experiments as is.")
+        return
+
+    for exp in no_sai_experiments:
+        if exp not in exp2member2data_combined:
+            # e.g. MIROC p-e/icefrac have no ScenarioMIP output to merge into.
+            print(f"  Note: no {exp} data for this variable — nothing to merge into.")
+            continue
+        print(f"  -> {exp}")
+        _merge_historical_into_one(historical_data, exp2member2data_combined[exp])
+
+
+def _merge_historical_into_one(
+    historical_data: dict[str, xr.Dataset | xr.DataArray],
+    baseline_data: dict[str, xr.Dataset | xr.DataArray],
+) -> None:
+    """Stitch ``historical_data`` into one no-SAI experiment's member dict, in place.
 
     Logic:
     1. Overlapping Members (e.g. Hist 1 & Base 1): Stitched together (1850-2100).
     2. Historical-Only (e.g. Hist 2): kept as is (1850-2014).
     3. Baseline-Only (e.g. Base 7): kept as is (2015-2100).
-
-    The result is stored in 'baseline', and 'historical' is removed.
     """
-    print("Merging Historical and Baseline data (Superset Mode)...")
-
-    historical_data = exp2member2data_combined.pop('historical', {})
-    baseline_data = exp2member2data_combined.setdefault('baseline', {})
-
-    if not historical_data:
-        print("  Note: No historical data found. Keeping baseline as is.")
-        return
-
     # Identify all unique member IDs involved
     hist_ids = set(historical_data.keys())
     base_ids = set(baseline_data.keys())
@@ -418,11 +652,15 @@ def merge_historical_and_baseline(exp2member2data_combined):
     print("-" * 40)
 
 
-def get_robust_regridder(ds_sample, target_grid):
+def get_robust_regridder(
+    ds_sample: xr.Dataset | xr.DataArray,
+    target_grid: xr.Dataset | xr.DataArray,
+) -> "xe.Regridder":
     """
-    Initializes an xesmf regridder. 
+    Initializes an xesmf regridder.
     Includes fallback logic for datasets with malformed lat/lon coordinates.
     """
+    import xesmf as xe  # lazy: see module-top note on the ESMF dependency
     try:
         # Standard initialization
         return xe.Regridder(ds_sample, target_grid, 'bilinear', periodic=True)
@@ -436,7 +674,12 @@ def get_robust_regridder(ds_sample, target_grid):
         return xe.Regridder(ds_fix, target_grid, 'bilinear', periodic=True, ignore_degenerate=True)
 
 
-def compute_and_save_variability(exp2member2data_combined, var_name, output_dir, overwrite=False):
+def compute_and_save_variability(
+    exp2member2data_combined: dict[str, dict[str, xr.Dataset | xr.DataArray]],
+    var_name: str,
+    output_dir: str | Path,
+    overwrite: bool = False,
+) -> tuple[float, xr.DataArray] | None:
     """
     Calculates and saves the model internal variability based on the 'baseline' experiment.
     
@@ -498,7 +741,7 @@ def compute_and_save_variability(exp2member2data_combined, var_name, output_dir,
     print(f"  Internal Variability (std): {std_value:.4f}")
     if out_path.exists() and not overwrite:
         print(f"  File already exists and overwrite is False: {out_path}")
-        print(f"  Skipping export of model internal variability.")
+        print("  Skipping export of model internal variability.")
         return std_value, weights
     print(f"  Saving model internal variability to {out_path}")
     np.save(out_path, std_value)
@@ -579,7 +822,7 @@ def compute_and_save_grid_variability(
     out_path = Path(output_dir) / "grid_level_model_internal_variability.nc"
     if out_path.exists() and not overwrite:
         print(f"  File already exists and overwrite is False: {out_path}")
-        print(f"  Skipping export of grid-level model internal variability.")
+        print("  Skipping export of grid-level model internal variability.")
         return ds_out
     print(f"  Saving grid variability to {out_path}")
     ds_out.to_netcdf(out_path)
@@ -587,91 +830,153 @@ def compute_and_save_grid_variability(
 
 
 # --- Main Function --- #
-def process_monthly(var, data_dir, output_dir, overwrite=False):
+def process_monthly(
+    var: str,
+    data_dir: str | Path = "",
+    output_dir: str | Path = "data/processed",
+    overwrite: bool = False,
+    model: str = "all",
+) -> None:
     """
-    Process monthly Simulator data and calculate model internal variability for each variable.
-    (it does not calculate model internal variability for sea ice. It is done in variability.py)
+    Process monthly Simulator data for one variable, per climate model.
+
+    Each model in :data:`MODELS` is processed independently — its own
+    experiment set, baseline, output-filename suffix and ``model`` metadata
+    coord — so model-specific quirks (MIROC's baseline starts in 2020 leaving
+    a 2015-2019 seam after the historical merge, it runs on a different native
+    grid, etc.) stay isolated. Every model's outputs land in the same
+    ``output_dir/<var>/`` so the fit step can pick them all up.
 
     Args:
-        var: Variable to process
-        data_dir: Directory containing Simulator data
-        output_dir: Directory to save processed data
-        overwrite: Whether to overwrite existing files
+        var: Variable to process.
+        data_dir: Unused. Inputs come from the Zarr stores at
+            :data:`version.ZARR_STORES_URI`. Kept so the existing
+            ``scripts/process_all_monthly.sh`` invocation works unchanged.
+        output_dir: Directory to save processed data.
+        overwrite: Whether to overwrite existing files.
+        model: Which model to process — a key of :data:`MODELS`, or ``"all"``
+            (default) to process every model in turn.
     """
     print(f"var: {var}")
-    print("="*100)
+    print("=" * 100)
 
-    # Validation & Setup
     if var not in var2esm_var:
         raise ValueError(f"\033[91mvar must be one of {list(var2esm_var.keys())}\033[0m")
 
-    data_dir = Path(data_dir)
-    if not data_dir.exists():
-        raise FileNotFoundError(f"\033[91mData directory does not exist: {data_dir}\033[0m")
+    if model == "all":
+        model_names = list(MODELS.keys())
+    elif model in MODELS:
+        model_names = [model]
+    else:
+        raise ValueError(
+            f"\033[91mmodel must be 'all' or one of {list(MODELS.keys())}\033[0m"
+        )
 
     output_dir = Path(output_dir) / var
     output_dir.mkdir(exist_ok=True, parents=True)
-
     esm_var = var2esm_var[var]
-    print(f"--- Processing {var} (Variable: {esm_var}) ---")
 
-    # Special Pre-processing (PRECT)
-    # If PRECT, we must generate the files first so they can be "found" in the next step.
-    if esm_var == "PRECT":
-        prect_out_dir = data_dir / "PRECT"
-        # Check if we actually need to generate them (skip if exists and not overwrite)
-        # For now, assuming we always run the pairing check as it's fast
-        print(">> Pairing PRECC and PRECL files...")
-        prect_member2paths = defaultdict(list)
-        pair_precc_precl_files(data_dir, prect_member2paths)
-        # for member, file_pairs in prect_member2paths.items():
-        #     for file_c, file_l in file_pairs:
-        #         print(f" >>> file_c: {file_c},\n <<< file_l: {file_l}")
-        
-        print(f">> Exporting unified PRECT files to {prect_out_dir}...")
-        process_and_export_prect_per_file(prect_member2paths, prect_out_dir, overwrite)
-        print(">> PRECT generation complete.")
+    for model_name in model_names:
+        print(f"\n--- Processing {var} ({esm_var}) for model {model_name} ---")
+        _process_model(var, esm_var, model_name, MODELS[model_name], output_dir, overwrite)
 
-    # Path Gathering
-    print(">> Scanning for files...")
-    search_pattern = f"*.h0.{esm_var}.*.nc"
-    # Search in main dir AND subdirectory (common for PRECT or organized data)
-    cdf_paths = sorted(data_dir.glob(search_pattern)) + \
-                sorted((data_dir / esm_var).glob(search_pattern))
-    
-    if not cdf_paths:
-        print(f"\033[93mWarning: No files found for {esm_var}\033[0m")
+    print(f"--- Processing {var} Complete ---")
+
+
+def _process_model(
+    var: str,
+    esm_var: str,
+    model_name: str,
+    model_cfg: dict,
+    output_dir: Path,
+    overwrite: bool,
+) -> None:
+    """Process one model's experiment set into per-experiment output files.
+
+    Extracted from the original single-model body; the ``model_cfg`` fields
+    parametrise the model-specific points (which stores + labels to load, the
+    ``model`` coord, the output-filename suffix, whether a historical
+    experiment exists, and whether to emit dashboard variability artifacts).
+    """
+    experiments = model_cfg["experiments"]
+    model_coord = model_cfg["model_coord"]
+    output_suffix = model_cfg["output_suffix"]
+    has_historical = model_cfg["has_historical"]
+    no_sai_experiments = tuple(model_cfg.get("no_sai_experiments", ("baseline",)))
+    experiment_missing_vars = model_cfg.get("experiment_missing_vars", {})
+    variable_members = model_cfg.get("variable_members", {})
+    allowed_members = variable_members.get(var)
+    compute_variability = model_cfg["compute_variability"]
+
+    # Loading from Zarr stores. Each store carries all members for one
+    # experiment under the appropriate Mon/atmos_2d* subgroup; one DataArray
+    # lands per (experiment, member) in exp2member2data.
+    if allowed_members is not None:
+        print(f"\033[93m>> {var}: restricted to member(s) {', '.join(allowed_members)} "
+              f"for {model_name}\033[0m")
+    print(">> Loading Zarr stores …")
+    group = _group_for_var(var)
+    exp2member2data: dict[str, dict[str, list[xr.DataArray]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for zarr_url, exp_label in experiments:
+        if var in experiment_missing_vars.get(exp_label, ()):
+            # Declared absent up front (the store ships an all-NaN placeholder), so
+            # skip it rather than letting every member fail the NaN check.
+            print(f"\033[93m   {exp_label}: {var} not published for this experiment — skipping\033[0m")
+            continue
+        print(f"   {zarr_url} (group={group})")
+        # A store that cannot be read is fatal: skipping it would still write the
+        # outputs, silently missing that experiment (a baseline without its
+        # historical merge, or no SAI files at all).
+        ds = _open_store_with_retry(zarr_url, group)
+
+        if esm_var not in ds.data_vars:
+            raise ValueError(
+                f"{esm_var} is not in {zarr_url} (group={group}). Declare a deliberate "
+                f"absence in experiment_missing_vars for {model_name}/{exp_label}."
+            )
+
+        shift_back = model_cfg.get("cam_history_time", False) and _is_cam_end_of_interval_stamping(ds)
+        if shift_back:
+            print(f"\033[93m   {exp_label}: CAM end-of-interval stamps — shifting back one month\033[0m")
+
+        for m_value in ds["member"].values:
+            m = str(m_value)
+            if allowed_members is not None and m not in allowed_members:
+                # This variable is restricted to a subset of the model's members
+                # (see variable_members in the MODELS entry). Skipping here keeps
+                # the restriction in one place rather than leaving members to fail
+                # a downstream NaN check.
+                continue
+            member_da = ds[esm_var].sel(member=m_value).drop_vars(
+                "member", errors="ignore"
+            )
+            try:
+                processed = _process_member_data(
+                    member_da, esm_var, exp_label, shift_back_one_month=shift_back
+                )
+            except Exception as e:
+                print(f"\033[91m   error processing {exp_label}/{m}: {e}\033[0m")
+                continue
+            exp2member2data[exp_label][m].append(processed)
+
+    if not exp2member2data:
+        print(f"\033[93mNo data loaded for {var} / {model_name} — skipping this model.\033[0m")
         return
-    
-    print(f"   Found {len(cdf_paths)} files.")
-
-    # Loading & Parsing (Member/Exp Organization)
-    exp2member2data = defaultdict(lambda: defaultdict(list))
-    exp2member2paths = defaultdict(lambda: defaultdict(list))
-    
-    for cdf_path in tqdm(cdf_paths, desc="Loading Files"):
-        member, exp = identify_file(cdf_path.name)
-        
-        if not member:
-            print(f"\033[91mSkipping {cdf_path.name}: No member ID found.\033[0m")
-            continue
-        if not exp:
-            print(f"\033[91mSkipping {cdf_path.name}: Unknown experiment.\033[0m")
-            continue
-
-        # Use the cleaner process_file helper from previous steps
-        x_processed = process_file(cdf_path, esm_var, exp)
-        
-        if x_processed is not None:
-            exp2member2data[exp][member].append(x_processed)
-            exp2member2paths[exp][member].append(cdf_path)
-            
 
     # Combination & Aggregation
     print(">> Combining & Aggregating...")
+    # Cell bounds need a historical experiment for the temperature min bound;
+    # models without one skip the check (None == no-op in the validator).
+    monthly_cell_bounds = (
+        build_monthly_cell_bounds(var, exp2member2data, no_sai_experiments)
+        if has_historical
+        else None
+    )
 
-    # Create grid for output (lat/lon)
-    # Get correct latitudes from CESM2-WACCM (center of bounds)
+    # Create grid for output (lat/lon) — the CESM2-WACCM target grid that all
+    # models are regridded onto.
     correct_lat = np.load(output_dir.parent / "correct_lat.npy")
     common_grid = {
         'lon': np.linspace(0, 358.75, 288),
@@ -679,171 +984,316 @@ def process_monthly(var, data_dir, output_dir, overwrite=False):
     }
 
     exp2member2data_combined = defaultdict(lambda: defaultdict(list))
+    year_count_summary = defaultdict(dict)
+    failed_sanity_checks: list[tuple[str, str, str]] = []
+    failed_processing: list[tuple[str, str, str]] = []
     for exp, member2data in tqdm(exp2member2data.items(), desc="Experiments"):
         for member, data_list in member2data.items():
-            # print(f"exp: {exp}")
-            # print(f"member: {member}")
-            # for data in data_list:
-            #     print(f"data.time: {data.time}")
-            # print(f"datalist size: {len(data_list)}")
             try:
                 # A. Combine time steps
-                ds_combined = xr.combine_by_coords(data_list, combine_attrs='drop_conflicts')
-                
+                ds_combined = _combined_monthly_to_dataarray(
+                    xr.combine_by_coords(data_list, combine_attrs="drop_conflicts"),
+                    esm_var,
+                )
+
                 # B. Validation
                 validate_continuity(ds_combined)
+                validate_monthly_cell_bounds(
+                    data=ds_combined,
+                    var_name=var,
+                    exp=exp,
+                    member=member,
+                    bounds=monthly_cell_bounds,
+                    no_sai_experiments=no_sai_experiments,
+                )
 
                 # C. Yearly Aggregation
-                # print(f"  Getting yearly aggregate for {var} experiment: {exp} member: {member} ...")
                 ds_yearly = get_yearly_aggregate(ds_combined, var, esm_var)
 
                 # D. Convert Time Index (Datetime -> Year Integer)
-                # Extract years safely from the datetime index
                 years = ds_yearly.time.dt.year.values
                 ds_yearly = ds_yearly.assign_coords(time=years)
-                
+                year_count_summary[exp][member] = len(ds_yearly.time)
+
+                # E. Sanity check yearly count by experiment type.
+                validate_year_count_for_experiment(
+                    exp=exp,
+                    year_count=year_count_summary[exp][member],
+                    var_name=var,
+                    member=member,
+                )
+                validate_year_continuity_strict(
+                    years=years,
+                    var_name=var,
+                    exp=exp,
+                    member=member,
+                    stage="unmerged yearly continuity",
+                )
+
+                validate_no_nans(
+                    data=ds_yearly,
+                    var_name=var,
+                    exp=exp,
+                    member=member,
+                    stage="yearly aggregation",
+                )
+                validate_no_negative_values(
+                    data=ds_yearly,
+                    var_name=var,
+                    exp=exp,
+                    member=member,
+                    stage="yearly aggregation",
+                )
+                validate_variable_specific_ranges(
+                    data=ds_yearly,
+                    var_name=var,
+                    exp=exp,
+                    member=member,
+                    stage="yearly aggregation",
+                )
+
                 exp2member2data_combined[exp][member] = ds_yearly
 
-                # E. Save (Implementation depends on your specific save needs)
-                # final_path = output_dir / f"{exp}_{member}_{var}.nc"
-                # ds_yearly.to_netcdf(final_path)
-                
+            except SanityCheckError as e:
+                print(f"\033[91mSanity check failed for {exp} member {member}: {e}\033[0m")
+                failed_sanity_checks.append((exp, member, str(e)))
             except Exception as e:
-                print(f"\033[91mError processing {exp} member {member}: {e}\033[0m")
+                print(f"\033[91mIO/parsing error for {exp} member {member}: {e}\033[0m")
+                failed_processing.append((exp, member, str(e)))
 
+    # Print a compact summary of yearly counts to aid debugging.
+    if year_count_summary:
+        print(f"Year-count summary for {var} / {model_name}:")
+        for exp in sorted(year_count_summary.keys()):
+            members = year_count_summary[exp]
+            detail = ", ".join(
+                f"{member}:{members[member]}" for member in sorted(members.keys())
+            )
+            print(f"  - {exp}: {detail}")
+    if failed_sanity_checks:
+        print(
+            f"\033[93mWarning: {len(failed_sanity_checks)} member(s) failed sanity checks:\033[0m"
+        )
+        for exp, member, message in failed_sanity_checks:
+            print(f"  - {exp}/{member}: {message}")
+    if failed_processing:
+        print(
+            f"\033[93mWarning: {len(failed_processing)} member(s) had IO/parsing errors:\033[0m"
+        )
+        for exp, member, message in failed_processing:
+            print(f"  - {exp}/{member}: {message}")
 
-    # output_dir is passed from process_monthly
-    std_value, weights = compute_and_save_variability(exp2member2data_combined, esm_var, output_dir, overwrite)
-    
-    # Compute grid-level model internal variability
-    grid_level_variability = compute_and_save_grid_variability(exp2member2data_combined, var, esm_var, output_dir, overwrite)
+    if not exp2member2data_combined:
+        raise ValueError(
+            f"No valid data remained for {var} / {model_name} after sanity checks. "
+            "See earlier per-member validation errors."
+        )
 
-    # Calcualting regional variability
-    process_geojson_variability(output_dir.parent / "geojsons/original", grid_level_variability, var, weights)
+    baseline_members = exp2member2data_combined.get("baseline", {})
+    if not baseline_members:
+        raise ValueError(
+            f"No valid baseline members remained for {var} / {model_name} after sanity "
+            "checks. Baseline is required."
+        )
 
-    # Stitch Historical + Baseline
-    merge_historical_and_baseline(exp2member2data_combined)
+    # Dashboard variability artifacts — emitted by the primary model only
+    # (single set per variable; secondary models' baselines would overwrite).
+    if compute_variability:
+        variability_result = compute_and_save_variability(
+            exp2member2data_combined, esm_var, output_dir, overwrite
+        )
+        if variability_result is None:
+            raise ValueError(
+                f"Could not compute model internal variability for {var}: baseline unavailable."
+            )
+        std_value, weights = variability_result
+
+        grid_level_variability = compute_and_save_grid_variability(
+            exp2member2data_combined, var, esm_var, output_dir, overwrite
+        )
+        if grid_level_variability is None:
+            raise ValueError(
+                f"Could not compute grid-level variability for {var}: baseline unavailable."
+            )
+
+        process_geojson_variability(
+            output_dir.parent / "geojsons/original", grid_level_variability, var, weights
+        )
+
+    # Stitch Historical + Baseline (only for models that have a historical run).
+    if has_historical:
+        merge_historical_into(exp2member2data_combined, no_sai_experiments)
+        for exp in no_sai_experiments:
+            for member, ds in exp2member2data_combined.get(exp, {}).items():
+                validate_year_continuity_with_max_gap(
+                    years=ds.time.values,
+                    var_name=var,
+                    exp=exp,
+                    member=member,
+                    stage="merged continuity",
+                    max_gap_years=MERGED_HIST_BASELINE_MAX_YEAR_GAP,
+                )
 
     print("Regridding and creating ensemble DataArrays...")
 
     # Initialize Regridder ONCE
+    import xesmf as xe  # lazy: see module-top note on the ESMF dependency
     first_exp = next(iter(exp2member2data_combined.values()))
     first_member_ds = next(iter(first_exp.values()))
-    
-    # We define standard coords just in case we need to force them on everyone
+
+    # Standard coords as a fallback if the native coords confuse xesmf.
     standard_lat = np.linspace(-90, 90, len(first_member_ds.lat))
     standard_lon = np.linspace(0, 360, len(first_member_ds.lon))
-    
-    # Try to build regridder; keep track if we used the fallback
+
     use_coord_fix = False
     try:
         regridder = xe.Regridder(first_member_ds, common_grid, 'bilinear', periodic=True)
     except Exception:
+        # CAUTION: this fallback *forces* a uniform -90..90 / 0..360 grid rather
+        # than repairing broken coordinate metadata. It is safe only when the
+        # source grid really is (near-)uniform with that extent — true for the
+        # CESM2-WACCM grid this was written for. For a model whose native grid
+        # is non-uniform or pole-excluding (e.g. a Gaussian latitude axis), the
+        # forced coords would not match the real cell centers, silently
+        # producing a spatially shifted field that still passes the NaN/range
+        # checks below. If a new model trips this path, verify its grid before
+        # trusting the output (MIROC's 128×256 atmos grid does NOT trip it — the
+        # standard regridder handles its native coords).
         print("\033[93m  Standard regridder failed. Switching to robust mode (forcing coords).\033[0m")
         use_coord_fix = True
-        # Create a temp copy just to build the weights
         ds_fix = first_member_ds.copy()
         ds_fix['lat'] = standard_lat
         ds_fix['lon'] = standard_lon
         regridder = xe.Regridder(ds_fix, common_grid, 'bilinear', periodic=True, ignore_degenerate=True)
 
-    # Process All Experiments
-    final_output_data = {} 
-
+    final_output_data = {}
     for exp, member2data in tqdm(exp2member2data_combined.items(), desc="Regridding Experiments"):
-        
         regridded_members = []
-
         for member, ds in member2data.items():
-            
-            # If we had to fix the regridder, we MUST fix the input data to match it
             if use_coord_fix:
-                ds = ds.copy() # Don't modify original data in the dict
+                ds = ds.copy()
                 ds['lat'] = standard_lat
                 ds['lon'] = standard_lon
 
-            # Apply regridder
             regridded = regridder(ds)
+            validate_no_nans(
+                data=regridded, var_name=var, exp=exp, member=member, stage="regridding",
+            )
+            validate_no_negative_values(
+                data=regridded, var_name=var, exp=exp, member=member, stage="regridding",
+            )
+            validate_variable_specific_ranges(
+                data=regridded, var_name=var, exp=exp, member=member, stage="regridding",
+            )
             regridded = regridded.assign_coords(member=member)
             regridded_members.append(regridded)
 
         if regridded_members:
-            # Concatenate
             ds_ensemble = xr.concat(regridded_members, dim="member", join="outer")
+            ds_ensemble = _ensure_regridded_ensemble_dataset(ds_ensemble, esm_var)
             final_output_data[exp] = ds_ensemble
 
-    print("Regridding complete.")  
-
+    print("Regridding complete.")
     print("Finalizing and saving data...")
-    
-    # Common metadata to add
-    metadata_coords = {
-        "ssp": ["ssp245"],
-        "model": ["CESM2-WACCM"]
-    }
+
+    metadata_coords = {"ssp": ["ssp245"], "model": [model_coord]}
 
     for exp, ds_ensemble in final_output_data.items():
-        
-        # Save "All Members" (for specific variables)
-        # We do this BEFORE averaging so we keep the member dimension
-        if var in ["icefrac", "tas"]:
-            out_path_members = output_dir / f"output_gauss-{exp}-all-members.nc"
-            print(f"  Saving all-members data to {out_path_members.name}...")
-            
-            # Rename variable for consistency before saving
+
+        # Save "All Members" BEFORE averaging. Every variable writes its no-SAI reference
+        # experiment(s) -- the standalone variability step (scripts/variability.py) derives
+        # each model's internal variability from these regridded members -- and tas/icefrac
+        # additionally write their SAI experiments, which the icefrac hindcast in that
+        # script trains on. tasmin/tasmax/pr/p-e also write their SAI experiments for the
+        # validation website's SAI-delta SNR stippling (model-validation/build_website.py).
+        ds_members_renamed = None
+        if var in ["icefrac", "tas", "tasmin", "tasmax", "pr", "p-e"] or exp in no_sai_experiments:
             ds_members_renamed = ds_ensemble.rename_vars({esm_var: var})
-            
-            # Save
+            if var == "p-e":
+                # Per-member P-E = pr - evap from the matching pr all-members file, so the
+                # file holds what its name says (the ensemble-mean path below does the
+                # same). Without the pr file we would be saving evaporation under "p-e".
+                pr_members_path = (
+                    output_dir.parent / "pr" / f"output_gauss-{exp}{output_suffix}-all-members.nc"
+                )
+                if pr_members_path.exists():
+                    with xr.open_dataset(pr_members_path, decode_times=True) as ds_pr_members:
+                        ds_pr_members = ds_pr_members.load()
+                    ds_members_renamed[var] = ds_pr_members["pr"] - ds_members_renamed[var]
+                else:
+                    print(
+                        f"\033[93m  [WARNING] Skipping p-e all-members for {exp}: "
+                        f"missing {pr_members_path}\033[0m"
+                    )
+                    ds_members_renamed = None
+
+        if ds_members_renamed is not None:
+            out_path_members = output_dir / f"output_gauss-{exp}{output_suffix}-all-members.nc"
+            print(f"  Saving all-members data to {out_path_members.name}...")
+            # No NaN check here: icefrac legitimately carries NaNs from the NH-September
+            # mask, and the member/time union (join='outer') can leave NaNs for any
+            # variable. (The negative-value and range guards below still apply.)
+            validate_no_negative_values(
+                data=ds_members_renamed[var], var_name=var, exp=exp,
+                member="all-members", stage="all-members output",
+            )
+            validate_variable_specific_ranges(
+                data=ds_members_renamed[var], var_name=var, exp=exp,
+                member="all-members", stage="all-members output",
+            )
+
             if overwrite or not out_path_members.exists():
                 save_processed_data(ds_members_renamed, out_path_members, overwrite)
             else:
                 print(f"    Skipping (file exists): {out_path_members.name}")
 
         # Compute Ensemble Mean
-        # The user code had an if/else that did the same thing for both cases.
-        # We simplify it to just one operation.
         ds_mean = ds_ensemble.mean(dim="member")
+        ds_mean = _ensure_regridded_ensemble_dataset(ds_mean, esm_var)
 
-        # Add Metadata Coordinates
         ds_mean = ds_mean.expand_dims({"ssp": 1, "model": 1})
         ds_mean = ds_mean.assign_coords(
             ssp=('ssp', metadata_coords["ssp"]),
             model=('model', metadata_coords["model"]),
-            lon=(ds_mean.lon % 360) # Ensure 0-360 longitude
+            lon=(ds_mean.lon % 360)  # Ensure 0-360 longitude
         )
 
-        # Rename Variable
         ds_mean = ds_mean.rename_vars({esm_var: var})
 
-        # Special Calculation: P-E
-        # This assumes 'var' is p-e and the current data is Evaporation (or similar),
-        # requiring subtraction from Precipitation (pr).
+        # P-E = pr - evap, using the matching pr output for this model/experiment.
         if var == "p-e":
-            pr_path = output_dir.parent / "pr" / f"output_gauss-{exp}.nc"
-            
+            pr_path = output_dir.parent / "pr" / f"output_gauss-{exp}{output_suffix}.nc"
             if pr_path.exists():
                 print(f"  Calculating P-E using {pr_path.name}...")
                 try:
                     ds_pr = xr.open_dataset(pr_path, decode_times=True)
-                    # Calculate: P - E
-                    # Note: Ensure units match (both should be mm/day based on earlier processing)
                     ds_mean[var] = ds_pr["pr"] - ds_mean[var]
                 except Exception as e:
                     print(f"\033[91m  [ERROR] Failed to calculate P-E: {e}\033[0m")
             else:
                 print(f"\033[93m  [WARNING] Cannot calculate P-E. Missing 'pr' file: {pr_path}\033[0m")
 
-        # Save Final Averaged File
-        out_path_mean = output_dir / f"output_gauss-{exp}.nc"
+        validate_no_nans(
+            data=ds_mean[var], var_name=var, exp=exp, member="ensemble-mean",
+            stage="ensemble mean output",
+        )
+        validate_no_negative_values(
+            data=ds_mean[var], var_name=var, exp=exp, member="ensemble-mean",
+            stage="ensemble mean output",
+        )
+        validate_variable_specific_ranges(
+            data=ds_mean[var], var_name=var, exp=exp, member="ensemble-mean",
+            stage="ensemble mean output",
+        )
+
+        out_path_mean = output_dir / f"output_gauss-{exp}{output_suffix}.nc"
         print(f"  Saving ensemble mean to {out_path_mean.name}")
-        
         if overwrite or not out_path_mean.exists():
             save_processed_data(ds_mean, out_path_mean, overwrite)
         else:
             print(f"    Skipping (file exists): {out_path_mean.name}")
 
-    print(f"--- Processing {var} Complete ---")
-
 
 if __name__ == "__main__":
+    import fire  # CLI-only; kept out of module-level imports (see top of file)
     fire.Fire(process_monthly)

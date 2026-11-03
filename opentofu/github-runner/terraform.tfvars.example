@@ -1,0 +1,42 @@
+# Copy to terraform.tfvars (do not commit secrets) and adjust.
+#
+# First-time init (remote state): copy backend.hcl.example → backend.hcl, set region to match
+# the S3 bucket, then: tofu init -backend-config=backend.hcl
+# Apply: tofu apply
+#
+# Networking defaults (no vpc_id / subnet_id needed):
+# - Uses the account default VPC in aws_region.
+# - Picks one subnet with map-public-ip-on-launch=true (sorted by subnet ID for stability).
+# - associate_public_ip defaults to true for outbound internet via the VPC internet gateway.
+#
+# Override vpc_id and/or subnet_id if you do not use the default VPC or want a specific subnet.
+
+aws_region = "us-west-2"
+
+# Optional overrides (default VPC + first public subnet if omitted):
+# vpc_id    = "vpc-xxxxxxxx"
+# subnet_id = "subnet-xxxxxxxx"
+
+# Set false when using a private subnet + NAT and a non-null subnet_id.
+associate_public_ip = true
+
+# Inbound SSH from EC2 Instance Connect (managed prefix list). Disable if you rely only on SSM.
+# enable_ec2_instance_connect = true
+
+validation_s3_bucket = "your-validation-bucket"
+validation_s3_prefix = "" # optional, no leading slash
+
+github_repo_owner = "your-org"
+github_repo_name  = "sai-simulator"
+
+# Must include labels used in .github/workflows/s3-validation-self-hosted.yml runs-on
+# (GitHub adds "self-hosted" automatically; add your custom label here).
+runner_labels = "sai-simulator-validation"
+
+# Optional
+# instance_type          = "t3.xlarge"
+# root_volume_size_gb    = 200
+# key_name               = "my-keypair"
+# management_cidr_blocks = ["203.0.113.0/24"]
+# actions_runner_version = "2.329.0"
+# extra_tags             = { Team = "platform" }
