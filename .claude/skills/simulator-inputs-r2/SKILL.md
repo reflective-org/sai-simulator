@@ -13,7 +13,7 @@ no credentials, no `storage_options`:
 https://pub-d127229e707d485c80965ab41706e316.r2.dev/simulator-inputs/<MODEL>_<EXPERIMENT>.zarr
 ```
 
-(In the `sai-simulator-internal` repo this is `ZARR_STORES_URI` in `version.py`.)
+(In the `sai-simulator` repo this is `ZARR_STORES_URI` in `version.py`.)
 Writing to the bucket needs R2 credentials and is a producer task — this skill is
 for reading.
 

@@ -1,10 +1,13 @@
-# Copy to backend.hcl and set region to match reflective-opentofu-state (required for tofu init).
+# Copy to backend.hcl (gitignored) and fill in your state bucket (required for tofu init).
 #
-# Discover region:
-#   aws s3api get-bucket-location --bucket reflective-opentofu-state
-# If LocationConstraint is null, the bucket is in us-west-2.
+# Region must match the bucket's AWS region or S3 returns PermanentRedirect (301).
+# Discover it:
+#   aws s3api get-bucket-location --bucket <your-state-bucket>
+# If LocationConstraint is null, the bucket is in us-east-1.
 #
 # Init:
 #   tofu init -backend-config=backend.hcl
 
 region = "us-west-2"
+bucket = "your-opentofu-state-bucket"
+key    = "sai-simulator/github-runner/terraform.tfstate"

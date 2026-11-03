@@ -25,10 +25,10 @@ Any change to that tuple renames every object, so goldens from before such a cha
 
 ## Where it runs
 
-`github-sai-validation-runner-ec2` (`i-0c6e8d3830b17ea1b`, c5a.12xlarge, 48 vCPU / 93 GB,
+`github-sai-validation-runner-ec2` (the `VALIDATION_RUNNER_INSTANCE_ID` repository variable; c5a.12xlarge, 48 vCPU / 93 GB,
 300 GB gp3, us-west-2). Its instance role carries `AmazonS3FullAccess` and
 `AmazonSSMManagedInstanceCore`, so it can write the goldens and be driven over SSM without
-SSH. Target bucket: `simulator-pregenerated-datacache`.
+SSH. Target bucket: the `VALIDATION_S3_BUCKET` repository secret.
 
 ## Procedure
 

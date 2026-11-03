@@ -203,6 +203,7 @@ terraform.tfvars
 terraform.tfvars.json
 terraform.tfvars.json.backup
 terraform.tfvars.json.backup.*
+backend.hcl
 
 #pytest
 .pytest_cache/
@@ -232,3 +233,7 @@ data/processed/*/
 # audit outputs
 figs/
 harness/
+
+# Claude Code: per-user settings and session worktrees (shared skills stay tracked)
+.claude/settings.local.json
+.claude/worktrees/

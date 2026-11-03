@@ -77,7 +77,7 @@ inter-model differences. The `fit_map.py` docstring is corrected accordingly.
 esmpy takes its version from the git checkout it is installed from and refuses to load
 against an ESMF library of another version. The machine's library is 8.7.0 while the source
 tree HEAD is v8.9.0b16; the fix used here is a worktree at tag `v8.7.0`
-(`/Users/ali/Documents/GitHub/util/esmf-8.7.0`) — see README §"Install ESMF Library".
+(a local `esmf-8.7.0` checkout) — see README §"Install ESMF Library".
 Only `scripts/process_monthly_gauss.py` needs xesmf; nothing in the three audit tracks does.
 
 ## Uncertainty bands

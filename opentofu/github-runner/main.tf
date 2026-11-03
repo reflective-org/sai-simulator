@@ -317,6 +317,19 @@ resource "aws_instance" "runner" {
   user_data_replace_on_change = true
 
   lifecycle {
+    # Keep the long-lived runner from being rebuilt by routine drift: the AMI
+    # data source tracks the newest AL2023 image, user_data edits only matter for
+    # a fresh instance, and the validation workflows stamp gh_validation_* lease
+    # tags at runtime. Replace deliberately with `tofu apply -replace=aws_instance.runner`.
+    ignore_changes = [
+      ami,
+      user_data,
+      tags["gh_validation_hold_until"],
+      tags["gh_validation_lease_expires_at"],
+      tags["gh_validation_pr"],
+      tags["gh_validation_repo"],
+    ]
+
     precondition {
       condition     = local.subnet_id_resolved != null
       error_message = "No subnet selected. Set subnet_id, or use a VPC that has subnets with map-public-ip-on-launch=true (typical for default VPC public subnets)."

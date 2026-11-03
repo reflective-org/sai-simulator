@@ -2,7 +2,7 @@
 """Stage raw UKESM NetCDF files from the hub bucket into Cloudflare R2.
 
 The Met Office side uploads UKESM1-1-LL output to the 2i2c hub's AWS bucket
-(``s3://reflective-persistent-prod-large/UKESM1-1/{experiment}/{member}/*.nc``),
+(``s3://$UKESM_HUB_BUCKET/UKESM1-1/{experiment}/{member}/*.nc``),
 which is only reachable with hub credentials. The simulator's zarrification
 step runs elsewhere with R2 credentials, so this script mirrors that prefix
 into the R2 bucket that already holds the simulator's data
@@ -24,7 +24,8 @@ Where to run it
     within their lifetime.
 
 Credentials
-    Source: boto3's normal chain (ambient hub role, or ``--profile``).
+    Source: boto3's normal chain (ambient hub role, or ``--profile``); the
+        bucket name comes from ``--src-bucket`` or ``UKESM_HUB_BUCKET``.
     Destination: the team's usual R2 env vars —
         R2_ACCOUNT_ID   Cloudflare account id (endpoint subdomain)
         R2_ACCESS_KEY   R2 access key id
@@ -57,7 +58,6 @@ from dataclasses import dataclass, field
 # deliberately stays minimal — the same reason ``fire`` and ``xesmf`` are lazy
 # elsewhere in scripts/.
 
-SRC_BUCKET = "reflective-persistent-prod-large"
 DEST_BUCKET = "reflective-data-store"
 # The hub-side prefix the Met Office uploads under; mirrored verbatim into R2.
 DEFAULT_PREFIX = "UKESM1-1/"
@@ -179,11 +179,11 @@ def make_r2_client():
     )
 
 
-def copy_one(src, dest, src_key: str, dest_key: str, expected: int) -> int:
+def copy_one(src, dest, src_bucket: str, src_key: str, dest_key: str, expected: int) -> int:
     """Stream one object S3 -> R2; verify size; never leave a short object."""
     from boto3.s3.transfer import TransferConfig
 
-    body = src.get_object(Bucket=SRC_BUCKET, Key=src_key)["Body"]
+    body = src.get_object(Bucket=src_bucket, Key=src_key)["Body"]
     try:
         # use_threads=False: the source body is a non-seekable stream, so the
         # multipart uploader must consume it strictly sequentially.
@@ -203,8 +203,10 @@ def main() -> int:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    p.add_argument("--src-bucket", default=os.environ.get("UKESM_HUB_BUCKET"),
+                   help="hub S3 bucket to read from (default: $UKESM_HUB_BUCKET)")
     p.add_argument("--src-prefix", default=DEFAULT_PREFIX,
-                   help=f"source prefix in {SRC_BUCKET} (default {DEFAULT_PREFIX})")
+                   help=f"source prefix in the hub bucket (default {DEFAULT_PREFIX})")
     p.add_argument("--dest-prefix", default=None,
                    help="destination prefix in R2 (default: same as --src-prefix)")
     p.add_argument("--only", action="append", default=[],
@@ -222,6 +224,8 @@ def main() -> int:
     p.add_argument("--log-file", default=None)
     p.add_argument("--lock-file", default="/tmp/copy-ukesm-to-r2.lock")
     args = p.parse_args()
+    if not args.src_bucket:
+        p.error("set --src-bucket or UKESM_HUB_BUCKET")
 
     handlers = [logging.StreamHandler(sys.stderr)]
     if args.log_file:
@@ -248,13 +252,13 @@ def main() -> int:
     src = make_src_client(args.profile)
     dest = make_r2_client()
 
-    src_sizes = list_sizes(src, SRC_BUCKET, src_prefix)
+    src_sizes = list_sizes(src, args.src_bucket, src_prefix)
     dest_sizes = list_sizes(dest, DEST_BUCKET, dest_prefix)
     plan = plan_transfers(src_sizes, dest_sizes, args.only, args.exclude)
     log.info(
         "%d in s3://%s/%s, %d in r2://%s/%s: %d to copy "
         "(%d size-mismatched recopies), %d up to date, %d filtered out",
-        len(src_sizes), SRC_BUCKET, src_prefix,
+        len(src_sizes), args.src_bucket, src_prefix,
         len(dest_sizes), DEST_BUCKET, dest_prefix,
         len(plan.to_copy), len(plan.mismatched), plan.up_to_date, plan.filtered_out,
     )
@@ -277,7 +281,7 @@ def main() -> int:
     started = time.monotonic()
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
-            pool.submit(copy_one, src, dest,
+            pool.submit(copy_one, src, dest, args.src_bucket,
                         src_prefix + rel, dest_prefix + rel, src_sizes[rel]): rel
             for rel in todo
         }

@@ -27,7 +27,7 @@ validation_s3_bucket = "your-validation-bucket"
 validation_s3_prefix = "" # optional, no leading slash
 
 github_repo_owner = "your-org"
-github_repo_name  = "sai-simulator-internal"
+github_repo_name  = "sai-simulator"
 
 # Must include labels used in .github/workflows/s3-validation-self-hosted.yml runs-on
 # (GitHub adds "self-hosted" automatically; add your custom label here).
