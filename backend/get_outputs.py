@@ -2007,8 +2007,9 @@ def generate_sai_netcdf(
         'decade_end_year': decade_end_year,
         'injection_strategy': 'ARISE' if variable_injection is not None else 'Standard',
         'creation_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        'paper_ref': 'Beall, Charlotte and Irvin, Jeremy A. and Dexheimer, Jake and Gruener, Dakota and Ng, Andrew Y. and Watson-Parris, Duncan and MacMartin, Douglas G. and Visioni, Daniele and Administrator, Sneak Peek, The Stratospheric Aerosol Injection (SAI) Simulator: An Open-Source Web Tool for Exploring Climate and SAI Deployment Scenarios. ONE-EARTH-D-25-00518, Available at SSRN: https://ssrn.com/abstract=5200736 or http://dx.doi.org/10.2139/ssrn.5200736',
-        'data_ref': 'https://doi.org/10.5281/zenodo.15531372',
+        'paper_ref': 'Beall, Charlotte and Irvin, Jeremy A. and Dexheimer, Jake and Gruener, Dakota and Ng, Andrew Y. and Watson-Parris, Duncan and MacMartin, Douglas G. and Visioni, Daniele, The Stratospheric Aerosol Injection (SAI) Simulator: An Open-Source Web Tool for Exploring Climate and SAI Deployment Scenarios. ONE-EARTH-D-25-00518, Available at SSRN: https://ssrn.com/abstract=5200736 or http://dx.doi.org/10.2139/ssrn.5200736',
+        # Zenodo concept DOI: always resolves to the latest release, so it never goes stale.
+        'data_ref': 'https://doi.org/10.5281/zenodo.14510645',
         'github_ref': 'https://github.com/reflective-org/sai-simulator',
     }
 
