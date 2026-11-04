@@ -25,6 +25,24 @@ from backend.constants import *
 from backend.get_outputs import get_outputs
 
 
+# Dashboard panels in display order: variable -> (UI label, ImageSlider color). Both the
+# UI components and generate_gradio_plots' return tuple are built from this one table, so
+# each plot always lands under its own label.
+DASHBOARD_PANELS = {
+    "tas": ("Temperature", "blue"),
+    "tasmin": ("Min Temperature", "blue"),
+    "tasmax": ("Max Temperature", "blue"),
+    "exposure_above_40": ("Exposure to Days above 40°C", "blue"),
+    "exposure_above_35": ("Exposure to Days above 35°C", "blue"),
+    "exposure_below_0": ("Exposure to Days below 0°C", "red"),
+    "exposure_above_10": ("Exposure to Days above 10mm", "red"),
+    "exposure_above_20": ("Exposure to Days above 20mm", "red"),
+    "p-e": ("Water Availability", "red"),
+    "icefrac": ("Ice Fraction", "blue"),
+}
+assert set(DASHBOARD_PANELS) == set(VAR2INFO), "DASHBOARD_PANELS must list every VAR2INFO variable"
+
+
 def fig_to_image(fig: "plt.Figure") -> Image.Image:
     """Rasterize a Matplotlib figure to a copied PIL :class:`Image.Image` (no live buffer reference)."""
     buf = io.BytesIO()
@@ -396,10 +414,10 @@ def generate_gradio_plots(
     # Custom color map from beige to blue
     colors = ["#f5f5dc", "#000080"]  # Beige to Navy Blue
     cmap = LinearSegmentedColormap.from_list("CustomMap", colors, N=256)
-    so2_by_latitude_df = so2_by_latitude.to_dataframe().drop(columns='features').unstack(level='time')
-    so2_by_latitude_df = so2_by_latitude_df.droplevel(level=0, axis=1)
-    so2_by_latitude_df.to_csv(f"so2_by_latitude_{decade_visualization}.csv")
-    so2_by_latitude_df = so2_by_latitude_df.iloc[::-1]
+    # Drop scalar coords (start_year, features from the cache) so only the lat x time grid remains.
+    scalar_coords = [c for c in so2_by_latitude.coords if c not in so2_by_latitude.dims]
+    so2_by_latitude_df = so2_by_latitude.drop_vars(scalar_coords).to_series().unstack(level='time')
+    so2_by_latitude_df = so2_by_latitude_df.sort_index(ascending=False)  # north at the top
     sns.heatmap(so2_by_latitude_df, annot=False, cmap=cmap, cbar_kws={'label': 'Tg SO2'}, ax=so2_by_latitude_ax)
     so2_by_latitude_ax.set_title('Latitude vs. Tg SO2')
     so2_by_latitude_ax.set_xlabel('Year')
@@ -419,7 +437,7 @@ def generate_gradio_plots(
     # Return all the plots
     # by using a for loop over the variables
     outputs = []
-    for var in var2plots:
+    for var in DASHBOARD_PANELS:
         outputs.append(ImageSlider(var2plots[var]["slider"]))
         outputs.append(var2plots[var]["delta"])
         outputs.append(var2plots[var]["global_mean"])
@@ -446,13 +464,20 @@ def update_rampup_dropdown(start_year: int, ramp_up: int) -> gr.Slider:
 
 
 def update_decade_dropdown(start_year: int, decade: str) -> gr.Dropdown:
-    """Drop decade options that start before ``start_year`` and reselect the first remaining one if needed."""
+    """Drop decade options that start before ``start_year`` and reselect the first remaining one if needed.
+
+    The final decade is always kept, so start years inside it (2092-2100) still have a choice.
+    """
     # Remove decade options that are not possible given the start year
     decades = DECADES.copy()
     start_year = start_year
     for dec in DECADES:
         if int(dec.split("-")[0]) < start_year:
             decades.remove(dec)
+
+    if not decades:
+        # Start years after the last decade begins (e.g. 2092-2100): keep the final decade.
+        decades = DECADES[-1:]
 
     if decade not in decades:
         decade = decades[0]
@@ -550,34 +575,12 @@ if __name__ == "__main__":
         slider_start_year.change(fn=update_decade_dropdown, inputs=[slider_start_year, decade_visualization], outputs=decade_visualization)
 
         btn = gr.Button("Submit")
-        outputs = [
-            ImageSlider(label="Regional Temperature", type="pil", slider_color="blue"),
-            gr.Plot(label="Regional Temperature | No SAI vs. SAI"),
-            gr.Plot(label="Mean Temperature Over Time"),
-            gr.Plot(label="Temperature Distribution")
-        ]
-        other_variables = [
-            # ("Precipitation", "red"),
-            ("Min Temperature", "blue"),
-            ("Max Temperature", "blue"),
-            # ("No. Days Above 40°C", "blue"),
-            # ("No. Days Above 35°C", "blue"),
-            # ("No. Days Below 0°C", "red"),
-            # ("No. Days Above 10mm", "red"),
-            # ("No. Days Above 20mm", "red"),
-            ("Exposure to Days above 40°C", "blue"),
-            ("Exposure to Days above 35°C", "blue"),
-            ("Exposure to Days below 0°C", "red"),
-            ("Exposure to Days above 10mm", "red"),
-            ("Exposure to Days above 20mm", "red"),
-            ("Water Availability", "red"),
-            ("Ice Fraction", "blue"),
-        ]
-        for var, slider_color in other_variables:
-            outputs.append(ImageSlider(label=f"Regional {var}", type="pil", slider_color=slider_color))
-            outputs.append(gr.Plot(label=f"Regional {var} | No SAI vs. SAI"))
-            outputs.append(gr.Plot(label=f"Mean {var} Over Time", visible=var != "Precipitation"))
-            outputs.append(gr.Plot(label=f"{var} Distribution"))
+        outputs = []
+        for var, (label, slider_color) in DASHBOARD_PANELS.items():
+            outputs.append(ImageSlider(label=f"Regional {label}", type="pil", slider_color=slider_color))
+            outputs.append(gr.Plot(label=f"Regional {label} | No SAI vs. SAI"))
+            outputs.append(gr.Plot(label=f"Mean {label} Over Time"))
+            outputs.append(gr.Plot(label=f"{label} Distribution"))
 
         outputs.append(gr.Plot(label="Latitude vs. Tg SO2"))
         outputs.append(gr.Plot(label="Global SO2"))

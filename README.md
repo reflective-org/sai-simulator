@@ -38,8 +38,11 @@ default; see `FAIR_CALIBRATION` in `backend/baseline.py`) is fed through every m
 fitted line and the lines are averaged equally — that average is the final mapping from
 global temperature to grid-cell values, so every pattern counts equally even though the
 models' transient sensitivities differ. (A model can sit out a variable it has no data
-for — see `REGIONAL_MODEL_VAR_EXCLUSIONS` in `backend/constants.py`; today UKESM sits
-out p−e on the projection side.) One Zarr store per (model, experiment) is served from
+for — see `REGIONAL_MODEL_VAR_EXCLUSIONS` in `backend/constants.py`; today the table
+is empty and all three models contribute every variable.) The SAI response is fitted
+differently: it is one **pooled** regression over every model's SAI runs, not a mean of
+per-model fits (see the weighting note under
+[Adding a New Model](#-adding-a-new-model)). One Zarr store per (model, experiment) is served from
 the public bucket configured in `version.py` (`ZARR_STORES_URI`); the table lists what
 each store contains.
 
@@ -149,11 +152,14 @@ Notes:
   as a result: real for r3, all-NaN for r2 and r12. Two conversions matter —
   ESGF ships percent where the store holds a 0–1 fraction, and marks land with
   a real `_FillValue` where the store holds 0.
-- **UKESM missing sources.** The MACLOUD historical publishes no evaporative
-  flux or sea ice, so the historical store ships all-NaN QFLX/ICEFRAC
-  placeholders: UKESM's p−e and icefrac series start in 2015. Its p−e therefore
-  feeds only the SAI delta (branch-consistent baseline/G6 pair) and sits out the
-  projection side (`REGIONAL_MODEL_VAR_EXCLUSIONS`). Its **icefrac now trains
+- **UKESM historical evaporation and sea ice come from ESGF.** The MACLOUD
+  historical publishes no evaporative flux or sea ice, so the historical store's
+  QFLX and ICEFRAC are filled from CMIP6 ESGF (`hfls` and `siconca`, for the run
+  this store calls r3; see above). UKESM's p−e therefore trains the projection
+  side like any other variable, and `REGIONAL_MODEL_VAR_EXCLUSIONS` no longer
+  lists it. Before that, with no historical evaporation, its p−e fed only the SAI
+  delta, because a series starting in 2015 left the ≤ 2014 historical reference
+  empty. Its **icefrac now trains
   the sea-ice sigmoid** alongside the other two: once ESGF supplied historical
   sea ice (see above) the training window reaches back to 1900 and the logistic's
   full-ice plateau is fitted rather than extrapolated. It held out while its ice
@@ -166,9 +172,10 @@ Notes:
   renders a diagnostic figure of the fitted sigmoids, each model's training
   coverage, and what including UKESM does to the mean (written to
   `img/icefrac_fit.png`, a generated artefact that is not committed).
-- **UKESM icefrac is one realization.** ESGF publishes its historical sea ice for
-  a single member, so `variable_members` in `process_monthly_gauss.MODELS`
-  restricts icefrac to `r3` in **every** experiment. A three-member mean after
+- **UKESM icefrac and evaporation are one realization.** ESGF publishes its
+  historical sea ice and evaporation for a single member, so `variable_members` in
+  `process_monthly_gauss.MODELS` restricts icefrac and p−e's QFLX term to `r3` in
+  **every** experiment (p−e's precipitation term stays a three-member mean). A three-member mean after
   2015 against one member before it would step the variance at the stitch, and
   the sigmoid trains on exactly that series. Its `tas` stays a three-member mean,
   so the fit pairs a one-member ice record against an ensemble-mean temperature;
