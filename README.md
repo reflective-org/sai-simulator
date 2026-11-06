@@ -4,7 +4,7 @@
 
 Official repository for [the SAI Simulator](https://simulator.reflective.org/), a new tool to explore the effects of stratospheric aerosol injection on the climate.
 
-![SAI Simulator](img/preview.png)
+![SAI Simulator](img/simulator_preview.png)
 
 ## Table of Contents
 
