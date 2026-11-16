@@ -1,0 +1,11 @@
+{
+  "upload_type": "software",
+  "license": "Apache-2.0",
+  "creators": [
+    {"name": "Akherati, Ali", "affiliation": "Reflective"},
+    {"name": "Irvin, Jeremy"},
+    {"name": "Dexheimer, Jake"},
+    {"name": "Orcutt, John"},
+    {"name": "Baur, Susanne"}
+  ]
+}
